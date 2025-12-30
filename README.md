@@ -4,4 +4,4 @@ From source (dev):
 pip install -e ".[dev]"
 
 From GitHub:
-pip install git+https://https://github.com/dpesce/ffjet.git
+pip install git+https://github.com/dpesce/ffjet.git
