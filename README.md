@@ -10,7 +10,7 @@ A tool for simulating images and spectral energy distributions (SEDs) of astroph
 The code is only tested on Python 3.9 and higher, and it may break for earlier versions.  It is recommended that you install ffjet using a virtual environment, e.g.:
 
 ```
-    $ git clone https://github.com/dpesce/jjfet
+    $ git clone https://github.com/dpesce/ffjet
     $ python -m venv .venv
     $ source .venv/bin/activate
     (.venv) $ pip install .
@@ -19,11 +19,11 @@ The code is only tested on Python 3.9 and higher, and it may break for earlier v
 You can also install directly from GitHub:
 
 ```
-    (.venv) $ pip install "git+https://github.com/dpesce/ffjet.git"
+    pip install "git+https://github.com/dpesce/ffjet.git"
 ```
 
-There is an optional progress bar functionality that uses `tqdm`; it can be installed using:
+There is an optional progress bar functionality that uses [`tqdm`](https://tqdm.github.io/); it can be installed using:
 
 ```
-    (.venv) $ pip install "ffjet[progress] @ git+https://github.com/dpesce/ffjet.git"
+    pip install "ffjet[progress] @ git+https://github.com/dpesce/ffjet.git"
 ```
