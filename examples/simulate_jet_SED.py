@@ -1,8 +1,8 @@
 ###################################################
 #                                                 #
-# This example script showcases some of the basic #
-# functionality for how to use this codebase to   #
-# simulate an image of a jet.                     #
+# This example script shows how to loop through   #
+# frequency with the same underlying base jet     #
+# model to produce an SED.                        #
 #                                                 #
 ###################################################
 
@@ -11,6 +11,7 @@
 
 import numpy as np
 import jetfuncs as jf
+from tqdm import tqdm
 import matplotlib.pyplot as plt
 
 ###################################################
@@ -34,15 +35,12 @@ s = 0.6
 ###################################################
 # inputs that control the image
 
-# observing frequency, in GHz
-frequency = 230.0
-
 # set the minimum and maximum values for the image dimensions, in gravitational radii
 xmin = ymin = -100.0
 xmax = ymax = 100.0
 
 # set the number of pixels for the image
-Nx = Ny = 200
+Nx = Ny = 100
 
 # set the dimensions and resolution along the depth (z) direction; relevant for radiative transfer
 zmin = 0.0
@@ -59,7 +57,7 @@ h = 0.0025
 eta = 0.01
 
 ###################################################
-# initialize the jet model and generate an image
+# initialize the jet model
 
 # initialize
 model = jf.JetModel(
@@ -82,53 +80,38 @@ model = jf.JetModel(
     eta=eta,
 )
 
-# generate image
-x, y, I_nu = model.make_image(frequency, show_progress=True)
+###################################################
+# loop through frequency to generate an SED
+
+# array of observing frequencies, in GHz
+frequency_arr = 10.0 ** np.linspace(0.0, 6.0, 200)
+
+# initialize an array to hold integrated luminosity density
+luminosity = np.zeros_like(frequency_arr)
+
+# loop through frequency
+for ifreq in tqdm(range(len(frequency_arr))):
+    # generate image at this frequency
+    x, y, I_nu = model.make_image(frequency_arr[ifreq], show_progress=False)
+
+    # convert intensity to luminosity density, in cgs units
+    Lnu = jf.convert_units(model, I_nu, output_units="luminosity")
+
+    # store
+    luminosity[ifreq] = np.sum(Lnu)
 
 ###################################################
-# convert image units
-
-###################################
-# The image is natively produced  #
-# in intensity units.  To convert #
-# to other units, we can use the  #
-# convert_units() function.       #
-###################################
-
-# distance to the source, in Mpc
-D = 16.8
-
-# luminosity density, in cgs units
-Lnu = jf.convert_units(model, I_nu, output_units="luminosity")
-
-# flux density, in cgs units
-Snu = jf.convert_units(model, I_nu, output_units="flux", D=D)
-
-# convert flux density to Jy
-Snu_Jy = Snu * (1.0e23)
-
-# brightness temperature, in K
-Tb = jf.convert_units(model, I_nu, output_units="Tb", frequency=frequency)
-
-###################################################
-# plot image
+# plot the SED
 
 fig = plt.figure(figsize=(4, 4))
 ax = fig.add_axes([0.1, 0.1, 0.8, 0.8])
-cax = fig.add_axes([0.91, 0.1, 0.02, 0.8])
-ax.set_facecolor("black")
-vmax = 10.5
-vmin = vmax - 3.0
-pc = ax.pcolormesh(x, y, np.log10(Tb)[::-1, ::-1], cmap="afmhot", vmax=vmax, vmin=vmin)
-ax.set_xlabel(r"$x$ ($r_g$)")
-ax.set_ylabel(r"$y$ ($r_g$)")
-plt.colorbar(pc, cax=cax, label=r"$\log(T_b)$")
-plt.savefig("jet_image.png", dpi=300, bbox_inches="tight")
+ax.plot(frequency_arr, frequency_arr * (1.0e9) * luminosity, "k-")
+ax.loglog()
+ax.set_xlim(np.min(frequency_arr), np.max(frequency_arr))
+ax.set_xlabel("Frequency (GHz)")
+ax.set_ylabel(r"$\nu L_{\nu}$ (erg/s)")
+ax.grid(linewidth=0.5, linestyle="--", alpha=0.1)
+plt.savefig("jet_SED.png", dpi=300, bbox_inches="tight")
 plt.close()
-
-###################################################
-# export the image as a FITS file
-
-jf.export_fits("jet_image.fits", Snu_Jy, x, y, observing_frequency_hz=230.0e9, bunit="Jy/pix")
 
 ###################################################

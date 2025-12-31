@@ -87,9 +87,9 @@ model = jf.JetModel(
     p=p,
     h=h,
     eta=eta,
-    use_log_xgrid=True,
-    use_log_ygrid=True,
-    use_log_zgrid=True,
+    use_log_xgrid=use_log_xgrid,
+    use_log_ygrid=use_log_ygrid,
+    use_log_zgrid=use_log_zgrid,
 )
 
 # generate image
