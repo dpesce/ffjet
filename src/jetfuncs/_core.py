@@ -2,7 +2,11 @@
 # imports and etc.
 
 import numpy as np
+from scipy.interpolate import RegularGridInterpolator
 import os
+from astropy.io import fits
+from astropy.wcs import WCS
+from astropy.time import Time
 
 # optional progress bar import
 try:
@@ -1792,134 +1796,344 @@ class JetModel:
 
         return {}
 
-    # function to convert the units of an image from intensity to luminosity/flux/brightness temperature
-    def convert_units(self, I_nu, output_units="luminosity", D=None, frequency=None):
-        """
-        Returns the image in the requested units.
 
-        For flux units, the distance D to the source must be specified in Mpc.
-        For brightness temperature (Tb) units, the frequency must be specified in GHz.
+###################################################
+# post-processing functions
 
-        Understood output units: luminosity, flux, Tb
 
-        """
+def convert_units(model, I_nu, *xy, output_units="luminosity", D=None, frequency=None):
+    """
+    Returns an image with pixel values provided in the requested units.
+    The model argument must be an instance of the JetModel class.
 
-        if (
-            (self.x_im_1D_input is not None)
-            | (self.y_im_1D_input is not None)
-            | (self.z_im_1D_input is not None)
-        ):
-            print("Warning: using custom input grids may cause issues with unit conversion.")
+    For flux units, the distance D to the source must be specified in Mpc.
+    For brightness temperature (Tb) units, the frequency must be specified in GHz.
 
-        # brightness temperature doesn't require any knowledge of pixel sizes
-        if output_units == "Tb":
-            # check that the frequency is provided
-            if frequency is None:
-                raise Exception(
-                    "For brightness temperature (Tb) units, the frequency must be specified in GHz."
-                )
+    Understood output units: luminosity, flux, Tb
 
-            # brightness temperature, in K
-            Tb = (3.255e18) * I_nu / (frequency**2.0)
+    """
 
-            return Tb
+    # brightness temperature doesn't require any knowledge of pixel sizes
+    if output_units == "Tb":
+        # check that the frequency is provided
+        if frequency is None:
+            raise Exception(
+                "For brightness temperature (Tb) units, the frequency must be specified in GHz."
+            )
 
+        # brightness temperature, in K
+        Tb = (3.255e18) * I_nu / (frequency**2.0)
+
+        return Tb
+
+    # otherwise, pixel size matters
+    if (
+        (model.x_im_1D_input is not None)
+        | (model.y_im_1D_input is not None)
+        | (model.z_im_1D_input is not None)
+    ):
+        print("Warning: using custom input grids may cause issues with unit conversion.")
+
+    # if the user doesn't pass a grid, use the one stored in the model
+    if len(xy) == 0:
         # determine pixel sizes in x-direction
-        if self.use_log_xgrid:
-            dx = np.zeros_like(self.x_im_1D)
-            for i in range(len(self.x_im_1D)):
+        if model.use_log_xgrid:
+            dx = np.zeros_like(model.x_im_1D)
+            for i in range(len(model.x_im_1D)):
                 if i == 0:
-                    xhi = np.sqrt(self.x_im_1D[i + 1] / self.x_im_1D[i]) * self.x_im_1D[i]
-                    xlo = np.sqrt(self.x_im_1D[i] / self.x_im_1D[i + 1]) * self.x_im_1D[i]
+                    xhi = np.sqrt(model.x_im_1D[i + 1] / model.x_im_1D[i]) * model.x_im_1D[i]
+                    xlo = np.sqrt(model.x_im_1D[i] / model.x_im_1D[i + 1]) * model.x_im_1D[i]
                     dxhere = xhi - xlo
-                elif (self.x_im_1D[i - 1] > 0.0) & (i < (len(self.x_im_1D) - 1)):
-                    xhi = np.sqrt(self.x_im_1D[i + 1] / self.x_im_1D[i]) * self.x_im_1D[i]
-                    xlo = np.sqrt(self.x_im_1D[i - 1] / self.x_im_1D[i]) * self.x_im_1D[i]
+                elif (model.x_im_1D[i - 1] > 0.0) & (i < (len(model.x_im_1D) - 1)):
+                    xhi = np.sqrt(model.x_im_1D[i + 1] / model.x_im_1D[i]) * model.x_im_1D[i]
+                    xlo = np.sqrt(model.x_im_1D[i - 1] / model.x_im_1D[i]) * model.x_im_1D[i]
                     dxhere = xhi - xlo
-                elif (self.x_im_1D[i - 1] > 0.0) & (i == (len(self.x_im_1D) - 1)):
-                    xhi = np.sqrt(self.x_im_1D[i] / self.x_im_1D[i - 1]) * self.x_im_1D[i]
-                    xlo = np.sqrt(self.x_im_1D[i - 1] / self.x_im_1D[i]) * self.x_im_1D[i]
+                elif (model.x_im_1D[i - 1] > 0.0) & (i == (len(model.x_im_1D) - 1)):
+                    xhi = np.sqrt(model.x_im_1D[i] / model.x_im_1D[i - 1]) * model.x_im_1D[i]
+                    xlo = np.sqrt(model.x_im_1D[i - 1] / model.x_im_1D[i]) * model.x_im_1D[i]
                     dxhere = xhi - xlo
-                elif (self.x_im_1D[i + 1] < 0.0) & (i > 0):
-                    xhi = np.sqrt(self.x_im_1D[i + 1] / self.x_im_1D[i]) * self.x_im_1D[i]
-                    xlo = np.sqrt(self.x_im_1D[i - 1] / self.x_im_1D[i]) * self.x_im_1D[i]
+                elif (model.x_im_1D[i + 1] < 0.0) & (i > 0):
+                    xhi = np.sqrt(model.x_im_1D[i + 1] / model.x_im_1D[i]) * model.x_im_1D[i]
+                    xlo = np.sqrt(model.x_im_1D[i - 1] / model.x_im_1D[i]) * model.x_im_1D[i]
                     dxhere = xhi - xlo
-                if self.x_im_1D[i] == self.xmin:
-                    xhi = np.sqrt(self.x_im_1D[i + 1] / self.x_im_1D[i]) * self.x_im_1D[i]
+                if model.x_im_1D[i] == model.xmin:
+                    xhi = np.sqrt(model.x_im_1D[i + 1] / model.x_im_1D[i]) * model.x_im_1D[i]
                     xlo = 0.0
                     dxhere = xhi - xlo
-                if self.x_im_1D[i] == -self.xmin:
+                if model.x_im_1D[i] == -model.xmin:
                     xhi = 0.0
-                    xlo = np.sqrt(self.x_im_1D[i - 1] / self.x_im_1D[i]) * self.x_im_1D[i]
+                    xlo = np.sqrt(model.x_im_1D[i - 1] / model.x_im_1D[i]) * model.x_im_1D[i]
                     dxhere = xhi - xlo
                 dx[i] = dxhere
 
         else:
-            dx = np.mean(np.diff(self.x_im_1D)) + np.zeros_like(self.x_im_1D)
+            dx = np.mean(np.diff(model.x_im_1D)) + np.zeros_like(model.x_im_1D)
 
         # determine pixel sizes in y-direction
-        if self.use_log_ygrid:
-            dy = np.zeros_like(self.y_im_1D)
-            for i in range(len(self.y_im_1D)):
+        if model.use_log_ygrid:
+            dy = np.zeros_like(model.y_im_1D)
+            for i in range(len(model.y_im_1D)):
                 if i == 0:
-                    yhi = np.sqrt(self.y_im_1D[i + 1] / self.y_im_1D[i]) * self.y_im_1D[i]
-                    ylo = np.sqrt(self.y_im_1D[i] / self.y_im_1D[i + 1]) * self.y_im_1D[i]
+                    yhi = np.sqrt(model.y_im_1D[i + 1] / model.y_im_1D[i]) * model.y_im_1D[i]
+                    ylo = np.sqrt(model.y_im_1D[i] / model.y_im_1D[i + 1]) * model.y_im_1D[i]
                     dyhere = yhi - ylo
-                elif (self.y_im_1D[i - 1] > 0.0) & (i < (len(self.y_im_1D) - 1)):
-                    yhi = np.sqrt(self.y_im_1D[i + 1] / self.y_im_1D[i]) * self.y_im_1D[i]
-                    ylo = np.sqrt(self.y_im_1D[i - 1] / self.y_im_1D[i]) * self.y_im_1D[i]
+                elif (model.y_im_1D[i - 1] > 0.0) & (i < (len(model.y_im_1D) - 1)):
+                    yhi = np.sqrt(model.y_im_1D[i + 1] / model.y_im_1D[i]) * model.y_im_1D[i]
+                    ylo = np.sqrt(model.y_im_1D[i - 1] / model.y_im_1D[i]) * model.y_im_1D[i]
                     dyhere = yhi - ylo
-                elif (self.y_im_1D[i - 1] > 0.0) & (i == (len(self.y_im_1D) - 1)):
-                    yhi = np.sqrt(self.y_im_1D[i] / self.y_im_1D[i - 1]) * self.y_im_1D[i]
-                    ylo = np.sqrt(self.y_im_1D[i - 1] / self.y_im_1D[i]) * self.y_im_1D[i]
+                elif (model.y_im_1D[i - 1] > 0.0) & (i == (len(model.y_im_1D) - 1)):
+                    yhi = np.sqrt(model.y_im_1D[i] / model.y_im_1D[i - 1]) * model.y_im_1D[i]
+                    ylo = np.sqrt(model.y_im_1D[i - 1] / model.y_im_1D[i]) * model.y_im_1D[i]
                     dyhere = yhi - ylo
-                elif (self.y_im_1D[i + 1] < 0.0) & (i > 0):
-                    yhi = np.sqrt(self.y_im_1D[i + 1] / self.y_im_1D[i]) * self.y_im_1D[i]
-                    ylo = np.sqrt(self.y_im_1D[i - 1] / self.y_im_1D[i]) * self.y_im_1D[i]
+                elif (model.y_im_1D[i + 1] < 0.0) & (i > 0):
+                    yhi = np.sqrt(model.y_im_1D[i + 1] / model.y_im_1D[i]) * model.y_im_1D[i]
+                    ylo = np.sqrt(model.y_im_1D[i - 1] / model.y_im_1D[i]) * model.y_im_1D[i]
                     dyhere = yhi - ylo
-                if self.y_im_1D[i] == self.ymin:
-                    yhi = np.sqrt(self.y_im_1D[i + 1] / self.y_im_1D[i]) * self.y_im_1D[i]
+                if model.y_im_1D[i] == model.ymin:
+                    yhi = np.sqrt(model.y_im_1D[i + 1] / model.y_im_1D[i]) * model.y_im_1D[i]
                     ylo = 0.0
                     dyhere = yhi - ylo
-                if self.y_im_1D[i] == -self.ymin:
+                if model.y_im_1D[i] == -model.ymin:
                     yhi = 0.0
-                    ylo = np.sqrt(self.y_im_1D[i - 1] / self.y_im_1D[i]) * self.y_im_1D[i]
+                    ylo = np.sqrt(model.y_im_1D[i - 1] / model.y_im_1D[i]) * model.y_im_1D[i]
                     dyhere = yhi - ylo
                 dy[i] = dyhere
 
         else:
-            dy = np.mean(np.diff(self.y_im_1D)) + np.zeros_like(self.y_im_1D)
+            dy = np.mean(np.diff(model.y_im_1D)) + np.zeros_like(model.y_im_1D)
 
-        # determine pixel areas, in rg^2
-        dA = np.zeros_like(I_nu)
-        for i in range(len(dx)):
-            for j in range(len(dy)):
-                dA[j, i] = dx[i] * dy[j]
+    # otherwise, unpack the user-specified coordinates
+    else:
+        (x_im_1D, y_im_1D) = xy
+        dx = np.concatenate(([x_im_1D[1] - x_im_1D[0]], np.diff(x_im_1D)))
+        dy = np.concatenate(([y_im_1D[1] - y_im_1D[0]], np.diff(y_im_1D)))
 
-        # convert to cgs
-        dA *= self.rg * self.rg
+    # determine pixel areas, in rg^2
+    dA = np.zeros_like(I_nu)
+    for i in range(len(dx)):
+        for j in range(len(dy)):
+            dA[j, i] = dx[i] * dy[j]
 
-        # luminosity density, in cgs
-        Lnu = dA * I_nu
+    # convert to cgs
+    dA *= model.rg * model.rg
 
-        if output_units == "luminosity":
-            return Lnu
+    # luminosity density, in cgs
+    Lnu = dA * I_nu
 
-        # if user wants flux units
-        if output_units == "flux":
-            # check that the distance is provided
-            if D is None:
-                raise Exception(
-                    "For flux units, the distance D to the source must be specified in Mpc."
-                )
+    if output_units == "luminosity":
+        return Lnu
 
-            # convert distance from Mpc to cm
-            D_cm = D * (3.086e24)
+    # if user wants flux units
+    if output_units == "flux":
+        # check that the distance is provided
+        if D is None:
+            raise Exception(
+                "For flux units, the distance D to the source must be specified in Mpc."
+            )
 
-            # flux density, in cgs
-            Snu = Lnu / (D_cm**2.0)
+        # convert distance from Mpc to cm
+        D_cm = D * (3.086e24)
 
-            return Snu
+        # flux density, in cgs
+        Snu = Lnu / (D_cm**2.0)
+
+        return Snu
+
+
+def interp_to_regular_grid(
+    I_nu,
+    x,
+    y,
+    *,
+    x_new=None,
+    y_new=None,
+    nx=512,
+    ny=512,
+    method="linear",
+    fill_value=np.nan,
+    bounds_error=False,
+):
+    """
+    Interpolate I_nu onto a regular rectangular grid.
+    The method, fill_value, and bounds_error arguments get passed directly to
+    scipy's RegularGridInterpolator.
+
+    Assumes: I_nu.shape == (len(y), len(x)) and I_nu[j, i] is at (x[i], y[j]).
+
+    Input method can be "linear" or "nearest"
+
+    Provide either:
+      - x_new and y_new (1D arrays of target grid centers), OR
+      - nx and ny to auto-make uniform grids spanning [min(x), max(x)] and [min(y), max(y)].
+    """
+
+    I_nu = np.asarray(I_nu)
+    x = np.asarray(x).ravel()
+    y = np.asarray(y).ravel()
+
+    if I_nu.shape != (len(y), len(x)):
+        raise ValueError(f"I_nu shape {I_nu.shape} must be (len(y), len(x)) = {(len(y), len(x))}")
+
+    # ensure ascending axes (required by RegularGridInterpolator)
+    x_order = np.argsort(x)
+    y_order = np.argsort(y)
+    x_sorted = x[x_order]
+    y_sorted = y[y_order]
+    I_sorted = I_nu[np.ix_(y_order, x_order)]
+
+    # build target grid if not provided
+    if x_new is None:
+        x_new = np.linspace(x_sorted.min(), x_sorted.max(), int(nx))
+    else:
+        x_new = np.asarray(x_new).ravel()
+
+    if y_new is None:
+        y_new = np.linspace(y_sorted.min(), y_sorted.max(), int(ny))
+    else:
+        y_new = np.asarray(y_new).ravel()
+
+    # interpolator expects points to be in the same axis order as (y_sorted, x_sorted)
+    interp = RegularGridInterpolator(
+        (y_sorted, x_sorted),
+        I_sorted,
+        method=method,
+        bounds_error=bounds_error,
+        fill_value=fill_value,
+    )
+
+    # evaluate on the new grid
+    Xn, Yn = np.meshgrid(x_new, y_new, indexing="xy")
+    pts = np.column_stack([Yn.ravel(), Xn.ravel()])
+    I_new = interp(pts).reshape(len(y_new), len(x_new))
+
+    return x_new, y_new, I_new
+
+
+def export_fits(
+    filename,
+    I_new,
+    x_new,
+    y_new,
+    *,
+    source_name=None,  # -> OBJECT
+    ra_deg=None,  # -> OBJRA
+    dec_deg=None,  # -> OBJDEC
+    observing_frequency_hz=None,  # -> OBSFREQ (Hz)
+    bunit=None,  # -> BUNIT (e.g. "Jy/beam", "K")
+    extra_header=None,  # dict: {"KEY": value, ...}
+    write_axes_extension=True,  # store x_new/y_new vectors in a table extension too
+    overwrite=True,
+):
+    """
+    Write a 2D image to FITS where x_new/y_new are angular offsets on a regular grid.
+    Default assumption is that the offsets are specified in radians.
+
+    Assumes:
+      - I_new.shape == (len(y_new), len(x_new))
+      - x_new and y_new are 1D arrays of pixel centers on a uniform grid
+      - no rotation (i.e., the pixel grid is aligned with coordinate axes)
+
+    """
+
+    I_new = np.asarray(I_new)
+    x_new = np.asarray(x_new).ravel()
+    y_new = np.asarray(y_new).ravel()
+
+    # convert from radians to degrees
+    x_new *= 180.0 / np.pi
+    y_new *= 180.0 / np.pi
+
+    if I_new.ndim != 2:
+        raise ValueError(f"I_new must be 2D, got shape {I_new.shape}")
+    if I_new.shape != (len(y_new), len(x_new)):
+        raise ValueError(
+            f"I_new shape {I_new.shape} must be (len(y_new), len(x_new)) = {(len(y_new), len(x_new))}"
+        )
+
+    # ensure uniform spacing (required for CRVAL/CDELT WCS)
+    def _uniform_step(arr, name, rtol=1e-7, atol=0.0):
+        if len(arr) < 2:
+            raise ValueError(f"{name} must have at least 2 points to define pixel scale.")
+        d = np.diff(arr)
+        step = float(np.median(d))
+        if not np.allclose(d, step, rtol=rtol, atol=atol):
+            raise ValueError(
+                f"{name} is not uniformly spaced (required for simple CRVAL/CDELT WCS). "
+                f"Resample to a uniform grid first."
+            )
+        return step
+
+    dx = _uniform_step(x_new, "x_new")
+    dy = _uniform_step(y_new, "y_new")
+
+    ny, nx = I_new.shape
+
+    # reference pixel at image center (FITS is 1-indexed)
+    crpix1 = (nx + 1) / 2.0
+    crpix2 = (ny + 1) / 2.0
+    ix = int(np.round(crpix1 - 1))
+    iy = int(np.round(crpix2 - 1))
+
+    # build linear WCS: (x_offset, y_offset)
+    w = WCS(naxis=2)
+    w.wcs.crpix = [crpix1, crpix2]
+    w.wcs.crval = [float(x_new[ix]), float(y_new[iy])]
+    w.wcs.cdelt = [dx, dy]
+    w.wcs.pc = np.eye(2)
+    w.wcs.ctype = ["XOFFSET", "YOFFSET"]
+    w.wcs.cunit = ["deg", "deg"]
+
+    header = w.to_header()
+
+    # header info
+    header["DATE"] = Time.now().isot
+
+    # object / coordinate metadata
+    if source_name is not None:
+        header["OBJECT"] = str(source_name)
+
+    if ra_deg is not None:
+        header["OBJRA"] = float(ra_deg)
+        header["RADECSYS"] = "ICRS"
+        header["EQUINOX"] = 2000.0
+
+    if dec_deg is not None:
+        header["OBJDEC"] = float(dec_deg)
+        header["RADECSYS"] = "ICRS"
+        header["EQUINOX"] = 2000.0
+
+    # spectral / units
+    if observing_frequency_hz is not None:
+        header["OBSFREQ"] = float(observing_frequency_hz)  # Hz
+    if bunit is not None:
+        header["BUNIT"] = str(bunit)
+
+    # other stats
+    finite = np.isfinite(I_new)
+    if np.any(finite):
+        header["DATAMIN"] = float(np.nanmin(I_new))
+        header["DATAMAX"] = float(np.nanmax(I_new))
+
+    # extra header material
+    if extra_header:
+        for k, v in dict(extra_header).items():
+            header[str(k).upper()] = v
+
+    # primary image HDU
+    hdus = [fits.PrimaryHDU(data=I_new.astype(np.float32, copy=False), header=header)]
+
+    # store the exact axis vectors
+    if write_axes_extension:
+        col_x = fits.Column(
+            name="x_offset_centers", format="D", unit="deg", array=x_new.astype(float)
+        )
+        col_y = fits.Column(
+            name="y_offset_centers", format="D", unit="deg", array=y_new.astype(float)
+        )
+        axes_hdu = fits.BinTableHDU.from_columns([col_x, col_y], name="AXES")
+        hdus.append(axes_hdu)
+
+    fits.HDUList(hdus).writeto(filename, overwrite=overwrite)
 
 
 ###################################################
