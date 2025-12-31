@@ -6,8 +6,8 @@ import jetfuncs as jf
 
 @pytest.fixture(scope="module")
 def tiny_model():
-    # Keep this small so CI stays fast.
-    # pretab_dir=None forces “package data” loading, which is what you want to test.
+    # the idea is to keep this small so that CI stays fast
+    # pretab_dir=None forces “package data” loading
     return jf.JetModel(
         m=10.0,
         a=0.5,
