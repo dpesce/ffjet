@@ -639,6 +639,9 @@ class JetModel:
         self.use_log_xgrid = use_log_xgrid
         self.use_log_ygrid = use_log_ygrid
         self.use_log_zgrid = use_log_zgrid
+        self.x_im_1D_input = x_im_1D
+        self.y_im_1D_input = y_im_1D
+        self.z_im_1D_input = z_im_1D
 
         self.s = float(s)
         self.p = float(p)
@@ -998,7 +1001,9 @@ class JetModel:
         self.dz_1D = self.rg * np.abs(np.diff(self.z_im_1D))
 
     # primary image-generating function
-    def make_image(self, frequency, *, tau_stop=None, show_progress=False):
+    def make_image(
+        self, frequency, *, tau_stop=None, show_progress=False, heating_prescription="Poynting"
+    ):
         """
         Returns (x_im_1D, y_im_1D, I_nu)
         """
@@ -1316,7 +1321,12 @@ class JetModel:
             # synchrotron emissivity/absorption
             t_c = np.abs(z[idx_loc] * rg) / (c * gamma)
             gamma_c = (6.0 * np.pi * m_e * c) / (sigma_T * (Bprime_mag * Bprime_mag) * t_c)
-            u_pl = h * ((Bprime_mag * Bprime_mag) / (8.0 * np.pi))
+
+            if heating_prescription == "Poynting":
+                u_pl = h * S / c
+            elif heating_prescription == "magnetic":
+                u_pl = h * ((Bprime_mag * Bprime_mag) / (8.0 * np.pi))
+
             n_m = (((p - 2.0) * u_pl) / ((gamma_m**p) * m_e * (c * c))) * (
                 1.0 / ((gamma_m ** (2.0 - p)) - (gamma_max ** (2.0 - p)))
             )
@@ -1781,6 +1791,135 @@ class JetModel:
             return costhetaB
 
         return {}
+
+    # function to convert the units of an image from intensity to luminosity/flux/brightness temperature
+    def convert_units(self, I_nu, output_units="luminosity", D=None, frequency=None):
+        """
+        Returns the image in the requested units.
+
+        For flux units, the distance D to the source must be specified in Mpc.
+        For brightness temperature (Tb) units, the frequency must be specified in GHz.
+
+        Understood output units: luminosity, flux, Tb
+
+        """
+
+        if (
+            (self.x_im_1D_input is not None)
+            | (self.y_im_1D_input is not None)
+            | (self.z_im_1D_input is not None)
+        ):
+            print("Warning: using custom input grids may cause issues with unit conversion.")
+
+        # brightness temperature doesn't require any knowledge of pixel sizes
+        if output_units == "Tb":
+            # check that the frequency is provided
+            if frequency is None:
+                raise Exception(
+                    "For brightness temperature (Tb) units, the frequency must be specified in GHz."
+                )
+
+            # brightness temperature, in K
+            Tb = (3.255e18) * I_nu / (frequency**2.0)
+
+            return Tb
+
+        # determine pixel sizes in x-direction
+        if self.use_log_xgrid:
+            dx = np.zeros_like(self.x_im_1D)
+            for i in range(len(self.x_im_1D)):
+                if i == 0:
+                    xhi = np.sqrt(self.x_im_1D[i + 1] / self.x_im_1D[i]) * self.x_im_1D[i]
+                    xlo = np.sqrt(self.x_im_1D[i] / self.x_im_1D[i + 1]) * self.x_im_1D[i]
+                    dxhere = xhi - xlo
+                elif (self.x_im_1D[i - 1] > 0.0) & (i < (len(self.x_im_1D) - 1)):
+                    xhi = np.sqrt(self.x_im_1D[i + 1] / self.x_im_1D[i]) * self.x_im_1D[i]
+                    xlo = np.sqrt(self.x_im_1D[i - 1] / self.x_im_1D[i]) * self.x_im_1D[i]
+                    dxhere = xhi - xlo
+                elif (self.x_im_1D[i - 1] > 0.0) & (i == (len(self.x_im_1D) - 1)):
+                    xhi = np.sqrt(self.x_im_1D[i] / self.x_im_1D[i - 1]) * self.x_im_1D[i]
+                    xlo = np.sqrt(self.x_im_1D[i - 1] / self.x_im_1D[i]) * self.x_im_1D[i]
+                    dxhere = xhi - xlo
+                elif (self.x_im_1D[i + 1] < 0.0) & (i > 0):
+                    xhi = np.sqrt(self.x_im_1D[i + 1] / self.x_im_1D[i]) * self.x_im_1D[i]
+                    xlo = np.sqrt(self.x_im_1D[i - 1] / self.x_im_1D[i]) * self.x_im_1D[i]
+                    dxhere = xhi - xlo
+                if self.x_im_1D[i] == self.xmin:
+                    xhi = np.sqrt(self.x_im_1D[i + 1] / self.x_im_1D[i]) * self.x_im_1D[i]
+                    xlo = 0.0
+                    dxhere = xhi - xlo
+                if self.x_im_1D[i] == -self.xmin:
+                    xhi = 0.0
+                    xlo = np.sqrt(self.x_im_1D[i - 1] / self.x_im_1D[i]) * self.x_im_1D[i]
+                    dxhere = xhi - xlo
+                dx[i] = dxhere
+
+        else:
+            dx = np.mean(np.diff(self.x_im_1D)) + np.zeros_like(self.x_im_1D)
+
+        # determine pixel sizes in y-direction
+        if self.use_log_ygrid:
+            dy = np.zeros_like(self.y_im_1D)
+            for i in range(len(self.y_im_1D)):
+                if i == 0:
+                    yhi = np.sqrt(self.y_im_1D[i + 1] / self.y_im_1D[i]) * self.y_im_1D[i]
+                    ylo = np.sqrt(self.y_im_1D[i] / self.y_im_1D[i + 1]) * self.y_im_1D[i]
+                    dyhere = yhi - ylo
+                elif (self.y_im_1D[i - 1] > 0.0) & (i < (len(self.y_im_1D) - 1)):
+                    yhi = np.sqrt(self.y_im_1D[i + 1] / self.y_im_1D[i]) * self.y_im_1D[i]
+                    ylo = np.sqrt(self.y_im_1D[i - 1] / self.y_im_1D[i]) * self.y_im_1D[i]
+                    dyhere = yhi - ylo
+                elif (self.y_im_1D[i - 1] > 0.0) & (i == (len(self.y_im_1D) - 1)):
+                    yhi = np.sqrt(self.y_im_1D[i] / self.y_im_1D[i - 1]) * self.y_im_1D[i]
+                    ylo = np.sqrt(self.y_im_1D[i - 1] / self.y_im_1D[i]) * self.y_im_1D[i]
+                    dyhere = yhi - ylo
+                elif (self.y_im_1D[i + 1] < 0.0) & (i > 0):
+                    yhi = np.sqrt(self.y_im_1D[i + 1] / self.y_im_1D[i]) * self.y_im_1D[i]
+                    ylo = np.sqrt(self.y_im_1D[i - 1] / self.y_im_1D[i]) * self.y_im_1D[i]
+                    dyhere = yhi - ylo
+                if self.y_im_1D[i] == self.ymin:
+                    yhi = np.sqrt(self.y_im_1D[i + 1] / self.y_im_1D[i]) * self.y_im_1D[i]
+                    ylo = 0.0
+                    dyhere = yhi - ylo
+                if self.y_im_1D[i] == -self.ymin:
+                    yhi = 0.0
+                    ylo = np.sqrt(self.y_im_1D[i - 1] / self.y_im_1D[i]) * self.y_im_1D[i]
+                    dyhere = yhi - ylo
+                dy[i] = dyhere
+
+        else:
+            dy = np.mean(np.diff(self.y_im_1D)) + np.zeros_like(self.y_im_1D)
+
+        # determine pixel areas, in rg^2
+        dA = np.zeros_like(I_nu)
+        for i in range(len(dx)):
+            for j in range(len(dy)):
+                dA[j, i] = dx[i] * dy[j]
+
+        # convert to cgs
+        dA *= self.rg * self.rg
+
+        # luminosity density, in cgs
+        Lnu = dA * I_nu
+
+        if output_units == "luminosity":
+            return Lnu
+
+        # if user wants flux units
+        if output_units == "flux":
+            # check that the distance is provided
+            if D is None:
+                raise Exception(
+                    "For flux units, the distance D to the source must be specified in Mpc."
+                )
+
+            # convert distance from Mpc to cm
+            D_cm = D * (3.086e24)
+
+            # flux density, in cgs
+            Snu = Lnu / (D_cm**2.0)
+
+            return Snu
 
 
 ###################################################
