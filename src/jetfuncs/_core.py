@@ -1507,15 +1507,25 @@ class JetModel:
         return x_im_1D, y_im_1D, I_nu
 
     # function to extract physical quantities at a given (r,theta)
-    def get_quantity(self, r, theta, quantity="Bmag"):
+    def get_quantity(
+        self, r, theta, quantity="Bmag", frequency=None, heating_prescription="Poynting"
+    ):
         """
         Returns the requested quantity at the input (r,theta)
 
         Understood quantities: Bmag, Bx, By, Bz, Br, Btheta, Bphi,
                                Bmag_prime, Bx_prime, By_prime, Bz_prime,
-                               psi, Omega, Poynting, costhetaB
+                               psi, Omega, Poynting, costhetaB, gamma, beta,
+                               t_c, gamma_c, u_e, jI, alphaI
+
+        For jI and alphaI, the frequency must be specified in GHz.
 
         """
+
+        # check that the frequency is provided if necessary
+        if quantity in ["jI", "alphaI"]:
+            if frequency is None:
+                raise Exception("For jI and alphaI, the frequency must be specified in GHz.")
 
         # pull cached attributes into local variables
         rH = self.rH
@@ -1713,8 +1723,13 @@ class JetModel:
 
         indgamma = gamma > gammamax
         gamma[indgamma] = gammamax
+        if quantity == "gamma":
+            return gamma
 
         beta = np.sqrt(np.maximum(0.0, 1.0 - 1.0 / (gamma * gamma)))
+        if quantity == "beta":
+            return beta
+
         velscale = np.zeros_like(beta)
         mask_boost = beta_orig > 0.0
         velscale[mask_boost] = beta[mask_boost] / beta_orig[mask_boost]
@@ -1793,6 +1808,167 @@ class JetModel:
 
         if quantity == "costhetaB":
             return costhetaB
+
+        # synchrotron emissivity/absorption
+        t_c = np.abs(z * rg) / (c * gamma)
+        if quantity == "t_c":
+            return t_c
+
+        gamma_c = (6.0 * np.pi * m_e * c) / (sigma_T * (Bprime_mag * Bprime_mag) * t_c)
+        if quantity == "gamma_c":
+            return gamma_c
+
+        if heating_prescription == "Poynting":
+            u_pl = h * S / c
+        elif heating_prescription == "magnetic":
+            u_pl = h * ((Bprime_mag * Bprime_mag) / (8.0 * np.pi))
+        if quantity == "u_e":
+            return u_pl
+
+        n_m = (((p - 2.0) * u_pl) / ((gamma_m**p) * m_e * (c * c))) * (
+            1.0 / ((gamma_m ** (2.0 - p)) - (gamma_max ** (2.0 - p)))
+        )
+
+        ind_fast = gamma_c <= gamma_m
+        ind_slow = gamma_c > gamma_m
+
+        cosxi = costhetaB
+        anisotropy_term = 1.0 + ((eta - 1.0) * (cosxi * cosxi))
+
+        nup = (4.1987e-3) * Bprime_mag * sinthetaB
+        nu_nup = (frequency / g) / nup
+
+        jI = np.zeros_like(x)
+        alphaI = np.zeros_like(x)
+
+        # slow cooling
+        if np.any(ind_slow):
+            p1 = p
+            p2 = p + 1.0
+            g1 = gamma_m
+            g2 = gamma_c[ind_slow]
+            g3 = gamma_max
+            x1 = nu_nup[ind_slow] / (g1 * g1)
+            x2 = nu_nup[ind_slow] / (g2 * g2)
+            x3 = nu_nup[ind_slow] / (g3 * g3)
+            Pp1 = phi_norm_p
+            Pp2 = phi_norm_pp1
+            GIx_p1 = GIx_p
+            GIx_p2 = GIx_pp1
+            A_norm = 1.0 / (
+                (((g2 ** (1.0 - p1)) - (g1 ** (1.0 - p1))) / (1.0 - p1))
+                + ((g2 ** (p2 - p1)) * (((g3 ** (1.0 - p2)) - (g2 ** (1.0 - p2))) / (1.0 - p2)))
+            )
+            n = (
+                n_m[ind_slow]
+                * (gamma_m**p)
+                * (
+                    (((gamma_c[ind_slow] ** (1.0 - p)) - (gamma_m ** (1.0 - p))) / (1.0 - p))
+                    - (
+                        gamma_c[ind_slow]
+                        * (((gamma_max ** (-p)) - (gamma_c[ind_slow] ** (-p))) / p)
+                    )
+                )
+            )
+            prefac_j = prefac_emis * n * A_norm * nup[ind_slow]
+            term1 = (
+                ((anisotropy_term[ind_slow] ** (-p1 / 2.0)) / Pp1)
+                * (nu_nup[ind_slow] ** ((1.0 - p1) / 2.0))
+                * (GIx_p1(x2) - GIx_p1(x1))
+            )
+            term2 = (
+                (g2 ** (p2 - p1))
+                * ((anisotropy_term[ind_slow] ** (-p2 / 2.0)) / Pp2)
+                * (nu_nup[ind_slow] ** ((1.0 - p2) / 2.0))
+                * (GIx_p2(x3) - GIx_p2(x2))
+            )
+            jI[ind_slow] = prefac_j * (term1 + term2)
+
+            GaIx_p1 = GaIx_p
+            GaIx_p2 = GaIx_pp1
+            prefac_a = prefac_absorp * n * A_norm / nup[ind_slow]
+            term1 = (
+                ((p1 + 2.0) * ((anisotropy_term[ind_slow] ** (-p1 / 2.0)) / Pp1))
+                * (nu_nup[ind_slow] ** (-(p1 + 4.0) / 2.0))
+                * (GaIx_p1(x2) - GaIx_p1(x1))
+            )
+            term2 = (
+                (
+                    (p2 + 2.0)
+                    * (g2 ** (p2 - p1))
+                    * ((anisotropy_term[ind_slow] ** (-p2 / 2.0)) / Pp2)
+                )
+                * (nu_nup[ind_slow] ** (-(p2 + 4.0) / 2.0))
+                * (GaIx_p2(x3) - GaIx_p2(x2))
+            )
+            alphaI[ind_slow] = prefac_a * (term1 + term2)
+
+        # fast cooling
+        if np.any(ind_fast):
+            p1 = 2.0
+            p2 = p + 1.0
+            g1 = gamma_c[ind_fast]
+            g2 = gamma_m
+            g3 = gamma_max
+            x1 = nu_nup[ind_fast] / (g1 * g1)
+            x2 = nu_nup[ind_fast] / (g2 * g2)
+            x3 = nu_nup[ind_fast] / (g3 * g3)
+            Pp1 = phi_norm_2
+            Pp2 = phi_norm_pp1
+            GIx_p1 = GIx_2
+            GIx_p2 = GIx_pp1
+            A_norm = 1.0 / (
+                (((g2 ** (1.0 - p1)) - (g1 ** (1.0 - p1))) / (1.0 - p1))
+                + ((g2 ** (p2 - p1)) * (((g3 ** (1.0 - p2)) - (g2 ** (1.0 - p2))) / (1.0 - p2)))
+            )
+            n = (
+                n_m[ind_fast]
+                * (gamma_c[ind_fast])
+                * (
+                    (gamma_m * ((gamma_c[ind_fast] ** (-1.0)) - (gamma_m ** (-1.0))))
+                    + ((gamma_m**p) * (((gamma_m ** (-p)) - (gamma_max ** (-p))) / p))
+                )
+            )
+            prefac_j = prefac_emis * n * A_norm * nup[ind_fast]
+            term1 = (
+                ((anisotropy_term[ind_fast] ** (-p1 / 2.0)) / Pp1)
+                * (nu_nup[ind_fast] ** ((1.0 - p1) / 2.0))
+                * (GIx_p1(x2) - GIx_p1(x1))
+            )
+            term2 = (
+                (g2 ** (p2 - p1))
+                * ((anisotropy_term[ind_fast] ** (-p2 / 2.0)) / Pp2)
+                * (nu_nup[ind_fast] ** ((1.0 - p2) / 2.0))
+                * (GIx_p2(x3) - GIx_p2(x2))
+            )
+            jI[ind_fast] = prefac_j * (term1 + term2)
+
+            GaIx_p1 = GaIx_2
+            GaIx_p2 = GaIx_pp1
+            prefac_a = prefac_absorp * n * A_norm / nup[ind_fast]
+            term1 = (
+                ((p1 + 2.0) * ((anisotropy_term[ind_fast] ** (-p1 / 2.0)) / Pp1))
+                * (nu_nup[ind_fast] ** (-(p1 + 4.0) / 2.0))
+                * (GaIx_p1(x2) - GaIx_p1(x1))
+            )
+            term2 = (
+                (
+                    (p2 + 2.0)
+                    * (g2 ** (p2 - p1))
+                    * ((anisotropy_term[ind_fast] ** (-p2 / 2.0)) / Pp2)
+                )
+                * (nu_nup[ind_fast] ** (-(p2 + 4.0) / 2.0))
+                * (GaIx_p2(x3) - GaIx_p2(x2))
+            )
+            alphaI[ind_fast] = prefac_a * (term1 + term2)
+
+        alphaI = np.nan_to_num(alphaI, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+        alphaI = np.maximum(alphaI, 0.0)
+
+        if quantity == "jI":
+            return jI
+        if quantity == "alphaI":
+            return alphaI
 
         return {}
 
