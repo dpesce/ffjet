@@ -14,6 +14,7 @@ The code is only tested on Python 3.9 and higher, and it may break for earlier v
     $ git clone https://github.com/dpesce/ffjet
     $ python -m venv .venv
     $ source .venv/bin/activate
+    (.venv) $ cd ffjet
     (.venv) $ pip install .
 ```
 
@@ -27,4 +28,13 @@ There is an optional progress bar functionality that uses [`tqdm`](https://tqdm.
 
 ```
     pip install "ffjet[progress] @ git+https://github.com/dpesce/ffjet.git"
+```
+
+## Checking that it works
+
+There are a number of example scripts contained in the [examples](./examples/) folder folder. You can check to make sure your installation is working by running one of these scripts, e.g.:
+
+```
+    cd ./examples
+    python ./simulate_jet_image.py
 ```
