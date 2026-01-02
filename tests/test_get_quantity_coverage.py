@@ -29,9 +29,10 @@ def test_get_quantity_basic_fields_and_poynting():
     psi = model.get_quantity(r, th, quantity="psi")
     Omega = model.get_quantity(r, th, quantity="Omega")
     Bmag = model.get_quantity(r, th, quantity="Bmag")
-    S = model.get_quantity(r, th, quantity="Poynting")  # name is "Poynting"
+    S = model.get_quantity(r, th, quantity="Poynting")
+    alphaI = model.get_quantity(r, th, quantity="alphaI", frequency=230.0)
 
-    for arr in (psi, Omega, Bmag, S):
+    for arr in (psi, Omega, Bmag, S, alphaI):
         assert np.shape(arr) == np.shape(r)
         assert np.all(np.isfinite(arr))
 
