@@ -985,6 +985,17 @@ class JetModel:
         self.phi_norm_pp1 = np.sum(
             0.5 * (integrand[1:] + integrand[:-1]) * (dummu[1:] - dummu[:-1])
         )
+        p_eta = 0.5 * (2.0 * p + 1.0)
+        integrand = (1.0 + ((eta - 1.0) * (dummu * dummu))) ** (-p_eta / 2.0)
+        self.phi_norm_slow = np.sum(
+            0.5 * (integrand[1:] + integrand[:-1]) * (dummu[1:] - dummu[:-1])
+        )
+
+        p_eta = 0.5 * (p + 3.0)
+        integrand = (1.0 + ((eta - 1.0) * (dummu * dummu))) ** (-p_eta / 2.0)
+        self.phi_norm_fast = np.sum(
+            0.5 * (integrand[1:] + integrand[:-1]) * (dummu[1:] - dummu[:-1])
+        )
 
     # construct the image and jet-frame grids
     @staticmethod
@@ -1066,6 +1077,8 @@ class JetModel:
         phi_norm_2 = self.phi_norm_2
         phi_norm_p = self.phi_norm_p
         phi_norm_pp1 = self.phi_norm_pp1
+        phi_norm_slow = self.phi_norm_slow
+        phi_norm_fast = self.phi_norm_fast
 
         GIx_2 = self.GIx_2
         GIx_p = self.GIx_p
@@ -1360,7 +1373,7 @@ class JetModel:
             if heating_prescription == "Poynting":
                 u_pl = h * S / (gamma * c)
             elif heating_prescription == "magnetic":
-                u_pl = h * ((Bprime_mag * Bprime_mag) / (8.0 * np.pi * gamma))
+                u_pl = h * ((Bprime_mag * Bprime_mag) / (8.0 * np.pi))
 
             n_m = (((p - 2.0) * u_pl) / ((gamma_m**p) * m_e * (c * c))) * (
                 1.0 / ((gamma_m ** (2.0 - p)) - (gamma_max ** (2.0 - p)))
@@ -1382,14 +1395,15 @@ class JetModel:
             if np.any(ind_slow):
                 p1 = p
                 p2 = p + 1.0
+                p_eta = 0.5 * (p1 + p2)
                 g1 = gamma_m
                 g2 = gamma_c[ind_slow]
                 g3 = gamma_max
                 x1 = nu_nup[ind_slow] / (g1 * g1)
                 x2 = nu_nup[ind_slow] / (g2 * g2)
                 x3 = nu_nup[ind_slow] / (g3 * g3)
-                Pp1 = phi_norm_p
-                Pp2 = phi_norm_pp1
+                Pp1 = phi_norm_slow
+                Pp2 = phi_norm_slow
                 GIx_p1 = GIx_p
                 GIx_p2 = GIx_pp1
                 A_norm = 1.0 / (
@@ -1409,13 +1423,13 @@ class JetModel:
                 )
                 prefac_j = prefac_emis * n * A_norm * nup[ind_slow]
                 term1 = (
-                    ((anisotropy_term[ind_slow] ** (-p1 / 2.0)) / Pp1)
+                    ((anisotropy_term[ind_slow] ** (-p_eta / 2.0)) / Pp1)
                     * (nu_nup[ind_slow] ** ((1.0 - p1) / 2.0))
                     * (GIx_p1(x2) - GIx_p1(x1))
                 )
                 term2 = (
                     (g2 ** (p2 - p1))
-                    * ((anisotropy_term[ind_slow] ** (-p2 / 2.0)) / Pp2)
+                    * ((anisotropy_term[ind_slow] ** (-p_eta / 2.0)) / Pp2)
                     * (nu_nup[ind_slow] ** ((1.0 - p2) / 2.0))
                     * (GIx_p2(x3) - GIx_p2(x2))
                 )
@@ -1425,7 +1439,7 @@ class JetModel:
                 GaIx_p2 = GaIx_pp1
                 prefac_a = prefac_absorp * n * A_norm / nup[ind_slow]
                 term1 = (
-                    ((p1 + 2.0) * ((anisotropy_term[ind_slow] ** (-p1 / 2.0)) / Pp1))
+                    ((p1 + 2.0) * ((anisotropy_term[ind_slow] ** (-p_eta / 2.0)) / Pp1))
                     * (nu_nup[ind_slow] ** (-(p1 + 4.0) / 2.0))
                     * (GaIx_p1(x2) - GaIx_p1(x1))
                 )
@@ -1433,7 +1447,7 @@ class JetModel:
                     (
                         (p2 + 2.0)
                         * (g2 ** (p2 - p1))
-                        * ((anisotropy_term[ind_slow] ** (-p2 / 2.0)) / Pp2)
+                        * ((anisotropy_term[ind_slow] ** (-p_eta / 2.0)) / Pp2)
                     )
                     * (nu_nup[ind_slow] ** (-(p2 + 4.0) / 2.0))
                     * (GaIx_p2(x3) - GaIx_p2(x2))
@@ -1444,14 +1458,15 @@ class JetModel:
             if np.any(ind_fast):
                 p1 = 2.0
                 p2 = p + 1.0
+                p_eta = 0.5 * (p1 + p2)
                 g1 = gamma_c[ind_fast]
                 g2 = gamma_m
                 g3 = gamma_max
                 x1 = nu_nup[ind_fast] / (g1 * g1)
                 x2 = nu_nup[ind_fast] / (g2 * g2)
                 x3 = nu_nup[ind_fast] / (g3 * g3)
-                Pp1 = phi_norm_2
-                Pp2 = phi_norm_pp1
+                Pp1 = phi_norm_fast
+                Pp2 = phi_norm_fast
                 GIx_p1 = GIx_2
                 GIx_p2 = GIx_pp1
                 A_norm = 1.0 / (
@@ -1468,13 +1483,13 @@ class JetModel:
                 )
                 prefac_j = prefac_emis * n * A_norm * nup[ind_fast]
                 term1 = (
-                    ((anisotropy_term[ind_fast] ** (-p1 / 2.0)) / Pp1)
+                    ((anisotropy_term[ind_fast] ** (-p_eta / 2.0)) / Pp1)
                     * (nu_nup[ind_fast] ** ((1.0 - p1) / 2.0))
                     * (GIx_p1(x2) - GIx_p1(x1))
                 )
                 term2 = (
                     (g2 ** (p2 - p1))
-                    * ((anisotropy_term[ind_fast] ** (-p2 / 2.0)) / Pp2)
+                    * ((anisotropy_term[ind_fast] ** (-p_eta / 2.0)) / Pp2)
                     * (nu_nup[ind_fast] ** ((1.0 - p2) / 2.0))
                     * (GIx_p2(x3) - GIx_p2(x2))
                 )
@@ -1484,7 +1499,7 @@ class JetModel:
                 GaIx_p2 = GaIx_pp1
                 prefac_a = prefac_absorp * n * A_norm / nup[ind_fast]
                 term1 = (
-                    ((p1 + 2.0) * ((anisotropy_term[ind_fast] ** (-p1 / 2.0)) / Pp1))
+                    ((p1 + 2.0) * ((anisotropy_term[ind_fast] ** (-p_eta / 2.0)) / Pp1))
                     * (nu_nup[ind_fast] ** (-(p1 + 4.0) / 2.0))
                     * (GaIx_p1(x2) - GaIx_p1(x1))
                 )
@@ -1492,7 +1507,7 @@ class JetModel:
                     (
                         (p2 + 2.0)
                         * (g2 ** (p2 - p1))
-                        * ((anisotropy_term[ind_fast] ** (-p2 / 2.0)) / Pp2)
+                        * ((anisotropy_term[ind_fast] ** (-p_eta / 2.0)) / Pp2)
                     )
                     * (nu_nup[ind_fast] ** (-(p2 + 4.0) / 2.0))
                     * (GaIx_p2(x3) - GaIx_p2(x2))
@@ -1547,16 +1562,16 @@ class JetModel:
         Understood quantities: Bmag, Bx, By, Bz, Br, Btheta, Bphi,
                                Bmag_prime, Bx_prime, By_prime, Bz_prime,
                                psi, Omega, Poynting, costhetaB, gamma, beta,
-                               t_c, gamma_c, u_e, jI, alphaI
+                               t_c, gamma_c, u_e, nu_p, jI, alphaI
 
         For jI and alphaI, the frequency must be specified in GHz.
 
         """
 
         # check that the frequency is provided if necessary
-        if quantity in ["jI", "alphaI"]:
+        if quantity in ["jI", "alphaI", "nu_p"]:
             if frequency is None:
-                raise Exception("For jI and alphaI, the frequency must be specified in GHz.")
+                raise Exception("For jI, alphaI, or nu_p, the frequency must be specified in GHz.")
 
         # pull cached attributes into local variables
         rH = self.rH
@@ -1581,6 +1596,8 @@ class JetModel:
         phi_norm_2 = self.phi_norm_2
         phi_norm_p = self.phi_norm_p
         phi_norm_pp1 = self.phi_norm_pp1
+        phi_norm_slow = self.phi_norm_slow
+        phi_norm_fast = self.phi_norm_fast
 
         GIx_2 = self.GIx_2
         GIx_p = self.GIx_p
@@ -1852,7 +1869,7 @@ class JetModel:
         if heating_prescription == "Poynting":
             u_pl = h * S / (gamma * c)
         elif heating_prescription == "magnetic":
-            u_pl = h * ((Bprime_mag * Bprime_mag) / (8.0 * np.pi * gamma))
+            u_pl = h * ((Bprime_mag * Bprime_mag) / (8.0 * np.pi))
         if quantity == "u_e":
             return u_pl
 
@@ -1870,6 +1887,9 @@ class JetModel:
             nup = (4.1987e-3) * Bprime_mag * sinthetaB
             nu_nup = (frequency / g) / nup
 
+            if quantity == "nu_p":
+                return nup
+
             jI = np.zeros_like(x)
             alphaI = np.zeros_like(x)
 
@@ -1877,14 +1897,15 @@ class JetModel:
             if np.any(ind_slow):
                 p1 = p
                 p2 = p + 1.0
+                p_eta = 0.5 * (p1 + p2)
                 g1 = gamma_m
                 g2 = gamma_c[ind_slow]
                 g3 = gamma_max
                 x1 = nu_nup[ind_slow] / (g1 * g1)
                 x2 = nu_nup[ind_slow] / (g2 * g2)
                 x3 = nu_nup[ind_slow] / (g3 * g3)
-                Pp1 = phi_norm_p
-                Pp2 = phi_norm_pp1
+                Pp1 = phi_norm_slow
+                Pp2 = phi_norm_slow
                 GIx_p1 = GIx_p
                 GIx_p2 = GIx_pp1
                 A_norm = 1.0 / (
@@ -1904,13 +1925,13 @@ class JetModel:
                 )
                 prefac_j = prefac_emis * n * A_norm * nup[ind_slow]
                 term1 = (
-                    ((anisotropy_term[ind_slow] ** (-p1 / 2.0)) / Pp1)
+                    ((anisotropy_term[ind_slow] ** (-p_eta / 2.0)) / Pp1)
                     * (nu_nup[ind_slow] ** ((1.0 - p1) / 2.0))
                     * (GIx_p1(x2) - GIx_p1(x1))
                 )
                 term2 = (
                     (g2 ** (p2 - p1))
-                    * ((anisotropy_term[ind_slow] ** (-p2 / 2.0)) / Pp2)
+                    * ((anisotropy_term[ind_slow] ** (-p_eta / 2.0)) / Pp2)
                     * (nu_nup[ind_slow] ** ((1.0 - p2) / 2.0))
                     * (GIx_p2(x3) - GIx_p2(x2))
                 )
@@ -1920,7 +1941,7 @@ class JetModel:
                 GaIx_p2 = GaIx_pp1
                 prefac_a = prefac_absorp * n * A_norm / nup[ind_slow]
                 term1 = (
-                    ((p1 + 2.0) * ((anisotropy_term[ind_slow] ** (-p1 / 2.0)) / Pp1))
+                    ((p1 + 2.0) * ((anisotropy_term[ind_slow] ** (-p_eta / 2.0)) / Pp1))
                     * (nu_nup[ind_slow] ** (-(p1 + 4.0) / 2.0))
                     * (GaIx_p1(x2) - GaIx_p1(x1))
                 )
@@ -1928,7 +1949,7 @@ class JetModel:
                     (
                         (p2 + 2.0)
                         * (g2 ** (p2 - p1))
-                        * ((anisotropy_term[ind_slow] ** (-p2 / 2.0)) / Pp2)
+                        * ((anisotropy_term[ind_slow] ** (-p_eta / 2.0)) / Pp2)
                     )
                     * (nu_nup[ind_slow] ** (-(p2 + 4.0) / 2.0))
                     * (GaIx_p2(x3) - GaIx_p2(x2))
@@ -1939,14 +1960,15 @@ class JetModel:
             if np.any(ind_fast):
                 p1 = 2.0
                 p2 = p + 1.0
+                p_eta = 0.5 * (p1 + p2)
                 g1 = gamma_c[ind_fast]
                 g2 = gamma_m
                 g3 = gamma_max
                 x1 = nu_nup[ind_fast] / (g1 * g1)
                 x2 = nu_nup[ind_fast] / (g2 * g2)
                 x3 = nu_nup[ind_fast] / (g3 * g3)
-                Pp1 = phi_norm_2
-                Pp2 = phi_norm_pp1
+                Pp1 = phi_norm_fast
+                Pp2 = phi_norm_fast
                 GIx_p1 = GIx_2
                 GIx_p2 = GIx_pp1
                 A_norm = 1.0 / (
@@ -1963,13 +1985,13 @@ class JetModel:
                 )
                 prefac_j = prefac_emis * n * A_norm * nup[ind_fast]
                 term1 = (
-                    ((anisotropy_term[ind_fast] ** (-p1 / 2.0)) / Pp1)
+                    ((anisotropy_term[ind_fast] ** (-p_eta / 2.0)) / Pp1)
                     * (nu_nup[ind_fast] ** ((1.0 - p1) / 2.0))
                     * (GIx_p1(x2) - GIx_p1(x1))
                 )
                 term2 = (
                     (g2 ** (p2 - p1))
-                    * ((anisotropy_term[ind_fast] ** (-p2 / 2.0)) / Pp2)
+                    * ((anisotropy_term[ind_fast] ** (-p_eta / 2.0)) / Pp2)
                     * (nu_nup[ind_fast] ** ((1.0 - p2) / 2.0))
                     * (GIx_p2(x3) - GIx_p2(x2))
                 )
@@ -1979,7 +2001,7 @@ class JetModel:
                 GaIx_p2 = GaIx_pp1
                 prefac_a = prefac_absorp * n * A_norm / nup[ind_fast]
                 term1 = (
-                    ((p1 + 2.0) * ((anisotropy_term[ind_fast] ** (-p1 / 2.0)) / Pp1))
+                    ((p1 + 2.0) * ((anisotropy_term[ind_fast] ** (-p_eta / 2.0)) / Pp1))
                     * (nu_nup[ind_fast] ** (-(p1 + 4.0) / 2.0))
                     * (GaIx_p1(x2) - GaIx_p1(x1))
                 )
@@ -1987,7 +2009,7 @@ class JetModel:
                     (
                         (p2 + 2.0)
                         * (g2 ** (p2 - p1))
-                        * ((anisotropy_term[ind_fast] ** (-p2 / 2.0)) / Pp2)
+                        * ((anisotropy_term[ind_fast] ** (-p_eta / 2.0)) / Pp2)
                     )
                     * (nu_nup[ind_fast] ** (-(p2 + 4.0) / 2.0))
                     * (GaIx_p2(x3) - GaIx_p2(x2))
