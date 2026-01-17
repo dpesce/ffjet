@@ -1358,9 +1358,9 @@ class JetModel:
             gamma_c = (6.0 * np.pi * m_e * c) / (sigma_T * (Bprime_mag * Bprime_mag) * t_c)
 
             if heating_prescription == "Poynting":
-                u_pl = h * S / c
+                u_pl = h * S / (gamma * c)
             elif heating_prescription == "magnetic":
-                u_pl = h * ((Bprime_mag * Bprime_mag) / (8.0 * np.pi))
+                u_pl = h * ((Bprime_mag * Bprime_mag) / (8.0 * np.pi * gamma))
 
             n_m = (((p - 2.0) * u_pl) / ((gamma_m**p) * m_e * (c * c))) * (
                 1.0 / ((gamma_m ** (2.0 - p)) - (gamma_max ** (2.0 - p)))
@@ -1850,9 +1850,9 @@ class JetModel:
             return gamma_c
 
         if heating_prescription == "Poynting":
-            u_pl = h * S / c
+            u_pl = h * S / (gamma * c)
         elif heating_prescription == "magnetic":
-            u_pl = h * ((Bprime_mag * Bprime_mag) / (8.0 * np.pi))
+            u_pl = h * ((Bprime_mag * Bprime_mag) / (8.0 * np.pi * gamma))
         if quantity == "u_e":
             return u_pl
 
