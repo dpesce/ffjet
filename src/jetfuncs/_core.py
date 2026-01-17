@@ -367,6 +367,29 @@ def u_driftframe(
         Esq = (E1_cov * E1) + (E2_cov * E2) + (E3_cov * E3)
 
         ########################
+        # enforce magnetic dominance: Esq/Bsq < 1
+
+        eps_EB = 1.0e-8
+        ratio_raw = Esq / Bsq
+
+        mask = ratio_raw >= (1.0 - eps_EB)
+        if np.any(mask):
+            # scale E -> E * sqrt((1-eps)/ratio_raw)
+            scl = np.ones_like(ratio_raw)
+            scl[mask] = np.sqrt((1.0 - eps_EB) / ratio_raw[mask])
+
+            E1 = E1 * scl
+            E2 = E2 * scl
+            E3 = E3 * scl
+            E1_cov = E1_cov * scl
+            E2_cov = E2_cov * scl
+            E3_cov = E3_cov * scl
+
+            Esq = (E1_cov * E1) + (E2_cov * E2) + (E3_cov * E3)
+
+        ratio = np.clip(Esq / Bsq, 0.0, 1.0 - eps_EB)
+
+        ########################
         # compute the parallel boost
 
         # compute metric quantities associated with stagnation radius
@@ -398,8 +421,6 @@ def u_driftframe(
         Aconst2 = Aconst * Aconst
 
         vphiupper = (alpha / (Bsq * gdet)) * (E1_cov * B2_cov - B1_cov * E2_cov)
-        ratio = Esq / Bsq
-        ratio = np.clip(ratio, 0.0, 1.0 - 1e-8)
         gammap = 1.0 / np.sqrt(1.0 - ratio)
         Bhatphi = B3 / np.sqrt(Bsq)
 
@@ -435,8 +456,18 @@ def u_driftframe(
         v2 = vperp2 + vpar2
         v3 = vperp3 + vpar3
 
+        eps_v = 1e-12
         vsq = g11 * v1 * v1 + g22 * v2 * v2 + g33 * v3 * v3
-        gamma = 1.0 / np.sqrt(1 - vsq)
+
+        mask = vsq >= (1.0 - eps_v)
+        if np.any(mask):
+            fac = np.sqrt((1.0 - eps_v) / vsq[mask])
+            v1[mask] *= fac
+            v2[mask] *= fac
+            v3[mask] *= fac
+            vsq[mask] = 1.0 - eps_v
+
+        gamma = 1.0 / np.sqrt(1.0 - vsq)
 
         Xi = (r2 + a2) ** 2 - Delta * a2 * sth2
         eta3 = 2.0 * a * r / np.sqrt(Delta * Sigma * Xi)
