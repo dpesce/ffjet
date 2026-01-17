@@ -911,43 +911,43 @@ class JetModel:
             with as_file(files("jetfuncs") / "synchrotron_integrals") as dpath:
                 d = str(dpath)
                 self.x_GI_2, self.GI_2 = self._load_table_xy(
-                    os.path.join(d, "GIx", f"GIx_p={np.round(2.0, 2)}.txt")
+                    os.path.join(d, "GIx", f"GIx_p={2.0:.2f}.txt")
                 )
                 self.x_GI_p, self.GI_p = self._load_table_xy(
-                    os.path.join(d, "GIx", f"GIx_p={np.round(p, 2)}.txt")
+                    os.path.join(d, "GIx", f"GIx_p={p:.2f}.txt")
                 )
                 self.x_GI_pp1, self.GI_pp1 = self._load_table_xy(
-                    os.path.join(d, "GIx", f"GIx_p={np.round(p + 1.0, 2)}.txt")
+                    os.path.join(d, "GIx", f"GIx_p={p + 1.0:.2f}.txt")
                 )
                 self.x_GaI_2, self.GaI_2 = self._load_table_xy(
-                    os.path.join(d, "GaIx", f"GaIx_p={np.round(2.0, 2)}.txt")
+                    os.path.join(d, "GaIx", f"GaIx_p={2.0:.2f}.txt")
                 )
                 self.x_GaI_p, self.GaI_p = self._load_table_xy(
-                    os.path.join(d, "GaIx", f"GaIx_p={np.round(p, 2)}.txt")
+                    os.path.join(d, "GaIx", f"GaIx_p={p:.2f}.txt")
                 )
                 self.x_GaI_pp1, self.GaI_pp1 = self._load_table_xy(
-                    os.path.join(d, "GaIx", f"GaIx_p={np.round(p + 1.0, 2)}.txt")
+                    os.path.join(d, "GaIx", f"GaIx_p={p + 1.0:.2f}.txt")
                 )
 
         else:
             d = self.pretab_dir
             self.x_GI_2, self.GI_2 = self._load_table_xy(
-                os.path.join(d, "GIx", f"GIx_p={np.round(2.0, 2)}.txt")
+                os.path.join(d, "GIx", f"GIx_p={2.0:.2f}.txt")
             )
             self.x_GI_p, self.GI_p = self._load_table_xy(
-                os.path.join(d, "GIx", f"GIx_p={np.round(p, 2)}.txt")
+                os.path.join(d, "GIx", f"GIx_p={p:.2f}.txt")
             )
             self.x_GI_pp1, self.GI_pp1 = self._load_table_xy(
-                os.path.join(d, "GIx", f"GIx_p={np.round(p + 1.0, 2)}.txt")
+                os.path.join(d, "GIx", f"GIx_p={p + 1.0:.2f}.txt")
             )
             self.x_GaI_2, self.GaI_2 = self._load_table_xy(
-                os.path.join(d, "GaIx", f"GaIx_p={np.round(2.0, 2)}.txt")
+                os.path.join(d, "GaIx", f"GaIx_p={2.0:.2f}.txt")
             )
             self.x_GaI_p, self.GaI_p = self._load_table_xy(
-                os.path.join(d, "GaIx", f"GaIx_p={np.round(p, 2)}.txt")
+                os.path.join(d, "GaIx", f"GaIx_p={p:.2f}.txt")
             )
             self.x_GaI_pp1, self.GaI_pp1 = self._load_table_xy(
-                os.path.join(d, "GaIx", f"GaIx_p={np.round(p + 1.0, 2)}.txt")
+                os.path.join(d, "GaIx", f"GaIx_p={p + 1.0:.2f}.txt")
             )
 
     # helper functions so the RT loop can use a simplified GIx_*/GaIx_* call style
