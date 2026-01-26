@@ -1370,9 +1370,6 @@ class JetModel:
             t_c = np.abs(z[idx_loc] * rg) / (c * gamma)
             gamma_c = (6.0 * np.pi * m_e * c) / (sigma_T * (Bprime_mag * Bprime_mag) * t_c)
 
-            # put a floor on gamma_c of 1
-            gamma_c = np.maximum(gamma_c, 1.0)
-
             if heating_prescription == "Poynting":
                 u_pl = h * S / (c * gamma)
             elif heating_prescription == "magnetic":
@@ -1866,7 +1863,6 @@ class JetModel:
             return t_c
 
         gamma_c = (6.0 * np.pi * m_e * c) / (sigma_T * (Bprime_mag * Bprime_mag) * t_c)
-        gamma_c = np.maximum(gamma_c, 1.0)
         if quantity == "gamma_c":
             return gamma_c
 
