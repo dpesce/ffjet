@@ -1165,10 +1165,14 @@ class JetModel:
             theta_fp[mask_sin] = 2.0 * np.arcsin(arg_arcsin[mask_sin])
             theta_fp[~mask_sin] = 2.0 * np.arccos(arg_arccos[~mask_sin])
 
+            # horizon buffer (avoids numerical artifacts)
+            eps_h = 1.0e-2
+            r_min = rH * (1.0 + eps_h)
+
             # jet region
             rjet1 = rH * np.power(1.0 / one_minus_costheta, 1.0 / nu)
             rjet2 = rH * np.power(1.0 / one_plus_costheta, 1.0 / nu)
-            ind_jet = ((r <= rjet1) | (r <= rjet2)) & (r > rH)
+            ind_jet = ((r <= rjet1) | (r <= rjet2)) & (r > r_min)
 
             if jet_cutout_fraction > 0.0:
                 theta_fp_cut = 2.0 * np.arcsin(jet_cutout_fraction / np.sqrt(2.0))
@@ -1199,6 +1203,11 @@ class JetModel:
 
             rho2 = r2[idx_loc] + (a2 * cth2)
             Delta = r2pa2 - (2.0 * r[idx_loc])
+
+            # horizon buffer for Delta
+            Delta_min = (r_min * r_min) - 2.0 * r_min + a2
+            Delta = np.maximum(Delta, Delta_min)
+
             Sigma = (r2pa2 * r2pa2) - (a2 * Delta * sth2)
             alphalapse = np.sqrt(Delta * rho2 / Sigma)
 
@@ -1321,7 +1330,7 @@ class JetModel:
             # redshift factor
             k_par = (vhat_x * nx) + (vhat_y * ny) + (vhat_z * nz)
             one_m_betak = 1.0 - (beta * k_par)
-            g = 1.0 / (gamma * one_m_betak)
+            g = alphalapse / (gamma * one_m_betak)
             g[~np.isfinite(g)] = 1.0
 
             # photon direction in comoving frame
@@ -1660,6 +1669,13 @@ class JetModel:
 
         rho2 = r2 + (a2 * cth2)
         Delta = r2pa2 - (2.0 * r)
+
+        # horizon buffer for Delta
+        eps_h = 1.0e-2
+        r_min = rH * (1.0 + eps_h)
+        Delta_min = (r_min * r_min) - 2.0 * r_min + a2
+        Delta = np.maximum(Delta, Delta_min)
+
         Sigma = (r2pa2 * r2pa2) - (a2 * Delta * sth2)
         alphalapse = np.sqrt(Delta * rho2 / Sigma)
 
@@ -1802,7 +1818,7 @@ class JetModel:
         # redshift factor
         k_par = (vhat_x * nx) + (vhat_y * ny) + (vhat_z * nz)
         one_m_betak = 1.0 - (beta * k_par)
-        g = 1.0 / (gamma * one_m_betak)
+        g = alphalapse / (gamma * one_m_betak)
         g[~np.isfinite(g)] = 1.0
 
         # photon direction in comoving frame
