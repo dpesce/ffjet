@@ -41,7 +41,7 @@ def test_get_quantity_basic_fields_and_poynting():
 
 
 def test_get_quantity_Bprime_reduces_to_lab_B_when_velocity_suppressed():
-    # betagamma_suppression=0 drives beta->0 and triggers the small-v overwrite:
+    # gammabeta_suppression=0 drives beta->0 and triggers the small-v overwrite:
     # Bprime_*[~mask_v] = B*
     model = jf.JetModel(
         m=10.0,
@@ -51,7 +51,7 @@ def test_get_quantity_Bprime_reduces_to_lab_B_when_velocity_suppressed():
         Nx=2,
         Ny=2,
         Nz=2,
-        betagamma_suppression=0.0,
+        gammabeta_suppression=0.0,
         pretab_dir=None,
     )
 
