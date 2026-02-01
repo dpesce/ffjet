@@ -308,7 +308,7 @@ def u_driftframe(
     bfield=None,
     nu_parallel=0,
     th=np.pi / 2,
-    gammamax=None,
+    gamma_inf=None,
     retbunit=False,
     retqty=False,
     eps=-1,
@@ -573,10 +573,10 @@ def u_driftframe(
     vsq = g11 * v1 * v1 + g22 * v2 * v2 + g33 * v3 * v3
     gamma = 1.0 / np.sqrt(1 - vsq)
 
-    if gammamax:  # approximate MHD gamma by summing gamma_FF and gamma_max in series
+    if gamma_inf:  # approximate MHD gamma by summing gamma_FF and gamma_max in series
         pval0 = 2.0
-        gammamax = gammamax * np.ones_like(gamma)
-        gammaeff = (1 / gammamax**pval0 + 1 / gamma**pval0) ** (-1 / pval0)
+        gamma_inf = gamma_inf * np.ones_like(gamma)
+        gammaeff = (1 / gamma_inf**pval0 + 1 / gamma**pval0) ** (-1 / pval0)
 
         gammamin = np.nanmin(gammaeff)
         argdiv = gammaeff == gammamin
@@ -652,10 +652,11 @@ class JetModel:
         h=0.0025,
         eta=0.01,
         jet_cutout_fraction=0.0,
-        gammamax=6.0,
-        betagamma_suppression=0.5,
+        gamma_inf=6.0,
         gamma_m=30.0,
         gamma_max=1.0e8,
+        p_eta=2.0,
+        gammabeta_suppression=0.5,
         DTYPE=np.float64,
         pretab_dir=None,
     ):
@@ -683,10 +684,11 @@ class JetModel:
         self.h = float(h)
         self.eta = float(eta)
         self.jet_cutout_fraction = float(jet_cutout_fraction)
-        self.gammamax = float(gammamax)
-        self.betagamma_suppression = float(betagamma_suppression)
+        self.gamma_inf = float(gamma_inf)
         self.gamma_m = float(gamma_m)
         self.gamma_max = float(gamma_max)
+        self.p_eta = float(p_eta)
+        self.gammabeta_suppression = float(gammabeta_suppression)
         self.DTYPE = DTYPE
 
         self.pretab_dir = pretab_dir
@@ -878,7 +880,7 @@ class JetModel:
             Omegahere,
             bfield=bf_here,
             nu_parallel="FF",
-            gammamax=None,
+            gamma_inf=None,
             th=thetahere,
             retqty=True,
         )
@@ -972,30 +974,11 @@ class JetModel:
     # compute normalizations for the anisotropic distributions
     def _compute_phi_norms(self):
         eta = self.eta
-        p = self.p
+        p_eta = self.p_eta
 
         dummu = np.linspace(0.0, 1.0, 10000)
-        integrand = (1.0 + ((eta - 1.0) * (dummu * dummu))) ** (-1.0)
-        self.phi_norm_2 = np.sum(0.5 * (integrand[1:] + integrand[:-1]) * (dummu[1:] - dummu[:-1]))
-
-        integrand = (1.0 + ((eta - 1.0) * (dummu * dummu))) ** (-p / 2.0)
-        self.phi_norm_p = np.sum(0.5 * (integrand[1:] + integrand[:-1]) * (dummu[1:] - dummu[:-1]))
-
-        integrand = (1.0 + ((eta - 1.0) * (dummu * dummu))) ** (-(p + 1.0) / 2.0)
-        self.phi_norm_pp1 = np.sum(
-            0.5 * (integrand[1:] + integrand[:-1]) * (dummu[1:] - dummu[:-1])
-        )
-        p_eta = 0.5 * (2.0 * p + 1.0)
         integrand = (1.0 + ((eta - 1.0) * (dummu * dummu))) ** (-p_eta / 2.0)
-        self.phi_norm_slow = np.sum(
-            0.5 * (integrand[1:] + integrand[:-1]) * (dummu[1:] - dummu[:-1])
-        )
-
-        p_eta = 0.5 * (p + 3.0)
-        integrand = (1.0 + ((eta - 1.0) * (dummu * dummu))) ** (-p_eta / 2.0)
-        self.phi_norm_fast = np.sum(
-            0.5 * (integrand[1:] + integrand[:-1]) * (dummu[1:] - dummu[:-1])
-        )
+        self.phi_norm = np.sum(0.5 * (integrand[1:] + integrand[:-1]) * (dummu[1:] - dummu[:-1]))
 
     # construct the image and jet-frame grids
     @staticmethod
@@ -1060,6 +1043,7 @@ class JetModel:
         a = self.a
         s = self.s
         p = self.p
+        p_eta = self.p_eta
         h = self.h
         eta = self.eta
 
@@ -1074,11 +1058,7 @@ class JetModel:
         prefac_emis = self.prefac_emis
         prefac_absorp = self.prefac_absorp
 
-        phi_norm_2 = self.phi_norm_2
-        phi_norm_p = self.phi_norm_p
-        phi_norm_pp1 = self.phi_norm_pp1
-        phi_norm_slow = self.phi_norm_slow
-        phi_norm_fast = self.phi_norm_fast
+        phi_norm = self.phi_norm
 
         GIx_2 = self.GIx_2
         GIx_p = self.GIx_p
@@ -1104,8 +1084,8 @@ class JetModel:
         dz_1D = self.dz_1D
 
         jet_cutout_fraction = self.jet_cutout_fraction
-        gammamax = self.gammamax
-        betagamma_suppression = self.betagamma_suppression
+        gamma_inf = self.gamma_inf
+        gammabeta_suppression = self.gammabeta_suppression
         gamma_m = self.gamma_m
         gamma_max = self.gamma_max
 
@@ -1297,11 +1277,11 @@ class JetModel:
             vphi_orig = u3 * np.sqrt(g33) / gamma
 
             beta_orig = np.sqrt(np.maximum(0.0, 1.0 - 1.0 / (gamma * gamma)))
-            betagamma = betagamma_suppression * beta_orig * gamma
-            gamma = np.sqrt(1.0 + (betagamma * betagamma))
+            gammabeta = gammabeta_suppression * beta_orig * gamma
+            gamma = np.sqrt(1.0 + (gammabeta * gammabeta))
 
-            indgamma = gamma > gammamax
-            gamma[indgamma] = gammamax
+            indgamma = gamma > gamma_inf
+            gamma[indgamma] = gamma_inf
 
             beta = np.sqrt(np.maximum(0.0, 1.0 - 1.0 / (gamma * gamma)))
             velscale = np.zeros_like(beta)
@@ -1404,15 +1384,14 @@ class JetModel:
             if np.any(ind_slow):
                 p1 = p
                 p2 = p + 1.0
-                p_eta = 0.5 * (p1 + p2)
                 g1 = gamma_m
                 g2 = gamma_c[ind_slow]
                 g3 = gamma_max
                 x1 = nu_nup[ind_slow] / (g1 * g1)
                 x2 = nu_nup[ind_slow] / (g2 * g2)
                 x3 = nu_nup[ind_slow] / (g3 * g3)
-                Pp1 = phi_norm_slow
-                Pp2 = phi_norm_slow
+                Pp1 = phi_norm
+                Pp2 = phi_norm
                 GIx_p1 = GIx_p
                 GIx_p2 = GIx_pp1
                 A_norm = 1.0 / (
@@ -1467,15 +1446,14 @@ class JetModel:
             if np.any(ind_fast):
                 p1 = 2.0
                 p2 = p + 1.0
-                p_eta = 0.5 * (p1 + p2)
                 g1 = gamma_c[ind_fast]
                 g2 = gamma_m
                 g3 = gamma_max
                 x1 = nu_nup[ind_fast] / (g1 * g1)
                 x2 = nu_nup[ind_fast] / (g2 * g2)
                 x3 = nu_nup[ind_fast] / (g3 * g3)
-                Pp1 = phi_norm_fast
-                Pp2 = phi_norm_fast
+                Pp1 = phi_norm
+                Pp2 = phi_norm
                 GIx_p1 = GIx_2
                 GIx_p2 = GIx_pp1
                 A_norm = 1.0 / (
@@ -1588,6 +1566,7 @@ class JetModel:
         a = self.a
         s = self.s
         p = self.p
+        p_eta = self.p_eta
         h = self.h
         eta = self.eta
 
@@ -1602,11 +1581,7 @@ class JetModel:
         prefac_emis = self.prefac_emis
         prefac_absorp = self.prefac_absorp
 
-        phi_norm_2 = self.phi_norm_2
-        phi_norm_p = self.phi_norm_p
-        phi_norm_pp1 = self.phi_norm_pp1
-        phi_norm_slow = self.phi_norm_slow
-        phi_norm_fast = self.phi_norm_fast
+        phi_norm = self.phi_norm
 
         GIx_2 = self.GIx_2
         GIx_p = self.GIx_p
@@ -1618,8 +1593,8 @@ class JetModel:
         stagnation = self.stagnation
 
         jet_cutout_fraction = self.jet_cutout_fraction
-        gammamax = self.gammamax
-        betagamma_suppression = self.betagamma_suppression
+        gamma_inf = self.gamma_inf
+        gammabeta_suppression = self.gammabeta_suppression
         gamma_m = self.gamma_m
         gamma_max = self.gamma_max
 
@@ -1782,11 +1757,11 @@ class JetModel:
         vphi_orig = u3 * np.sqrt(g33) / gamma
 
         beta_orig = np.sqrt(np.maximum(0.0, 1.0 - 1.0 / (gamma * gamma)))
-        betagamma = betagamma_suppression * beta_orig * gamma
-        gamma = np.sqrt(1.0 + (betagamma * betagamma))
+        gammabeta = gammabeta_suppression * beta_orig * gamma
+        gamma = np.sqrt(1.0 + (gammabeta * gammabeta))
 
-        indgamma = gamma > gammamax
-        gamma[indgamma] = gammamax
+        indgamma = gamma > gamma_inf
+        gamma[indgamma] = gamma_inf
         if quantity == "gamma":
             return gamma
 
@@ -1913,15 +1888,14 @@ class JetModel:
             if np.any(ind_slow):
                 p1 = p
                 p2 = p + 1.0
-                p_eta = 0.5 * (p1 + p2)
                 g1 = gamma_m
                 g2 = gamma_c[ind_slow]
                 g3 = gamma_max
                 x1 = nu_nup[ind_slow] / (g1 * g1)
                 x2 = nu_nup[ind_slow] / (g2 * g2)
                 x3 = nu_nup[ind_slow] / (g3 * g3)
-                Pp1 = phi_norm_slow
-                Pp2 = phi_norm_slow
+                Pp1 = phi_norm
+                Pp2 = phi_norm
                 GIx_p1 = GIx_p
                 GIx_p2 = GIx_pp1
                 A_norm = 1.0 / (
@@ -1976,15 +1950,14 @@ class JetModel:
             if np.any(ind_fast):
                 p1 = 2.0
                 p2 = p + 1.0
-                p_eta = 0.5 * (p1 + p2)
                 g1 = gamma_c[ind_fast]
                 g2 = gamma_m
                 g3 = gamma_max
                 x1 = nu_nup[ind_fast] / (g1 * g1)
                 x2 = nu_nup[ind_fast] / (g2 * g2)
                 x3 = nu_nup[ind_fast] / (g3 * g3)
-                Pp1 = phi_norm_fast
-                Pp2 = phi_norm_fast
+                Pp1 = phi_norm
+                Pp2 = phi_norm
                 GIx_p1 = GIx_2
                 GIx_p2 = GIx_pp1
                 A_norm = 1.0 / (
@@ -2281,9 +2254,9 @@ def export_fits(
 
     """
 
-    I_new = np.asarray(I_new)
-    x_new = np.asarray(x_new).ravel()
-    y_new = np.asarray(y_new).ravel()
+    I_new = np.asarray(I_new).copy()
+    x_new = np.asarray(x_new).copy().ravel()
+    y_new = np.asarray(y_new).copy().ravel()
 
     # convert from radians to degrees
     x_new *= 180.0 / np.pi
