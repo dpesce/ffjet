@@ -1264,9 +1264,9 @@ class JetModel:
             S = poyntingmag * scaling
 
             # rescale B fields
-            Br *= sqrt_scaling
-            Btheta *= sqrt_scaling
-            Bphi *= sqrt_scaling
+            Br *= alphalapse * sqrt_scaling
+            Btheta *= alphalapse * sqrt_scaling
+            Bphi *= alphalapse * sqrt_scaling
             Bx, By, Bz = rtp_to_xyz(
                 Br, Btheta, Bphi, x[idx_loc], y[idx_loc], z[idx_loc], r[idx_loc], R
             )
@@ -1730,9 +1730,9 @@ class JetModel:
             return S
 
         # rescale B fields
-        Br *= sqrt_scaling
-        Btheta *= sqrt_scaling
-        Bphi *= sqrt_scaling
+        Br *= alphalapse * sqrt_scaling
+        Btheta *= alphalapse * sqrt_scaling
+        Bphi *= alphalapse * sqrt_scaling
         Bx, By, Bz = rtp_to_xyz(Br, Btheta, Bphi, x, y, z, r, R)
         B = np.sqrt(Bx * Bx + By * By + Bz * Bz)
 
