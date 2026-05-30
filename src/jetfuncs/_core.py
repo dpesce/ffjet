@@ -1369,7 +1369,8 @@ class JetModel:
             )
 
             ind_fast = gamma_c <= gamma_m
-            ind_slow = gamma_c > gamma_m
+            ind_slow = (gamma_c > gamma_m) & (gamma_c < gamma_max)
+            ind_uncooled = gamma_c >= gamma_max
 
             cosxi = costhetaB
             anisotropy_term = 1.0 + ((eta - 1.0) * (cosxi * cosxi))
@@ -1379,6 +1380,45 @@ class JetModel:
 
             jI = np.zeros_like(x[idx_loc])
             alphaI = np.zeros_like(x[idx_loc])
+
+            # uncooled branch
+            if np.any(ind_uncooled):
+                p1 = p
+                g1 = gamma_m
+                g2 = gamma_max
+                x1 = nu_nup[ind_uncooled] / (g1 * g1)
+                x2 = nu_nup[ind_uncooled] / (g2 * g2)
+                Pp1 = phi_norm
+                GIx_p1 = GIx_p
+
+                A_norm = 1.0 / (((g2 ** (1.0 - p1)) - (g1 ** (1.0 - p1))) / (1.0 - p1))
+
+                n = (
+                    n_m[ind_uncooled]
+                    * (gamma_m**p)
+                    * (((g2 ** (1.0 - p1)) - (g1 ** (1.0 - p1))) / (1.0 - p1))
+                )
+
+                prefac_j = prefac_emis * n * A_norm * nup[ind_uncooled]
+
+                term1 = (
+                    ((anisotropy_term[ind_uncooled] ** (-p_eta / 2.0)) / Pp1)
+                    * (nu_nup[ind_uncooled] ** ((1.0 - p1) / 2.0))
+                    * (GIx_p1(x2) - GIx_p1(x1))
+                )
+
+                jI[ind_uncooled] = prefac_j * term1
+
+                GaIx_p1 = GaIx_p
+                prefac_a = prefac_absorp * n * A_norm / nup[ind_uncooled]
+
+                term1 = (
+                    ((p1 + 2.0) * ((anisotropy_term[ind_uncooled] ** (-p_eta / 2.0)) / Pp1))
+                    * (nu_nup[ind_uncooled] ** (-(p1 + 4.0) / 2.0))
+                    * (GaIx_p1(x2) - GaIx_p1(x1))
+                )
+
+                alphaI[ind_uncooled] = prefac_a * term1
 
             # slow cooling
             if np.any(ind_slow):
@@ -1869,7 +1909,8 @@ class JetModel:
         )
 
         ind_fast = gamma_c <= gamma_m
-        ind_slow = gamma_c > gamma_m
+        ind_slow = (gamma_c > gamma_m) & (gamma_c < gamma_max)
+        ind_uncooled = gamma_c >= gamma_max
 
         cosxi = costhetaB
         anisotropy_term = 1.0 + ((eta - 1.0) * (cosxi * cosxi))
@@ -1883,6 +1924,45 @@ class JetModel:
 
             jI = np.zeros_like(x)
             alphaI = np.zeros_like(x)
+
+            # uncooled branch
+            if np.any(ind_uncooled):
+                p1 = p
+                g1 = gamma_m
+                g2 = gamma_max
+                x1 = nu_nup[ind_uncooled] / (g1 * g1)
+                x2 = nu_nup[ind_uncooled] / (g2 * g2)
+                Pp1 = phi_norm
+                GIx_p1 = GIx_p
+
+                A_norm = 1.0 / (((g2 ** (1.0 - p1)) - (g1 ** (1.0 - p1))) / (1.0 - p1))
+
+                n = (
+                    n_m[ind_uncooled]
+                    * (gamma_m**p)
+                    * (((g2 ** (1.0 - p1)) - (g1 ** (1.0 - p1))) / (1.0 - p1))
+                )
+
+                prefac_j = prefac_emis * n * A_norm * nup[ind_uncooled]
+
+                term1 = (
+                    ((anisotropy_term[ind_uncooled] ** (-p_eta / 2.0)) / Pp1)
+                    * (nu_nup[ind_uncooled] ** ((1.0 - p1) / 2.0))
+                    * (GIx_p1(x2) - GIx_p1(x1))
+                )
+
+                jI[ind_uncooled] = prefac_j * term1
+
+                GaIx_p1 = GaIx_p
+                prefac_a = prefac_absorp * n * A_norm / nup[ind_uncooled]
+
+                term1 = (
+                    ((p1 + 2.0) * ((anisotropy_term[ind_uncooled] ** (-p_eta / 2.0)) / Pp1))
+                    * (nu_nup[ind_uncooled] ** (-(p1 + 4.0) / 2.0))
+                    * (GaIx_p1(x2) - GaIx_p1(x1))
+                )
+
+                alphaI[ind_uncooled] = prefac_a * term1
 
             # slow cooling
             if np.any(ind_slow):
