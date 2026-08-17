@@ -11,5 +11,5 @@ def test_xyz_to_rtp_smoke():
 
 
 def test_tables_load_smoke():
-    m = jf.JetModel(m=10.0, a=0.5, inc=60.0, mdot=1e-3, Nx=2, Ny=2, Nz=2, pretab_dir=None)
+    m = jf.JetModel(m=10.0, a=0.5, inc=60.0, mdot=1e-3, Nx=2, Ny=2, Nz=2)
     assert m.GIx_2(1.0) >= 0.0

@@ -7,7 +7,6 @@ import jetfuncs as jf
 @pytest.fixture(scope="module")
 def tiny_model():
     # the idea is to keep this small so that CI stays fast
-    # pretab_dir=None forces “package data” loading
     return jf.JetModel(
         m=10.0,
         a=0.5,
@@ -22,7 +21,6 @@ def tiny_model():
         ymax=5.0,
         zmin=0.2,
         zmax=10.0,
-        pretab_dir=None,
     )
 
 

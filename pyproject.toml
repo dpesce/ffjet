@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ffjet"
 version = "0.1.0"
-description = "Jet modeling utilities (includes pretabulated synchrotron quantities)."
+description = "Jet modeling utilities (semi-analytic force-free jet images and SEDs)."
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
@@ -31,9 +31,6 @@ include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.setuptools.package-data]
-jetfuncs = ["synchrotron_integrals/**/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

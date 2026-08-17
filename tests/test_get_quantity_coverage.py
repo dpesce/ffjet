@@ -21,7 +21,6 @@ def test_get_quantity_basic_fields_and_poynting():
         Nx=2,
         Ny=2,
         Nz=2,
-        pretab_dir=None,
     )
 
     r, th = _safe_r_theta()
@@ -52,7 +51,6 @@ def test_get_quantity_Bprime_reduces_to_lab_B_when_velocity_suppressed():
         Ny=2,
         Nz=2,
         gammabeta_suppression=0.0,
-        pretab_dir=None,
     )
 
     r, th = _safe_r_theta()
@@ -75,7 +73,7 @@ def test_get_quantity_Bprime_reduces_to_lab_B_when_velocity_suppressed():
 
 
 def test_get_quantity_unknown_returns_empty_dict_for_array_input():
-    model = jf.JetModel(m=10.0, a=0.5, inc=60.0, mdot=1e-3, Nx=2, Ny=2, Nz=2, pretab_dir=None)
+    model = jf.JetModel(m=10.0, a=0.5, inc=60.0, mdot=1e-3, Nx=2, Ny=2, Nz=2)
 
     # important: need to pass arrays (even length-1),
     # because the code does indexed assignment on gamma

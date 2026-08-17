@@ -24,7 +24,6 @@ def _make_tiny_model(
         use_log_zgrid=False,
         gamma_m=gamma_m,
         gamma_max=gamma_max,
-        pretab_dir=None,
     )
 
 
