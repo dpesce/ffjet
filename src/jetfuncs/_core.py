@@ -698,7 +698,7 @@ class JetModel:
         self.nu = 2.0 - (2.0 * self.s)
         self.rH = 1.0 + np.sqrt(1.0 - (self.a * self.a))
 
-        self.inc_rad = self.inc * np.pi / 180.0
+        self.inc_rad = np.pi - (self.inc * np.pi / 180.0)
         self.cos_i = np.cos(self.inc_rad)
         self.sin_i = np.sin(self.inc_rad)
 
