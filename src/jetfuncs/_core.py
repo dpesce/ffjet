@@ -1103,6 +1103,7 @@ class JetModel:
         x_im_1D = self.x_im_1D
         y_im_1D = self.y_im_1D
         z_im_1D = self.z_im_1D
+        z_mid_1D = self.z_mid_1D
 
         x_im = self.x_im
         y_im = self.y_im
@@ -1942,6 +1943,8 @@ class JetModel:
                 f"unrecognized heating_prescription {heating_prescription!r}; "
                 f"expected 'Poynting' or 'magnetic'"
             )
+        if quantity == "u_e":
+            return u_pl
 
         n_m = (((p - 2.0) * u_pl) / ((gamma_m**p) * m_e * (c * c))) * (
             1.0 / ((gamma_m ** (2.0 - p)) - (gamma_max ** (2.0 - p)))
