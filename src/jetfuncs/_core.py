@@ -469,8 +469,7 @@ def u_driftframe(
 
         gamma = 1.0 / np.sqrt(1.0 - vsq)
 
-        Xi = (r2 + a2) ** 2 - Delta * a2 * sth2
-        eta3 = 2.0 * a * r / np.sqrt(Delta * Sigma * Xi)
+        eta3 = 2.0 * a * r / np.sqrt(Delta * rho2 * Sigma)
 
         u0 = gamma / alpha
         u1 = gamma * v1
