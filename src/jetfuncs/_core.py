@@ -198,7 +198,7 @@ def Nderiv(r, theta, a, Omegaf, M, bf_here):
     )
     dNdr /= (Sigma * Sigma) / 2
 
-    denomtheta = (a * a) + 2 * (r * r) + (a * a) * np.cos(2 * theta) ** 2
+    denomtheta = (a * a) + 2 * (r * r) + (a * a) * np.cos(2 * theta)
     dNdtheta = (Omegaf * Omegaf) * ((a * a) + r * (r - 2 * M)) + 8 * M * r * (
         a * (a * Omegaf - 1) + Omegaf * (r * r)
     ) ** 2 / (denomtheta * denomtheta)
