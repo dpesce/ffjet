@@ -77,4 +77,4 @@ def test_convert_units_luminosity_simple_uniform_grid():
     assert Lnu.shape == I_nu.shape
 
     # dx = dy = 1, dA = 1; rg=1 -> Lnu == I_nu for this simple case
-    npt.assert_allclose(Lnu, I_nu, rtol=0.0, atol=0.0)
+    npt.assert_allclose(Lnu, 4.0 * np.pi * I_nu, rtol=1e-15, atol=0.0)

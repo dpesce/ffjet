@@ -2215,8 +2215,8 @@ def convert_units(model, I_nu, *xy, output_units="luminosity", D=None, frequency
     # convert to cgs
     dA *= model.rg * model.rg
 
-    # luminosity density, in cgs
-    Lnu = dA * I_nu
+    # isotropic-equivalent luminosity density, L_nu = 4 pi D^2 S_nu, in cgs
+    Lnu = 4.0 * np.pi * dA * I_nu
 
     if output_units == "luminosity":
         return Lnu
@@ -2233,7 +2233,7 @@ def convert_units(model, I_nu, *xy, output_units="luminosity", D=None, frequency
         D_cm = D * (3.086e24)
 
         # flux density, in cgs
-        Snu = Lnu / (D_cm**2.0)
+        Snu = Lnu / (4.0 * np.pi * (D_cm**2.0))
 
         return Snu
 

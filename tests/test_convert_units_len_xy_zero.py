@@ -95,5 +95,5 @@ def test_convert_units_lenxy0_log_grids_hits_edge_cases():
     dx = _log_pixel_widths_1d(x, m.xmin)
     dy = _log_pixel_widths_1d(y, m.ymin)
 
-    expected = np.outer(dy, dx)  # rg==1 and I_nu==1
+    expected = 4.0 * np.pi * np.outer(dy, dx)  # rg==1 and I_nu==1
     assert np.allclose(Lnu, expected, rtol=1e-12, atol=0.0)
