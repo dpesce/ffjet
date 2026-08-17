@@ -1057,6 +1057,9 @@ class JetModel:
         # path lengths between adjacent z-slices, used in the RT loop
         self.dz_1D = self.rg * np.abs(np.diff(self.z_im_1D))
 
+        # cell-centre z for second-order RT quadrature
+        self.z_mid_1D = 0.5 * (self.z_im_1D[1:] + self.z_im_1D[:-1])
+
     # primary image-generating function
     def make_image(
         self, frequency, *, tau_stop=None, show_progress=False, heating_prescription="Poynting"
@@ -1148,7 +1151,7 @@ class JetModel:
                 w = allpix
 
             # observer z coordinate (same geometry as before)
-            z_im_now = z_im_1D[i] + z_J_f[w]
+            z_im_now = z_mid_1D[i] + z_J_f[w]
 
             # jet coordinates
             x = (x_im_f[w] * cos_i) + (z_im_now * sin_i)
