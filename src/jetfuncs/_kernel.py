@@ -77,8 +77,20 @@ sigma_T = 6.65246e-25
     P_TAB_INVDLOGX,
     P_TAB_KMAX,
     P_JET_CUTOUT,
+    P_TAIL_C,
+    P_X_TAIL,
+    P_GM_P,
+    P_GM_1MP,
+    P_GM_MP,
+    P_GM_PM1,
+    P_INV_GM,
+    P_GX_1MP,
+    P_GX_MP,
+    P_NM_FAC,
+    P_RHNU,
+    P_INV_RHNU,
     N_PARAMS,
-) = range(29)
+) = range(41)
 
 
 def pack_params(model, heating_prescription="Poynting"):
@@ -117,6 +129,21 @@ def pack_params(model, heating_prescription="Poynting"):
     P[P_TAB_INVDLOGX] = model._tab_inv_dlogx
     P[P_TAB_KMAX] = model._tab_kmax
     P[P_JET_CUTOUT] = model.jet_cutout_fraction
+    P[P_TAIL_C] = model._TAIL_C
+    P[P_X_TAIL] = model._X_TAIL
+    # powers of gamma_m and gamma_max are model constants; the electron normalization
+    # re-derived them for every cell, which was ~5.7 ns of the ~75 ns per-cell budget
+    gm, gx, pp = model.gamma_m, model.gamma_max, model.p
+    P[P_GM_P] = gm**pp
+    P[P_GM_1MP] = gm ** (1.0 - pp)
+    P[P_GM_MP] = gm ** (-pp)
+    P[P_GM_PM1] = gm ** (pp - 1.0)
+    P[P_INV_GM] = 1.0 / gm
+    P[P_GX_1MP] = gx ** (1.0 - pp)
+    P[P_GX_MP] = gx ** (-pp)
+    P[P_NM_FAC] = ((pp - 2.0) / (gm**pp)) * (1.0 / ((gm ** (2.0 - pp)) - (gx ** (2.0 - pp))))
+    P[P_RHNU] = model.rH**model.nu
+    P[P_INV_RHNU] = model.rH ** (-model.nu)
     return P
 
 
@@ -184,6 +211,23 @@ def _G_eval(k, t, flag, logG):
     if flag == 1:
         return 0.0
     return math.nan
+
+
+@njit(cache=True, inline="always")
+def _G_diff(x_lo, x_hi, k_lo, t_lo, f_lo, k_hi, t_hi, f_hi, logG, m, tailC, xtail):
+    """
+    G(x_lo) - G(x_hi) for x_lo <= x_hi.
+
+    Both arguments sit on the plateau of G when x_hi is small, so the tabulated difference
+    is destroyed by cancellation there -- exactly zero once the two round to the same
+    stored value.  Below xtail use the analytic small-x form instead (see
+    JetModel._G_diff): with F(z) -> C (z/2)^(1/3), the difference is
+    C (x_hi^e - x_lo^e)/e with e = m + 4/3, which has no cancellation and needs no table.
+    """
+    if x_hi <= xtail:
+        e = m + (4.0 / 3.0)
+        return (tailC / e) * ((x_hi**e) - (x_lo**e))
+    return _G_eval(k_lo, t_lo, f_lo, logG) - _G_eval(k_hi, t_hi, f_hi, logG)
 
 
 # ----------------------------------------------------------------------------- jet mask
@@ -288,7 +332,7 @@ def jet_intervals(x_im_f, y_im_f, z_J_f, z_mid_1D, P, max_int):
 
 
 @njit(cache=True)
-def _rtheta_chain(r, omc, sgn, P, th_tab, rs_tab, ts_tab):
+def _rtheta_chain(r, omc, sgn, P, omc_tab, rs_tab, ts_tab):
     """
     (r, theta)-only physics of one point.  omc = 1 - |cos theta| (passed exactly, so that
     points very close to the axis keep their precision) and sgn = sign(cos theta).
@@ -307,8 +351,6 @@ def _rtheta_chain(r, omc, sgn, P, th_tab, rs_tab, ts_tab):
     rH = P[P_RH]
     nu = P[P_NU]
     a = P[P_A]
-    s = P[P_S]
-    p = P[P_P]
     h = P[P_H]
     rg = P[P_RG]
     scaling = P[P_SCALING]
@@ -320,43 +362,42 @@ def _rtheta_chain(r, omc, sgn, P, th_tab, rs_tab, ts_tab):
     gamma_m = P[P_GAMMA_M]
     gamma_max = P[P_GAMMA_MAX]
     heating_is_poynting = P[P_HEAT_POYNTING] > 0.5
+    rHnu = P[P_RHNU]
+    inv_rHnu = P[P_INV_RHNU]
+    gm_p = P[P_GM_P]
+    gm_pm1 = P[P_GM_PM1]
+    nm_fac = P[P_NM_FAC]
 
     # ---------------- geometry
     r2 = r * r
     costheta = sgn * (1.0 - omc)
     z = r * costheta
-    half_small = math.sqrt(0.5 * omc)
-    half_big = math.sqrt(0.5 * (2.0 - omc))
-    if sgn > 0.0:
-        sin_half = half_small
-        cos_half = half_big
-    else:
-        sin_half = half_big
-        cos_half = half_small
-
-    # footpoint theta
-    r_rH_1_s = (r / rH) ** (1.0 - s)
-    arg_arcsin = r_rH_1_s * sin_half
-    if arg_arcsin < 0.7071067811865476:
-        theta_fp = 2.0 * math.asin(arg_arcsin)
-    else:
-        theta_fp = 2.0 * math.acos(r_rH_1_s * cos_half)
-
     # horizon buffer
     r_min = rH * (1.0 + 1.0e-2)
 
-    # stream function, Omega, stagnation surface
-    rHnu = rH**nu
-    psi = rHnu * (1.0 - abs(math.cos(theta_fp)))
-    cthhorizon = 1.0 - psi * (rH ** (-nu))
-    Omega = a / (4.0 + 8.0 / (1.0 + cthhorizon))
-    if theta_fp <= 0.5 * math.pi:
-        rstag = _interp_lin(theta_fp, th_tab, rs_tab)
-        tstag = _interp_lin(theta_fp, th_tab, ts_tab)
+    # Footpoint of the field line, stream function, Omega, stagnation surface.
+    #
+    # sin(theta_fp/2) = (r/rH)^(1-s) sin(theta/2) with nu = 2 - 2s, so the half-angle
+    # identity gives cos(theta_fp) directly, with no inverse trigonometry and no separate
+    # power of r: on the branch where (r/rH)^nu (1 - cos theta) < 1,
+    #     cos(theta_fp) = 1 - (r/rH)^nu (1 - cos theta),
+    # and otherwise cos(theta_fp) = (r/rH)^nu (1 + cos theta) - 1.  Everything downstream
+    # needs only omc_fp = 1 - |cos theta_fp| = psi / rH^nu, which is also the abscissa the
+    # stagnation table is built on -- and being symmetric about theta_fp = pi/2 it folds
+    # the two hemispheres without a branch.
+    r_nu = r**nu
+    ratio_nu = r_nu * inv_rHnu
+    w_fp = ratio_nu * (1.0 - costheta)
+    if w_fp < 1.0:
+        cos_fp = 1.0 - w_fp
     else:
-        tf = math.pi - theta_fp
-        rstag = _interp_lin(tf, th_tab, rs_tab)
-        tstag = _interp_lin(tf, th_tab, ts_tab)
+        cos_fp = (ratio_nu * (1.0 + costheta)) - 1.0
+    omc_fp = 1.0 - abs(cos_fp)
+    psi = rHnu * omc_fp
+    cthhorizon = abs(cos_fp)
+    Omega = a / (4.0 + 8.0 / (1.0 + cthhorizon))
+    rstag = _interp_lin(omc_fp, omc_tab, rs_tab)
+    tstag = _interp_lin(omc_fp, omc_tab, ts_tab)
 
     # metric quantities
     sth2 = omc * (2.0 - omc)  # = 1 - cos^2(theta), without cancellation
@@ -380,7 +421,6 @@ def _rtheta_chain(r, omc, sgn, P, th_tab, rs_tab, ts_tab):
     gdet = sintheta * rho2
 
     # EM field
-    r_nu = r**nu
     signcostheta = 1.0 if costh > 0.0 else (-1.0 if costh < 0.0 else 0.0)
     dpsidtheta = signcostheta * sintheta * r_nu
     dpsidr = nu * psi / r
@@ -540,56 +580,34 @@ def _rtheta_chain(r, omc, sgn, P, th_tab, rs_tab, ts_tab):
         u_pl = h * S / (c * gamma)
     else:
         u_pl = h * ((Bpm * Bpm) / (8.0 * math.pi))
-    n_m = (((p - 2.0) * u_pl) / ((gamma_m**p) * m_e * (c * c))) * (
-        1.0 / ((gamma_m ** (2.0 - p)) - (gamma_max ** (2.0 - p)))
-    )
+    # Every power of gamma_m and gamma_max here is a model constant, precomputed in
+    # pack_params; only gamma_c varies from cell to cell, and gamma_c^(1-p) is
+    # gamma_c * gamma_c^(-p), so the slow-cooling branch needs a single pow.
+    # (gamma_c^(p2-p) with p2 = p+1 is just gamma_c, and gamma_m^(1-2) is 1/gamma_m.)
+    n_m = (u_pl / (m_e * (c * c))) * nm_fac
 
-    # n_e * A_norm for the cooling branch this point is in, times gamma_2^(p_2 - p_1)
+    # n_e and A_norm are used only through their product, and that product does not
+    # depend on where the cooling break sits: the break moves the shape normalization
+    # and the number density by reciprocal factors, which cancel.  Writing out the three
+    # branches of Eqs. C.2/C.3 and simplifying,
+    #
+    #     n * A_norm = n_m gamma_m^p        (uncooled and slow cooling)
+    #                = n_m gamma_c gamma_m  (fast cooling)
+    #
+    # verified against the unsimplified expressions to 3 ulp over gamma_c in [1, 1e10].
+    # Every power of gamma_m and gamma_max is a model constant (pack_params), so what was
+    # ten pow calls and a dozen divisions per cell is now a multiply.
     if gamma_c >= gamma_max:
-        # uncooled: single power law between gamma_m and gamma_max
-        A_norm = 1.0 / (((gamma_max ** (1.0 - p)) - (gamma_m ** (1.0 - p))) / (1.0 - p))
-        n = n_m * (gamma_m**p) * (((gamma_max ** (1.0 - p)) - (gamma_m ** (1.0 - p))) / (1.0 - p))
+        nA = n_m * gm_p  # uncooled: one power law from gamma_m to gamma_max
         cont = gamma_max
     elif gamma_c > gamma_m:
-        # slow cooling: p1 = p, p2 = p+1, break at gamma_c
-        p2 = p + 1.0
-        A_norm = 1.0 / (
-            (((gamma_c ** (1.0 - p)) - (gamma_m ** (1.0 - p))) / (1.0 - p))
-            + (
-                (gamma_c ** (p2 - p))
-                * (((gamma_max ** (1.0 - p2)) - (gamma_c ** (1.0 - p2))) / (1.0 - p2))
-            )
-        )
-        n = (
-            n_m
-            * (gamma_m**p)
-            * (
-                (((gamma_c ** (1.0 - p)) - (gamma_m ** (1.0 - p))) / (1.0 - p))
-                - (gamma_c * (((gamma_max ** (-p)) - (gamma_c ** (-p))) / p))
-            )
-        )
+        nA = n_m * gm_p  # slow cooling: break at gamma_c
         cont = gamma_c
     else:
-        # fast cooling: p1 = 2, p2 = p+1, break at gamma_m
-        p2 = p + 1.0
-        A_norm = 1.0 / (
-            (((gamma_m ** (1.0 - 2.0)) - (gamma_c ** (1.0 - 2.0))) / (1.0 - 2.0))
-            + (
-                (gamma_m ** (p2 - 2.0))
-                * (((gamma_max ** (1.0 - p2)) - (gamma_m ** (1.0 - p2))) / (1.0 - p2))
-            )
-        )
-        n = (
-            n_m
-            * gamma_c
-            * (
-                (gamma_m * ((gamma_c ** (-1.0)) - (gamma_m ** (-1.0))))
-                + ((gamma_m**p) * (((gamma_m ** (-p)) - (gamma_max ** (-p))) / p))
-            )
-        )
-        cont = gamma_m ** (p - 1.0)
-    Kj = prefac_emis * n * A_norm * cont
-    Ka = prefac_absorp * n * A_norm * cont
+        nA = n_m * gamma_c * gamma_m  # fast cooling: break at gamma_m
+        cont = gm_pm1
+    Kj = prefac_emis * nA * cont
+    Ka = prefac_absorp * nA * cont
     return vr, vt, vp, gamma, alphalapse, Bpr, Bpt, Bpp, Bpm, gamma_c, Kj, Ka
 
 
@@ -608,7 +626,6 @@ def _ray_part(x, y, z, r, R, vr, vt, vp, gamma, alphalapse, Bpr, Bpt, Bpp, gamma
     eta = P[P_ETA]
     p_eta = P[P_PETA]
     phi_norm = P[P_PHI_NORM]
-    p = P[P_P]
     gamma_m = P[P_GAMMA_M]
     gamma_max = P[P_GAMMA_MAX]
 
@@ -669,14 +686,14 @@ def _ray_part(x, y, z, r, R, vr, vt, vp, gamma, alphalapse, Bpr, Bpt, Bpp, gamma
     elif gamma_c > gamma_m:
         cont = gamma_c
     else:
-        cont = gamma_m ** (p - 1.0)
+        cont = P[P_GM_PM1]
     Cj = (Kj / cont) * nup * aniso_fac
     Ca = ((Ka / cont) / nup) * aniso_fac
     return g, nup, gamma_c, Cj, Ca
 
 
 @njit(cache=True)
-def _cell_state(xi, yi, zJ, zi, P, th_tab, rs_tab, ts_tab):
+def _cell_state(xi, yi, zJ, zi, P, omc_tab, rs_tab, ts_tab):
     """
     Frequency-independent physics of one cell, evaluated exactly.
     Returns (g, nu_p, gamma_c, C_j, C_a).
@@ -694,7 +711,7 @@ def _cell_state(xi, yi, zJ, zi, P, th_tab, rs_tab, ts_tab):
     sgn = 1.0 if z >= 0.0 else -1.0
     omc = R2 / (r * (r + az))  # 1 - |cos theta|, without cancellation
     vr, vt, vp, gamma, alpha, Bpr, Bpt, Bpp, Bpm, gamma_c, Kj, Ka = _rtheta_chain(
-        r, omc, sgn, P, th_tab, rs_tab, ts_tab
+        r, omc, sgn, P, omc_tab, rs_tab, ts_tab
     )
     return _ray_part(x, y, z, r, R, vr, vt, vp, gamma, alpha, Bpr, Bpt, Bpp, gamma_c, Kj, Ka, P)
 
@@ -711,7 +728,7 @@ N_TAB = 12  # stored quantities per node
 
 
 @njit(cache=True, parallel=True)
-def build_field_table(logr, ugrid, P, th_tab, rs_tab, ts_tab, hemisphere):
+def build_field_table(logr, ugrid, P, omc_tab, rs_tab, ts_tab, hemisphere):
     """
     Table T[i_r, i_u, q] of the (r,theta)-only quantities for one hemisphere (+1/-1):
       0-2 (vr, vt, vp)   3 gamma   4 lapse   5-7 (Bpr, Bpt, Bpp)   8 |B'|
@@ -734,7 +751,7 @@ def build_field_table(logr, ugrid, P, th_tab, rs_tab, ts_tab, hemisphere):
                 w = 1.0 - 1.0e-12
             omc = w / t  # 1 - |cos theta|, exact
             vr, vt, vp, gamma, alpha, Bpr, Bpt, Bpp, Bpm, gc, Kj, Ka = _rtheta_chain(
-                r, omc, hemisphere, P, th_tab, rs_tab, ts_tab
+                r, omc, hemisphere, P, omc_tab, rs_tab, ts_tab
             )
             T[i, j, 0] = vr
             T[i, j, 1] = vt
@@ -813,6 +830,8 @@ def _cell_emis(frequency, g, nup, gamma_c, Cj, Ca, P, T0, T1, T2, T3, T4, T5):
     logx0 = P[P_TAB_LOGX0]
     invdlogx = P[P_TAB_INVDLOGX]
     kmax = P[P_TAB_KMAX]
+    tailC = P[P_TAIL_C]
+    xtail = P[P_X_TAIL]
 
     nu_nup = (frequency / g) / nup
     if math.isnan(nu_nup):
@@ -822,42 +841,52 @@ def _cell_emis(frequency, g, nup, gamma_c, Cj, Ca, P, T0, T1, T2, T3, T4, T5):
 
     if gamma_c >= gamma_max:
         # uncooled: p1 = p; g1 = gamma_m, g2 = gamma_max
-        k1, t1, f1 = _G_bracket(nu_nup / (gamma_m * gamma_m), logx0, invdlogx, kmax)
-        k2, t2, f2 = _G_bracket(nu_nup / (gamma_max * gamma_max), logx0, invdlogx, kmax)
+        x1 = nu_nup / (gamma_m * gamma_m)
+        x2 = nu_nup / (gamma_max * gamma_max)
+        k1, t1, f1 = _G_bracket(x1, logx0, invdlogx, kmax)
+        k2, t2, f2 = _G_bracket(x2, logx0, invdlogx, kmax)
         pw = 10.0 ** (0.5 * (1.0 - p) * l10nn)  # nu_nup**((1-p)/2)
-        jI = Cj * pw * (_G_eval(k2, t2, f2, T1) - _G_eval(k1, t1, f1, T1))
+        dG = _G_diff(x2, x1, k2, t2, f2, k1, t1, f1, T1, 0.5 * (p - 3.0), tailC, xtail)
+        jI = Cj * pw * dG
         pwa = pw / (nu_nup * nu_nup * sq)  # nu_nup**(-(p+4)/2)
-        alphaI = Ca * (p + 2.0) * pwa * (_G_eval(k2, t2, f2, T4) - _G_eval(k1, t1, f1, T4))
+        dGa = _G_diff(x2, x1, k2, t2, f2, k1, t1, f1, T4, 0.5 * (p - 2.0), tailC, xtail)
+        alphaI = Ca * (p + 2.0) * pwa * dGa
     elif gamma_c > gamma_m:
         # slow: p1 = p, p2 = p+1; g1 = gamma_m, g2 = gamma_c, g3 = gamma_max
-        k1, t1, f1 = _G_bracket(nu_nup / (gamma_m * gamma_m), logx0, invdlogx, kmax)
-        k2, t2, f2 = _G_bracket(nu_nup / (gamma_c * gamma_c), logx0, invdlogx, kmax)
-        k3, t3, f3 = _G_bracket(nu_nup / (gamma_max * gamma_max), logx0, invdlogx, kmax)
+        x1 = nu_nup / (gamma_m * gamma_m)
+        x2 = nu_nup / (gamma_c * gamma_c)
+        x3 = nu_nup / (gamma_max * gamma_max)
+        k1, t1, f1 = _G_bracket(x1, logx0, invdlogx, kmax)
+        k2, t2, f2 = _G_bracket(x2, logx0, invdlogx, kmax)
+        k3, t3, f3 = _G_bracket(x3, logx0, invdlogx, kmax)
         pw1 = 10.0 ** (0.5 * (1.0 - p) * l10nn)  # nu_nup**((1-p1)/2)
         pw2 = pw1 / sq  # nu_nup**((1-p2)/2)
-        dG1 = _G_eval(k2, t2, f2, T1) - _G_eval(k1, t1, f1, T1)
-        dG2 = _G_eval(k3, t3, f3, T2) - _G_eval(k2, t2, f2, T2)
+        dG1 = _G_diff(x2, x1, k2, t2, f2, k1, t1, f1, T1, 0.5 * (p - 3.0), tailC, xtail)
+        dG2 = _G_diff(x3, x2, k3, t3, f3, k2, t2, f2, T2, 0.5 * (p - 2.0), tailC, xtail)
         jI = Cj * (pw1 * dG1 + gamma_c * pw2 * dG2)  # g2**(p2-p1) = gamma_c
         pwa1 = pw1 / (nu_nup * nu_nup * sq)  # nu_nup**(-(p1+4)/2)
         pwa2 = pwa1 / sq  # nu_nup**(-(p2+4)/2)
-        dGa1 = _G_eval(k2, t2, f2, T4) - _G_eval(k1, t1, f1, T4)
-        dGa2 = _G_eval(k3, t3, f3, T5) - _G_eval(k2, t2, f2, T5)
+        dGa1 = _G_diff(x2, x1, k2, t2, f2, k1, t1, f1, T4, 0.5 * (p - 2.0), tailC, xtail)
+        dGa2 = _G_diff(x3, x2, k3, t3, f3, k2, t2, f2, T5, 0.5 * (p - 1.0), tailC, xtail)
         alphaI = Ca * ((p + 2.0) * pwa1 * dGa1 + (p + 3.0) * gamma_c * pwa2 * dGa2)
     else:
         # fast: p1 = 2, p2 = p+1; g1 = gamma_c, g2 = gamma_m, g3 = gamma_max
-        k1, t1, f1 = _G_bracket(nu_nup / (gamma_c * gamma_c), logx0, invdlogx, kmax)
-        k2, t2, f2 = _G_bracket(nu_nup / (gamma_m * gamma_m), logx0, invdlogx, kmax)
-        k3, t3, f3 = _G_bracket(nu_nup / (gamma_max * gamma_max), logx0, invdlogx, kmax)
-        gm_pm1 = gamma_m ** (p - 1.0)  # g2**(p2-p1)
+        x1 = nu_nup / (gamma_c * gamma_c)
+        x2 = nu_nup / (gamma_m * gamma_m)
+        x3 = nu_nup / (gamma_max * gamma_max)
+        k1, t1, f1 = _G_bracket(x1, logx0, invdlogx, kmax)
+        k2, t2, f2 = _G_bracket(x2, logx0, invdlogx, kmax)
+        k3, t3, f3 = _G_bracket(x3, logx0, invdlogx, kmax)
+        gm_pm1 = P[P_GM_PM1]  # g2**(p2-p1)
         pw1 = 1.0 / sq  # nu_nup**(-1/2)
         pw2 = 10.0 ** (-0.5 * p * l10nn)  # nu_nup**((1-p2)/2) = nu_nup**(-p/2)
-        dG1 = _G_eval(k2, t2, f2, T0) - _G_eval(k1, t1, f1, T0)
-        dG2 = _G_eval(k3, t3, f3, T2) - _G_eval(k2, t2, f2, T2)
+        dG1 = _G_diff(x2, x1, k2, t2, f2, k1, t1, f1, T0, -0.5, tailC, xtail)
+        dG2 = _G_diff(x3, x2, k3, t3, f3, k2, t2, f2, T2, 0.5 * (p - 2.0), tailC, xtail)
         jI = Cj * (pw1 * dG1 + gm_pm1 * pw2 * dG2)
         pwa1 = 1.0 / (nu_nup * nu_nup * nu_nup)  # nu_nup**(-3)
         pwa2 = pw2 / (nu_nup * nu_nup * sq)  # nu_nup**(-(p+5)/2)
-        dGa1 = _G_eval(k2, t2, f2, T3) - _G_eval(k1, t1, f1, T3)
-        dGa2 = _G_eval(k3, t3, f3, T5) - _G_eval(k2, t2, f2, T5)
+        dGa1 = _G_diff(x2, x1, k2, t2, f2, k1, t1, f1, T3, 0.0, tailC, xtail)
+        dGa2 = _G_diff(x3, x2, k3, t3, f3, k2, t2, f2, T5, 0.5 * (p - 1.0), tailC, xtail)
         alphaI = Ca * (4.0 * pwa1 * dGa1 + (p + 3.0) * gm_pm1 * pwa2 * dGa2)
     return jI, alphaI
 
@@ -898,7 +927,7 @@ def rt_kernel(
     ends,
     nint,
     P,
-    th_tab,
+    omc_tab,
     rs_tab,
     ts_tab,
     T0,
@@ -925,7 +954,7 @@ def rt_kernel(
                 break
             for i in range(starts[pix, k], ends[pix, k]):
                 g, nup, gamma_c, Cj, Ca = _cell_state(
-                    xi, yi, zJ, z_mid_1D[i], P, th_tab, rs_tab, ts_tab
+                    xi, yi, zJ, z_mid_1D[i], P, omc_tab, rs_tab, ts_tab
                 )
                 jI, alphaI = _cell_emis(
                     frequency, g, nup, gamma_c, Cj, Ca, P, T0, T1, T2, T3, T4, T5
@@ -949,7 +978,7 @@ def precompute_state(
     ends,
     nint,
     P,
-    th_tab,
+    omc_tab,
     rs_tab,
     ts_tab,
     st_g,
@@ -970,7 +999,7 @@ def precompute_state(
         for k in range(nint[pix]):
             for i in range(starts[pix, k], ends[pix, k]):
                 g, nup, gamma_c, Cj, Ca = _cell_state(
-                    xi, yi, zJ, z_mid_1D[i], P, th_tab, rs_tab, ts_tab
+                    xi, yi, zJ, z_mid_1D[i], P, omc_tab, rs_tab, ts_tab
                 )
                 st_g[o] = g
                 st_nup[o] = nup

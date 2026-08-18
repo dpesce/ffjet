@@ -5,7 +5,7 @@ import warnings
 
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator
-from scipy.special import hyp2f1, kv
+from scipy.special import gamma as _gammafn, hyp2f1, kv
 from astropy.io import fits
 from astropy.wcs import WCS
 from astropy.time import Time
@@ -932,23 +932,20 @@ class JetModel:
         self.thetahorizon_arr = theta_H
         self.rstag_arr = r_c
         self.tstag_arr = theta_c
+        # The table is looked up by omc_fp = 1 - |cos(theta_fp)| rather than by theta_fp.
+        # That quantity is psi / rH^nu, which the geometry already provides without any
+        # inverse trigonometry, and it folds the two hemispheres together automatically
+        # (it is symmetric about theta_fp = pi/2).  Ascending, like theta_H.
+        self.omchorizon_arr = omc_H
+
+    def _stagnation_omc(self, omc_fp):
+        """(r, theta) of the stagnation point, indexed by omc_fp = 1 - |cos(theta_fp)|."""
+        oc = self.omchorizon_arr
+        return np.interp(omc_fp, oc, self.rstag_arr), np.interp(omc_fp, oc, self.tstag_arr)
 
     def stagnation(self, theta_fp):
-        th = self.thetahorizon_arr
-        rs = self.rstag_arr
-        ts = self.tstag_arr
-
-        rout = np.zeros_like(theta_fp)
-        tout = np.zeros_like(theta_fp)
-
-        ind1 = theta_fp <= (np.pi / 2.0)
-        rout[ind1] = np.interp(theta_fp, th, rs)[ind1]
-        tout[ind1] = np.interp(theta_fp, th, ts)[ind1]
-
-        ind2 = theta_fp > (np.pi / 2.0)
-        rout[ind2] = np.interp(theta_fp, (np.pi - th)[::-1], rs[::-1])[ind2]
-        tout[ind2] = np.interp(theta_fp, (np.pi - th)[::-1], ts[::-1])[ind2]
-        return rout, tout
+        """(r, theta) of the stagnation point on the field line with footpoint theta_fp."""
+        return self._stagnation_omc(1.0 - np.abs(np.cos(theta_fp)))
 
     # determine the scaling factor necessary to ensure that the jet has the correct total power
     def _build_poynting_scaling(self):
@@ -1161,6 +1158,40 @@ class JetModel:
     # the left and zero returned to the right of the tabulated range.  The stored grid
     # is uniform in log10(x), so the bracketing index is arithmetic rather than a binary
     # search and the cost does not depend on the table length.
+    # --- small-argument tail of the synchrotron integrals -------------------------
+    #
+    # Every emissivity and absorption coefficient is a *difference* of the same tabulated
+    # integral at two arguments, G(x_lo) - G(x_hi) with x_lo < x_hi.  As x -> 0 the
+    # integral approaches a constant, so the difference is taken between two nearly equal
+    # plateau values and is destroyed by cancellation -- and once both arguments round to
+    # the same stored value it is exactly zero, which sets the coefficient to zero instead
+    # of its correct small-x limit.  Measured against a cancellation-free reference, the
+    # tabulated difference is wrong by 100% below x_hi ~ 1e-7 for GaI_(p+1), ~1e-8 for
+    # GI_(p+1) and GaI_p, ~1e-9 for GaI_2 and ~1e-13 for GI_2 and GI_p.
+    #
+    # Below _X_TAIL the difference is evaluated analytically instead.  With
+    # F(z) -> [4 pi / (sqrt(3) Gamma(1/3))] (z/2)^(1/3) as z -> 0,
+    #
+    #     G_m(x_lo) - G_m(x_hi) = int_{x_lo}^{x_hi} z^m F(z) dz
+    #                           = C (x_hi^e - x_lo^e) / e,    e = m + 4/3,
+    #
+    # which has no cancellation and no table lookup.  Its own error is <= 7e-5 at
+    # x_hi = 1e-6 and falls as x_hi^(2/3) below that -- more than thirty times smaller
+    # than the grid-discretization error of any usable image.
+    _X_TAIL = 1.0e-6
+    _TAIL_C = 4.0 * np.pi / (np.sqrt(3.0) * _gammafn(1.0 / 3.0)) / 2.0 ** (1.0 / 3.0)
+
+    def _G_diff(self, lookup, m, x_lo, x_hi):
+        """G(x_lo) - G(x_hi) for x_lo <= x_hi, with the plateau handled analytically."""
+        d = lookup(x_lo) - lookup(x_hi)
+        small = x_hi <= self._X_TAIL
+        if not np.any(small):
+            return d
+        e = m + (4.0 / 3.0)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            tail = (self._TAIL_C / e) * ((x_hi**e) - (x_lo**e))
+        return np.where(small, tail, d)
+
     def _G_lookup(self, x, key):
         logG = getattr(self, "logG_" + key, None)
         if logG is None:
@@ -1436,7 +1467,7 @@ class JetModel:
                 float(frequency), iv["order"],
                 self.x_im_f, self.y_im_f, self.z_J_f, self.z_mid_1D, self.dz_1D,
                 iv["starts"], iv["ends"], iv["nint"],
-                P, self.thetahorizon_arr, self.rstag_arr, self.tstag_arr, *T, tau, I_out,
+                P, self.omchorizon_arr, self.rstag_arr, self.tstag_arr, *T, tau, I_out,
             )
         return self.x_im_1D, self.y_im_1D, I_out.reshape(self.x_im.shape)
 
@@ -1488,7 +1519,7 @@ class JetModel:
                 f"use fewer points or raise the limit"
             )
         P = _kern.pack_params(self, heating_prescription)
-        args = (P, self.thetahorizon_arr, self.rstag_arr, self.tstag_arr)
+        args = (P, self.omchorizon_arr, self.rstag_arr, self.tstag_arr)
         Tup = _kern.build_field_table(logr, ugrid, *args, 1.0)
         Tlo = _kern.build_field_table(logr, ugrid, *args, -1.0)
         self._ftab = dict(
@@ -1566,7 +1597,7 @@ class JetModel:
                 iv["order"], offsets, self.x_im_f, self.y_im_f, self.z_J_f, self.z_mid_1D,
                 iv["starts"], iv["ends"], iv["nint"],
                 _kern.pack_params(self, heating_prescription),
-                self.thetahorizon_arr, self.rstag_arr, self.tstag_arr,
+                self.omchorizon_arr, self.rstag_arr, self.tstag_arr,
                 st["g"], st["nup"], st["gamma_c"], st["Cj"], st["Ca"], st["iz"],
             )
         self._state = st
@@ -1690,16 +1721,15 @@ class JetModel:
             one_minus_costheta = np.where(pos, small, big)
             one_plus_costheta = np.where(pos, big, small)
 
-            # footpoint theta
-            r_rH_1_s = np.power(r / rH, 1.0 - s)
-            sin_half = np.sqrt(0.5 * one_minus_costheta)
-            cos_half = np.sqrt(0.5 * one_plus_costheta)
-            arg_arcsin = r_rH_1_s * sin_half
-            arg_arccos = r_rH_1_s * cos_half
-            mask_sin = arg_arcsin < (1.0 / np.sqrt(2.0))
-            theta_fp = np.empty_like(r)
-            theta_fp[mask_sin] = 2.0 * np.arcsin(arg_arcsin[mask_sin])
-            theta_fp[~mask_sin] = 2.0 * np.arccos(arg_arccos[~mask_sin])
+            # Footpoint of the field line through this point.  sin(theta_fp/2) =
+            # (r/rH)^(1-s) sin(theta/2) and nu = 2 - 2s give, without any inverse
+            # trigonometry, cos(theta_fp) = 1 - (r/rH)^nu (1 - cos theta) on the branch
+            # where that is >= -1, and (r/rH)^nu (1 + cos theta) - 1 on the other.  Only
+            # omc_fp = 1 - |cos theta_fp| = psi / rH^nu is ever needed downstream.
+            ratio_nu = np.power(r / rH, nu)
+            w_fp = ratio_nu * one_minus_costheta
+            cos_fp = np.where(w_fp < 1.0, 1.0 - w_fp, (ratio_nu * one_plus_costheta) - 1.0)
+            omc_fp = 1.0 - np.abs(cos_fp)
 
             # horizon buffer (avoids numerical artifacts)
             eps_h = 1.0e-2
@@ -1711,8 +1741,10 @@ class JetModel:
             ind_jet = ((r <= rjet1) | (r <= rjet2)) & (r > r_min)
 
             if jet_cutout_fraction > 0.0:
-                theta_fp_cut = 2.0 * np.arcsin(jet_cutout_fraction / np.sqrt(2.0))
-                ind_jet &= ~((theta_fp < theta_fp_cut) | (theta_fp > (np.pi - theta_fp_cut)))
+                # both halves of the two-sided cut are the single condition
+                # 1 - |cos theta_fp| < 1 - cos(theta_fp_cut)
+                omc_fp_cut = jet_cutout_fraction * jet_cutout_fraction
+                ind_jet &= ~(omc_fp < omc_fp_cut)
 
             if not ind_jet.any():
                 continue
@@ -1724,9 +1756,9 @@ class JetModel:
             idx = w[idx_loc]
 
             # stream function, Omega, stagnation surface
-            psi = psiBZpower(rH, theta_fp[idx_loc], nu)
+            psi = (rH**nu) * omc_fp[idx_loc]
             Omega = omega_BZpower(0, psi, a, nu)
-            rstag, tstag = stagnation(theta_fp[idx_loc])
+            rstag, tstag = self._stagnation_omc(omc_fp[idx_loc])
 
             # metric quantities
             R = np.sqrt(R2[idx_loc])
@@ -1965,7 +1997,7 @@ class JetModel:
                 term1 = (
                     ((anisotropy_term[ind_uncooled] ** (-p_eta / 2.0)) / Pp1)
                     * (nu_nup[ind_uncooled] ** ((1.0 - p1) / 2.0))
-                    * (GIx_p1(x2) - GIx_p1(x1))
+                    * self._G_diff(GIx_p1, (p1 - 3.0) / 2.0, x2, x1)
                 )
 
                 jI[ind_uncooled] = prefac_j * term1
@@ -1976,7 +2008,7 @@ class JetModel:
                 term1 = (
                     ((p1 + 2.0) * ((anisotropy_term[ind_uncooled] ** (-p_eta / 2.0)) / Pp1))
                     * (nu_nup[ind_uncooled] ** (-(p1 + 4.0) / 2.0))
-                    * (GaIx_p1(x2) - GaIx_p1(x1))
+                    * self._G_diff(GaIx_p1, (p1 - 2.0) / 2.0, x2, x1)
                 )
 
                 alphaI[ind_uncooled] = prefac_a * term1
@@ -2014,13 +2046,13 @@ class JetModel:
                 term1 = (
                     ((anisotropy_term[ind_slow] ** (-p_eta / 2.0)) / Pp1)
                     * (nu_nup[ind_slow] ** ((1.0 - p1) / 2.0))
-                    * (GIx_p1(x2) - GIx_p1(x1))
+                    * self._G_diff(GIx_p1, (p1 - 3.0) / 2.0, x2, x1)
                 )
                 term2 = (
                     (g2 ** (p2 - p1))
                     * ((anisotropy_term[ind_slow] ** (-p_eta / 2.0)) / Pp2)
                     * (nu_nup[ind_slow] ** ((1.0 - p2) / 2.0))
-                    * (GIx_p2(x3) - GIx_p2(x2))
+                    * self._G_diff(GIx_p2, (p2 - 3.0) / 2.0, x3, x2)
                 )
                 jI[ind_slow] = prefac_j * (term1 + term2)
 
@@ -2030,7 +2062,7 @@ class JetModel:
                 term1 = (
                     ((p1 + 2.0) * ((anisotropy_term[ind_slow] ** (-p_eta / 2.0)) / Pp1))
                     * (nu_nup[ind_slow] ** (-(p1 + 4.0) / 2.0))
-                    * (GaIx_p1(x2) - GaIx_p1(x1))
+                    * self._G_diff(GaIx_p1, (p1 - 2.0) / 2.0, x2, x1)
                 )
                 term2 = (
                     (
@@ -2039,7 +2071,7 @@ class JetModel:
                         * ((anisotropy_term[ind_slow] ** (-p_eta / 2.0)) / Pp2)
                     )
                     * (nu_nup[ind_slow] ** (-(p2 + 4.0) / 2.0))
-                    * (GaIx_p2(x3) - GaIx_p2(x2))
+                    * self._G_diff(GaIx_p2, (p2 - 2.0) / 2.0, x3, x2)
                 )
                 alphaI[ind_slow] = prefac_a * (term1 + term2)
 
@@ -2073,13 +2105,13 @@ class JetModel:
                 term1 = (
                     ((anisotropy_term[ind_fast] ** (-p_eta / 2.0)) / Pp1)
                     * (nu_nup[ind_fast] ** ((1.0 - p1) / 2.0))
-                    * (GIx_p1(x2) - GIx_p1(x1))
+                    * self._G_diff(GIx_p1, (p1 - 3.0) / 2.0, x2, x1)
                 )
                 term2 = (
                     (g2 ** (p2 - p1))
                     * ((anisotropy_term[ind_fast] ** (-p_eta / 2.0)) / Pp2)
                     * (nu_nup[ind_fast] ** ((1.0 - p2) / 2.0))
-                    * (GIx_p2(x3) - GIx_p2(x2))
+                    * self._G_diff(GIx_p2, (p2 - 3.0) / 2.0, x3, x2)
                 )
                 jI[ind_fast] = prefac_j * (term1 + term2)
 
@@ -2089,7 +2121,7 @@ class JetModel:
                 term1 = (
                     ((p1 + 2.0) * ((anisotropy_term[ind_fast] ** (-p_eta / 2.0)) / Pp1))
                     * (nu_nup[ind_fast] ** (-(p1 + 4.0) / 2.0))
-                    * (GaIx_p1(x2) - GaIx_p1(x1))
+                    * self._G_diff(GaIx_p1, (p1 - 2.0) / 2.0, x2, x1)
                 )
                 term2 = (
                     (
@@ -2098,7 +2130,7 @@ class JetModel:
                         * ((anisotropy_term[ind_fast] ** (-p_eta / 2.0)) / Pp2)
                     )
                     * (nu_nup[ind_fast] ** (-(p2 + 4.0) / 2.0))
-                    * (GaIx_p2(x3) - GaIx_p2(x2))
+                    * self._G_diff(GaIx_p2, (p2 - 2.0) / 2.0, x3, x2)
                 )
                 alphaI[ind_fast] = prefac_a * (term1 + term2)
 
@@ -2215,25 +2247,20 @@ class JetModel:
         one_minus_costheta = 2.0 * np.sin(0.5 * theta) ** 2
         one_plus_costheta = 2.0 * np.cos(0.5 * theta) ** 2
 
-        # footpoint theta
-        r_rH_1_s = np.power(r / rH, 1.0 - s)
-        sin_half = np.sqrt(0.5 * one_minus_costheta)
-        cos_half = np.sqrt(0.5 * one_plus_costheta)
-        arg_arcsin = r_rH_1_s * sin_half
-        arg_arccos = r_rH_1_s * cos_half
-        mask_sin = arg_arcsin < (1.0 / np.sqrt(2.0))
-        theta_fp = np.empty_like(r)
-        theta_fp[mask_sin] = 2.0 * np.arcsin(arg_arcsin[mask_sin])
-        theta_fp[~mask_sin] = 2.0 * np.arccos(arg_arccos[~mask_sin])
+        # footpoint of the field line, without inverse trigonometry (see _make_image_numpy)
+        ratio_nu = np.power(r / rH, nu)
+        w_fp = ratio_nu * one_minus_costheta
+        cos_fp = np.where(w_fp < 1.0, 1.0 - w_fp, (ratio_nu * one_plus_costheta) - 1.0)
+        omc_fp = 1.0 - np.abs(cos_fp)
 
         # stream function, Omega, stagnation surface
-        psi = psiBZpower(rH, theta_fp, nu)
+        psi = (rH**nu) * omc_fp
         if quantity == "psi":
             return psi
         Omega = omega_BZpower(0, psi, a, nu)
         if quantity == "Omega":
             return Omega
-        rstag, tstag = stagnation(theta_fp)
+        rstag, tstag = self._stagnation_omc(omc_fp)
 
         # metric quantities
         R = np.sqrt(R2)
@@ -2515,7 +2542,7 @@ class JetModel:
                 term1 = (
                     ((anisotropy_term[ind_uncooled] ** (-p_eta / 2.0)) / Pp1)
                     * (nu_nup[ind_uncooled] ** ((1.0 - p1) / 2.0))
-                    * (GIx_p1(x2) - GIx_p1(x1))
+                    * self._G_diff(GIx_p1, (p1 - 3.0) / 2.0, x2, x1)
                 )
 
                 jI[ind_uncooled] = prefac_j * term1
@@ -2526,7 +2553,7 @@ class JetModel:
                 term1 = (
                     ((p1 + 2.0) * ((anisotropy_term[ind_uncooled] ** (-p_eta / 2.0)) / Pp1))
                     * (nu_nup[ind_uncooled] ** (-(p1 + 4.0) / 2.0))
-                    * (GaIx_p1(x2) - GaIx_p1(x1))
+                    * self._G_diff(GaIx_p1, (p1 - 2.0) / 2.0, x2, x1)
                 )
 
                 alphaI[ind_uncooled] = prefac_a * term1
@@ -2564,13 +2591,13 @@ class JetModel:
                 term1 = (
                     ((anisotropy_term[ind_slow] ** (-p_eta / 2.0)) / Pp1)
                     * (nu_nup[ind_slow] ** ((1.0 - p1) / 2.0))
-                    * (GIx_p1(x2) - GIx_p1(x1))
+                    * self._G_diff(GIx_p1, (p1 - 3.0) / 2.0, x2, x1)
                 )
                 term2 = (
                     (g2 ** (p2 - p1))
                     * ((anisotropy_term[ind_slow] ** (-p_eta / 2.0)) / Pp2)
                     * (nu_nup[ind_slow] ** ((1.0 - p2) / 2.0))
-                    * (GIx_p2(x3) - GIx_p2(x2))
+                    * self._G_diff(GIx_p2, (p2 - 3.0) / 2.0, x3, x2)
                 )
                 jI[ind_slow] = prefac_j * (term1 + term2)
 
@@ -2580,7 +2607,7 @@ class JetModel:
                 term1 = (
                     ((p1 + 2.0) * ((anisotropy_term[ind_slow] ** (-p_eta / 2.0)) / Pp1))
                     * (nu_nup[ind_slow] ** (-(p1 + 4.0) / 2.0))
-                    * (GaIx_p1(x2) - GaIx_p1(x1))
+                    * self._G_diff(GaIx_p1, (p1 - 2.0) / 2.0, x2, x1)
                 )
                 term2 = (
                     (
@@ -2589,7 +2616,7 @@ class JetModel:
                         * ((anisotropy_term[ind_slow] ** (-p_eta / 2.0)) / Pp2)
                     )
                     * (nu_nup[ind_slow] ** (-(p2 + 4.0) / 2.0))
-                    * (GaIx_p2(x3) - GaIx_p2(x2))
+                    * self._G_diff(GaIx_p2, (p2 - 2.0) / 2.0, x3, x2)
                 )
                 alphaI[ind_slow] = prefac_a * (term1 + term2)
 
@@ -2623,13 +2650,13 @@ class JetModel:
                 term1 = (
                     ((anisotropy_term[ind_fast] ** (-p_eta / 2.0)) / Pp1)
                     * (nu_nup[ind_fast] ** ((1.0 - p1) / 2.0))
-                    * (GIx_p1(x2) - GIx_p1(x1))
+                    * self._G_diff(GIx_p1, (p1 - 3.0) / 2.0, x2, x1)
                 )
                 term2 = (
                     (g2 ** (p2 - p1))
                     * ((anisotropy_term[ind_fast] ** (-p_eta / 2.0)) / Pp2)
                     * (nu_nup[ind_fast] ** ((1.0 - p2) / 2.0))
-                    * (GIx_p2(x3) - GIx_p2(x2))
+                    * self._G_diff(GIx_p2, (p2 - 3.0) / 2.0, x3, x2)
                 )
                 jI[ind_fast] = prefac_j * (term1 + term2)
 
@@ -2639,7 +2666,7 @@ class JetModel:
                 term1 = (
                     ((p1 + 2.0) * ((anisotropy_term[ind_fast] ** (-p_eta / 2.0)) / Pp1))
                     * (nu_nup[ind_fast] ** (-(p1 + 4.0) / 2.0))
-                    * (GaIx_p1(x2) - GaIx_p1(x1))
+                    * self._G_diff(GaIx_p1, (p1 - 2.0) / 2.0, x2, x1)
                 )
                 term2 = (
                     (
@@ -2648,7 +2675,7 @@ class JetModel:
                         * ((anisotropy_term[ind_fast] ** (-p_eta / 2.0)) / Pp2)
                     )
                     * (nu_nup[ind_fast] ** (-(p2 + 4.0) / 2.0))
-                    * (GaIx_p2(x3) - GaIx_p2(x2))
+                    * self._G_diff(GaIx_p2, (p2 - 2.0) / 2.0, x3, x2)
                 )
                 alphaI[ind_fast] = prefac_a * (term1 + term2)
 
