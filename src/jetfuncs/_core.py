@@ -705,6 +705,7 @@ class JetModel:
         DTYPE=np.float64,
         stokes="I",
         backend="auto",
+        n_stagnation=1000,
     ):
         ####################
         # store inputs
@@ -738,6 +739,7 @@ class JetModel:
         self.DTYPE = DTYPE
 
         self.stokes = str(stokes).upper()
+        self.n_stagnation = int(n_stagnation)
 
         # radiative-transfer back end: "auto" (numba if installed, else numpy),
         # "numba", or "numpy"; can be overridden per call in make_image()
@@ -801,61 +803,43 @@ class JetModel:
         self._build_grids(x_im_1D, y_im_1D, z_im_1D)
 
     def _build_stagnation_surface(self):
+        """
+        Stagnation surface, tabulated on n_stagnation field lines (labelled by the
+        polar angle theta_H at which they thread the horizon, log-spaced in theta_H).
+
+        Along each field line, r(theta) = r_H [(1 - cos theta_H)/(1 - cos theta)]^(1/nu),
+        the stagnation point is where the field-parallel derivative of the corotation
+        energy N_co = -(g_tt + 2 g_tphi Omega_F + g_phiphi Omega_F^2) vanishes
+        (Gelles et al. 2025); it is found by bisection in theta between the far field
+        (theta -> 0) and the horizon (theta = theta_H).  Omega_F is the angular velocity
+        of the field line being traced and is therefore held fixed during the bisection.
+        All field lines are bisected together as arrays, so a fine table costs ~10 ms.
+        """
         a = self.a
         nu = self.nu
         rH = self.rH
         bf = self.bf
+        n = int(self.n_stagnation)
+        if n < 4:
+            raise ValueError("n_stagnation must be at least 4")
 
-        thetahorizon_arr = 10.0 ** np.linspace(-5.0, np.log10(np.pi / 2.0), 100)
-        psi_arr = np.zeros_like(thetahorizon_arr)
-        rstag_arr = np.zeros_like(thetahorizon_arr)
-        tstag_arr = np.zeros_like(thetahorizon_arr)
+        theta_H = 10.0 ** np.linspace(-5.0, np.log10(np.pi / 2.0), n)
+        psi_H = psiBZpower(rH, theta_H, nu)  # stream function of each field line
+        Omega_H = omega_BZpower(0, psi_H, a, nu)  # its (constant) angular velocity
+        one_minus_cos_H = 1.0 - np.cos(theta_H)
 
-        for i in range(len(thetahorizon_arr)):
-            theta_a = 1.0e-10
-            theta_b = thetahorizon_arr[i]
+        theta_a = np.full(n, 1.0e-10)  # far along the field line
+        theta_b = theta_H.copy()  # at the horizon
+        for _ in range(30):
+            theta_c = np.sqrt(theta_a * theta_b)
+            r_c = rH * (one_minus_cos_H / (1.0 - np.cos(theta_c))) ** (1.0 / nu)
+            positive = Nderiv(r_c, theta_c, a, Omega_H, 1.0, bf) > 0.0
+            theta_a = np.where(positive, theta_c, theta_a)
+            theta_b = np.where(positive, theta_b, theta_c)
 
-            r_a = rH * ((1.0 - np.cos(theta_b)) / (1.0 - np.cos(theta_a))) ** (1.0 / nu)
-            r_b = rH
-
-            psi_a = psiBZpower(rH, theta_a, nu)
-            psi_b = psiBZpower(rH, theta_b, nu)
-
-            Omega_a = omega_BZpower(0, psi_a, a, nu)
-            Omega_b = omega_BZpower(0, psi_b, a, nu)
-
-            Ndval_a = Nderiv(r_a, theta_a, a, Omega_a, 1.0, bf)
-            Ndval_b = Nderiv(r_b, theta_b, a, Omega_b, 1.0, bf)
-
-            for _ in range(30):
-                theta_c = np.sqrt(theta_a * theta_b)
-                r_c = rH * ((1.0 - np.cos(thetahorizon_arr[i])) / (1.0 - np.cos(theta_c))) ** (
-                    1.0 / nu
-                )
-                psi_c = psiBZpower(rH, theta_c, nu)
-                Omega_c = omega_BZpower(0, psi_c, a, nu)
-                Ndval_c = Nderiv(r_c, theta_c, a, Omega_c, 1.0, bf)
-
-                if Ndval_c > 0.0:
-                    theta_a = theta_c
-                    r_a = r_c
-                    psi_a = psi_c
-                    Omega_a = Omega_c
-                    Ndval_a = Ndval_c
-                else:
-                    theta_b = theta_c
-                    r_b = r_c
-                    psi_b = psi_c
-                    Omega_b = Omega_c
-                    Ndval_b = Ndval_c
-
-            psi_arr[i] = psi_c
-            rstag_arr[i] = r_c
-            tstag_arr[i] = theta_c
-
-        self.thetahorizon_arr = thetahorizon_arr
-        self.rstag_arr = rstag_arr
-        self.tstag_arr = tstag_arr
+        self.thetahorizon_arr = theta_H
+        self.rstag_arr = r_c
+        self.tstag_arr = theta_c
 
     def stagnation(self, theta_fp):
         th = self.thetahorizon_arr
