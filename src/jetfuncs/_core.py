@@ -938,10 +938,43 @@ class JetModel:
         # (it is symmetric about theta_fp = pi/2).  Ascending, like theta_H.
         self.omchorizon_arr = omc_H
 
+        # Roots are found on field lines spaced logarithmically in theta_H, which is the
+        # right distribution for the root find but leaves the lookup abscissa unevenly
+        # spaced -- so a lookup has to bisect.  Resampling onto a grid uniform in
+        # log10(omc) lets the kernel index it directly, with one log10 and no search, and
+        # lets both stagnation columns share a single bracket.  The resampled grid is
+        # finer than the original by _STAG_LUT_REFINE, so it reproduces the interpolant it
+        # is built from rather than coarsening it.
+        n_lut = int(self._STAG_LUT_REFINE * n)
+        lut_lo = np.log10(omc_H[0])
+        lut_hi = np.log10(omc_H[-1])
+        lut_log = np.linspace(lut_lo, lut_hi, n_lut)
+        lut_x = 10.0**lut_log
+        self._stag_lut_x = lut_x
+        self._stag_lut_r = np.interp(lut_x, omc_H, r_c)
+        self._stag_lut_t = np.interp(lut_x, omc_H, theta_c)
+        self._stag_lut_logx0 = float(lut_lo)
+        self._stag_lut_invdlog = 1.0 / (lut_log[1] - lut_log[0])
+        self._stag_lut_kmax = float(n_lut - 2)
+
     def _stagnation_omc(self, omc_fp):
-        """(r, theta) of the stagnation point, indexed by omc_fp = 1 - |cos(theta_fp)|."""
-        oc = self.omchorizon_arr
-        return np.interp(omc_fp, oc, self.rstag_arr), np.interp(omc_fp, oc, self.tstag_arr)
+        """
+        (r, theta) of the stagnation point, indexed by omc_fp = 1 - |cos(theta_fp)|.
+
+        Direct index into the uniform-in-log10(omc) lookup grid built above -- the same
+        arithmetic the compiled kernel uses, so the two back ends stay in lockstep.
+        """
+        with np.errstate(divide="ignore", invalid="ignore"):
+            f = (np.log10(omc_fp) - self._stag_lut_logx0) * self._stag_lut_invdlog
+        f = np.clip(np.nan_to_num(f, nan=0.0), 0.0, self._stag_lut_kmax)
+        k = f.astype(np.intp)
+        # the log grid supplies the bracket in O(1); the weight is taken linearly in omc,
+        # which is the interpolation the table was tabulated for
+        x_lut = self._stag_lut_x
+        w = (np.clip(omc_fp, x_lut[0], x_lut[-1]) - x_lut[k]) / (x_lut[k + 1] - x_lut[k])
+        r_lut, t_lut = self._stag_lut_r, self._stag_lut_t
+        return (r_lut[k] + w * (r_lut[k + 1] - r_lut[k]),
+                t_lut[k] + w * (t_lut[k + 1] - t_lut[k]))
 
     def stagnation(self, theta_fp):
         """(r, theta) of the stagnation point on the field line with footpoint theta_fp."""
@@ -1070,6 +1103,7 @@ class JetModel:
     # Near-axis field lines of a slowly spinning, wide (small-s) jet stagnate very far out
     # -- r_stag ~ 7e13 r_g at a=0.01, s=0.05 -- so the scan has to reach well beyond any
     # imaging domain.
+    _STAG_LUT_REFINE = 4  # lookup-grid refinement over n_stagnation
     _STAG_R_MAX = 1.0e20
     _STAG_SCAN_PER_DECADE = 40
 
@@ -1467,7 +1501,7 @@ class JetModel:
                 float(frequency), iv["order"],
                 self.x_im_f, self.y_im_f, self.z_J_f, self.z_mid_1D, self.dz_1D,
                 iv["starts"], iv["ends"], iv["nint"],
-                P, self.omchorizon_arr, self.rstag_arr, self.tstag_arr, *T, tau, I_out,
+                P, self._stag_lut_x, self._stag_lut_r, self._stag_lut_t, *T, tau, I_out,
             )
         return self.x_im_1D, self.y_im_1D, I_out.reshape(self.x_im.shape)
 
@@ -1519,7 +1553,7 @@ class JetModel:
                 f"use fewer points or raise the limit"
             )
         P = _kern.pack_params(self, heating_prescription)
-        args = (P, self.omchorizon_arr, self.rstag_arr, self.tstag_arr)
+        args = (P, self._stag_lut_x, self._stag_lut_r, self._stag_lut_t)
         Tup = _kern.build_field_table(logr, ugrid, *args, 1.0)
         Tlo = _kern.build_field_table(logr, ugrid, *args, -1.0)
         self._ftab = dict(
@@ -1597,7 +1631,7 @@ class JetModel:
                 iv["order"], offsets, self.x_im_f, self.y_im_f, self.z_J_f, self.z_mid_1D,
                 iv["starts"], iv["ends"], iv["nint"],
                 _kern.pack_params(self, heating_prescription),
-                self.omchorizon_arr, self.rstag_arr, self.tstag_arr,
+                self._stag_lut_x, self._stag_lut_r, self._stag_lut_t,
                 st["g"], st["nup"], st["gamma_c"], st["Cj"], st["Ca"], st["iz"],
             )
         self._state = st
@@ -1735,10 +1769,10 @@ class JetModel:
             eps_h = 1.0e-2
             r_min = rH * (1.0 + eps_h)
 
-            # jet region
-            rjet1 = rH * np.power(1.0 / one_minus_costheta, 1.0 / nu)
-            rjet2 = rH * np.power(1.0 / one_plus_costheta, 1.0 / nu)
-            ind_jet = ((r <= rjet1) | (r <= rjet2)) & (r > r_min)
+            # jet region: psi <= psi_edge in either lobe, i.e. (r/rH)^nu (1 -/+ cos
+            # theta) <= 1.  Equivalent to r <= rH (1 -/+ cos theta)^(-1/nu) for nu > 0,
+            # but reuses ratio_nu above and never forms 1/(1 - cos theta).
+            ind_jet = ((w_fp <= 1.0) | ((ratio_nu * one_plus_costheta) <= 1.0)) & (r > r_min)
 
             if jet_cutout_fraction > 0.0:
                 # both halves of the two-sided cut are the single condition

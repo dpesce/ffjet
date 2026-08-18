@@ -89,8 +89,11 @@ sigma_T = 6.65246e-25
     P_NM_FAC,
     P_RHNU,
     P_INV_RHNU,
+    P_STAG_LOGX0,
+    P_STAG_INVDLOG,
+    P_STAG_KMAX,
     N_PARAMS,
-) = range(41)
+) = range(44)
 
 
 def pack_params(model, heating_prescription="Poynting"):
@@ -144,6 +147,9 @@ def pack_params(model, heating_prescription="Poynting"):
     P[P_NM_FAC] = ((pp - 2.0) / (gm**pp)) * (1.0 / ((gm ** (2.0 - pp)) - (gx ** (2.0 - pp))))
     P[P_RHNU] = model.rH**model.nu
     P[P_INV_RHNU] = model.rH ** (-model.nu)
+    P[P_STAG_LOGX0] = model._stag_lut_logx0
+    P[P_STAG_INVDLOG] = model._stag_lut_invdlog
+    P[P_STAG_KMAX] = model._stag_lut_kmax
     return P
 
 
@@ -160,26 +166,6 @@ def pack_tables(model):
 
 
 # ----------------------------------------------------------------------------- small helpers
-@njit(cache=True, inline="always")
-def _interp_lin(x, xs, ys):
-    """np.interp(x, xs, ys) for ascending xs (same arithmetic as numpy's C routine)."""
-    n = xs.shape[0]
-    if x <= xs[0]:
-        return ys[0]
-    if x >= xs[n - 1]:
-        return ys[n - 1]
-    lo = 0
-    hi = n - 1
-    while hi - lo > 1:
-        mid = (lo + hi) >> 1
-        if xs[mid] <= x:
-            lo = mid
-        else:
-            hi = mid
-    slope = (ys[hi] - ys[lo]) / (xs[hi] - xs[lo])
-    return slope * (x - xs[lo]) + ys[lo]
-
-
 @njit(cache=True, inline="always")
 def _G_bracket(x, logx0, invdlogx, kmax):
     """
@@ -245,7 +231,6 @@ def jet_intervals(x_im_f, y_im_f, z_J_f, z_mid_1D, P, max_int):
     sin_i = P[P_SIN_I]
     rH = P[P_RH]
     nu = P[P_NU]
-    s = P[P_S]
     cut = P[P_JET_CUTOUT]
     r_min = rH * (1.0 + 1.0e-2)
     Npix = x_im_f.shape[0]
@@ -254,10 +239,9 @@ def jet_intervals(x_im_f, y_im_f, z_J_f, z_mid_1D, P, max_int):
     ends = np.full((Npix, max_int), -1, dtype=np.int32)
     nint = np.zeros(Npix, dtype=np.int32)
     ncell = np.zeros(Npix, dtype=np.int64)
-    if cut > 0.0:
-        theta_fp_cut = 2.0 * math.asin(cut / math.sqrt(2.0))
-    else:
-        theta_fp_cut = -1.0
+    inv_rHnu = P[P_INV_RHNU]
+    # 1 - cos(theta_fp_cut) with theta_fp_cut = 2 arcsin(cut/sqrt(2))
+    omc_fp_cut = cut * cut if cut > 0.0 else -1.0
     for pix in prange(Npix):
         inside = False
         k = 0
@@ -278,19 +262,21 @@ def jet_intervals(x_im_f, y_im_f, z_J_f, z_mid_1D, P, max_int):
             else:
                 omc = big
                 opc = small
-            rjet1 = rH * ((1.0 / omc) ** (1.0 / nu))
-            rjet2 = rH * ((1.0 / opc) ** (1.0 / nu))
-            inj = ((r <= rjet1) or (r <= rjet2)) and (r > r_min)
-            if inj and theta_fp_cut > 0.0:
-                r_rH_1_s = (r / rH) ** (1.0 - s)
-                sin_half = math.sqrt(0.5 * omc)
-                cos_half = math.sqrt(0.5 * opc)
-                arg_arcsin = r_rH_1_s * sin_half
-                if arg_arcsin < 0.7071067811865476:
-                    theta_fp = 2.0 * math.asin(arg_arcsin)
-                else:
-                    theta_fp = 2.0 * math.acos(r_rH_1_s * cos_half)
-                if (theta_fp < theta_fp_cut) or (theta_fp > (math.pi - theta_fp_cut)):
+            # A point is inside a jet lobe when its stream function does not exceed the
+            # edge value: r^nu (1 -/+ cos theta) <= rH^nu.  Testing it that way rather
+            # than as r <= rH (1 -/+ cos theta)^(-1/nu) is the same condition for nu > 0,
+            # but costs one pow instead of two and never forms 1/omc -- which is what
+            # underflowed to a division by zero for near-axis samples on wide log grids.
+            rnu = r**nu
+            w_up = rnu * omc * inv_rHnu
+            w_lo = rnu * opc * inv_rHnu
+            inj = ((w_up <= 1.0) or (w_lo <= 1.0)) and (r > r_min)
+            if inj and omc_fp_cut > 0.0:
+                # footpoint via the half-angle identity (see _rtheta_chain); the two-sided
+                # cut theta_fp < theta_cut or theta_fp > pi - theta_cut is the single
+                # condition 1 - |cos theta_fp| < 1 - cos(theta_cut)
+                cos_fp = (1.0 - w_up) if w_up < 1.0 else (w_lo - 1.0)
+                if (1.0 - abs(cos_fp)) < omc_fp_cut:
                     inj = False
             if inj:
                 cnt += 1
@@ -332,7 +318,7 @@ def jet_intervals(x_im_f, y_im_f, z_J_f, z_mid_1D, P, max_int):
 
 
 @njit(cache=True)
-def _rtheta_chain(r, omc, sgn, P, omc_tab, rs_tab, ts_tab):
+def _rtheta_chain(r, omc, sgn, P, xs_tab, rs_tab, ts_tab):
     """
     (r, theta)-only physics of one point.  omc = 1 - |cos theta| (passed exactly, so that
     points very close to the axis keep their precision) and sgn = sign(cos theta).
@@ -364,6 +350,9 @@ def _rtheta_chain(r, omc, sgn, P, omc_tab, rs_tab, ts_tab):
     heating_is_poynting = P[P_HEAT_POYNTING] > 0.5
     rHnu = P[P_RHNU]
     inv_rHnu = P[P_INV_RHNU]
+    stag_logx0 = P[P_STAG_LOGX0]
+    stag_invdlog = P[P_STAG_INVDLOG]
+    stag_kmax = P[P_STAG_KMAX]
     gm_p = P[P_GM_P]
     gm_pm1 = P[P_GM_PM1]
     nm_fac = P[P_NM_FAC]
@@ -396,8 +385,23 @@ def _rtheta_chain(r, omc, sgn, P, omc_tab, rs_tab, ts_tab):
     psi = rHnu * omc_fp
     cthhorizon = abs(cos_fp)
     Omega = a / (4.0 + 8.0 / (1.0 + cthhorizon))
-    rstag = _interp_lin(omc_fp, omc_tab, rs_tab)
-    tstag = _interp_lin(omc_fp, omc_tab, ts_tab)
+    # Direct index into the uniform-in-log10(omc) lookup grid: one log10 and no search,
+    # with both columns sharing the bracket.  (The raw table is spaced logarithmically in
+    # theta_H, so indexing it directly is not possible; see _build_stagnation_surface.)
+    fs = (math.log10(omc_fp) - stag_logx0) * stag_invdlog
+    if fs < 0.0:
+        fs = 0.0
+    elif fs > stag_kmax:
+        fs = stag_kmax
+    ks = int(fs)
+    x0s = xs_tab[ks]
+    ws = (omc_fp - x0s) / (xs_tab[ks + 1] - x0s)
+    if ws < 0.0:
+        ws = 0.0
+    elif ws > 1.0:
+        ws = 1.0
+    rstag = rs_tab[ks] + ws * (rs_tab[ks + 1] - rs_tab[ks])
+    tstag = ts_tab[ks] + ws * (ts_tab[ks + 1] - ts_tab[ks])
 
     # metric quantities
     sth2 = omc * (2.0 - omc)  # = 1 - cos^2(theta), without cancellation
@@ -693,7 +697,7 @@ def _ray_part(x, y, z, r, R, vr, vt, vp, gamma, alphalapse, Bpr, Bpt, Bpp, gamma
 
 
 @njit(cache=True)
-def _cell_state(xi, yi, zJ, zi, P, omc_tab, rs_tab, ts_tab):
+def _cell_state(xi, yi, zJ, zi, P, xs_tab, rs_tab, ts_tab):
     """
     Frequency-independent physics of one cell, evaluated exactly.
     Returns (g, nu_p, gamma_c, C_j, C_a).
@@ -711,7 +715,7 @@ def _cell_state(xi, yi, zJ, zi, P, omc_tab, rs_tab, ts_tab):
     sgn = 1.0 if z >= 0.0 else -1.0
     omc = R2 / (r * (r + az))  # 1 - |cos theta|, without cancellation
     vr, vt, vp, gamma, alpha, Bpr, Bpt, Bpp, Bpm, gamma_c, Kj, Ka = _rtheta_chain(
-        r, omc, sgn, P, omc_tab, rs_tab, ts_tab
+        r, omc, sgn, P, xs_tab, rs_tab, ts_tab
     )
     return _ray_part(x, y, z, r, R, vr, vt, vp, gamma, alpha, Bpr, Bpt, Bpp, gamma_c, Kj, Ka, P)
 
@@ -728,7 +732,7 @@ N_TAB = 12  # stored quantities per node
 
 
 @njit(cache=True, parallel=True)
-def build_field_table(logr, ugrid, P, omc_tab, rs_tab, ts_tab, hemisphere):
+def build_field_table(logr, ugrid, P, xs_tab, rs_tab, ts_tab, hemisphere):
     """
     Table T[i_r, i_u, q] of the (r,theta)-only quantities for one hemisphere (+1/-1):
       0-2 (vr, vt, vp)   3 gamma   4 lapse   5-7 (Bpr, Bpt, Bpp)   8 |B'|
@@ -751,7 +755,7 @@ def build_field_table(logr, ugrid, P, omc_tab, rs_tab, ts_tab, hemisphere):
                 w = 1.0 - 1.0e-12
             omc = w / t  # 1 - |cos theta|, exact
             vr, vt, vp, gamma, alpha, Bpr, Bpt, Bpp, Bpm, gc, Kj, Ka = _rtheta_chain(
-                r, omc, hemisphere, P, omc_tab, rs_tab, ts_tab
+                r, omc, hemisphere, P, xs_tab, rs_tab, ts_tab
             )
             T[i, j, 0] = vr
             T[i, j, 1] = vt
@@ -927,7 +931,7 @@ def rt_kernel(
     ends,
     nint,
     P,
-    omc_tab,
+    xs_tab,
     rs_tab,
     ts_tab,
     T0,
@@ -954,7 +958,7 @@ def rt_kernel(
                 break
             for i in range(starts[pix, k], ends[pix, k]):
                 g, nup, gamma_c, Cj, Ca = _cell_state(
-                    xi, yi, zJ, z_mid_1D[i], P, omc_tab, rs_tab, ts_tab
+                    xi, yi, zJ, z_mid_1D[i], P, xs_tab, rs_tab, ts_tab
                 )
                 jI, alphaI = _cell_emis(
                     frequency, g, nup, gamma_c, Cj, Ca, P, T0, T1, T2, T3, T4, T5
@@ -978,7 +982,7 @@ def precompute_state(
     ends,
     nint,
     P,
-    omc_tab,
+    xs_tab,
     rs_tab,
     ts_tab,
     st_g,
@@ -999,7 +1003,7 @@ def precompute_state(
         for k in range(nint[pix]):
             for i in range(starts[pix, k], ends[pix, k]):
                 g, nup, gamma_c, Cj, Ca = _cell_state(
-                    xi, yi, zJ, z_mid_1D[i], P, omc_tab, rs_tab, ts_tab
+                    xi, yi, zJ, z_mid_1D[i], P, xs_tab, rs_tab, ts_tab
                 )
                 st_g[o] = g
                 st_nup[o] = nup
