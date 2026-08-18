@@ -223,10 +223,17 @@ def jet_intervals(x_im_f, y_im_f, z_J_f, z_mid_1D, P, max_int):
             x = (x_im_f[pix] * cos_i) + (z_im_now * sin_i)
             y = y_im_f[pix]
             z = (z_im_now * cos_i) - (x_im_f[pix] * sin_i)
-            r = math.sqrt((x * x) + (y * y) + (z * z))
-            costheta = z / r
-            omc = 1.0 - costheta
-            opc = 1.0 + costheta
+            R2 = (x * x) + (y * y)
+            r = math.sqrt(R2 + (z * z))
+            az = abs(z)
+            big = (r + az) / r  # 1 + |cos theta|
+            small = R2 / (r * (r + az))  # 1 - |cos theta|, without cancellation
+            if z >= 0.0:
+                omc = small
+                opc = big
+            else:
+                omc = big
+                opc = small
             rjet1 = rH * ((1.0 / omc) ** (1.0 / nu))
             rjet2 = rH * ((1.0 / opc) ** (1.0 / nu))
             inj = ((r <= rjet1) or (r <= rjet2)) and (r > r_min)
@@ -683,10 +690,11 @@ def _cell_state(xi, yi, zJ, zi, P, th_tab, rs_tab, ts_tab):
     R2 = (x * x) + (y * y)
     r = math.sqrt(R2 + (z * z))
     R = math.sqrt(R2)
-    costheta = z / r
-    sgn = 1.0 if costheta >= 0.0 else -1.0
+    az = abs(z)
+    sgn = 1.0 if z >= 0.0 else -1.0
+    omc = R2 / (r * (r + az))  # 1 - |cos theta|, without cancellation
     vr, vt, vp, gamma, alpha, Bpr, Bpt, Bpp, Bpm, gamma_c, Kj, Ka = _rtheta_chain(
-        r, 1.0 - abs(costheta), sgn, P, th_tab, rs_tab, ts_tab
+        r, omc, sgn, P, th_tab, rs_tab, ts_tab
     )
     return _ray_part(x, y, z, r, R, vr, vt, vp, gamma, alpha, Bpr, Bpt, Bpp, gamma_c, Kj, Ka, P)
 
@@ -757,14 +765,10 @@ def _cell_state_tab(xi, yi, zJ, zi, P, Tup, Tlo, logr0, invdlogr, nr, invdu, nu_
     R2 = (x * x) + (y * y)
     r = math.sqrt(R2 + (z * z))
     R = math.sqrt(R2)
-    costheta = z / r
+    omc = R2 / (r * (r + abs(z)))  # 1 - |cos theta|, without cancellation
     r_rH_1_s = (r / rH) ** (1.0 - s)
-    if costheta >= 0.0:
-        u = r_rH_1_s * math.sqrt(1.0 - costheta)  # sqrt(psi/psi_edge)
-        T = Tup
-    else:
-        u = r_rH_1_s * math.sqrt(1.0 + costheta)
-        T = Tlo
+    u = r_rH_1_s * math.sqrt(omc)  # sqrt(psi/psi_edge)
+    T = Tup if z >= 0.0 else Tlo
     fr = (math.log10(r - rH) - logr0) * invdlogr
     if fr < 0.0:
         fr = 0.0

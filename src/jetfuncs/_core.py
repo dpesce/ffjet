@@ -1,9 +1,11 @@
 ###################################################
 # imports and etc.
 
+import warnings
+
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator
-from scipy.special import kv
+from scipy.special import hyp2f1, kv
 from astropy.io import fits
 from astropy.wcs import WCS
 from astropy.time import Time
@@ -753,6 +755,48 @@ class JetModel:
         self._ftab = None  # 2-D table of the (r,theta)-only physics (see build_field_table)
 
         ####################
+        # input validation
+        #
+        # Each of these otherwise fails silently or with an exception from deep inside the
+        # setup, so they are checked here where the offending argument can be named.
+
+        if not (self.m > 0.0):
+            raise ValueError(f"m={self.m} must be positive (black hole mass, in solar masses)")
+        if not (self.mdot > 0.0):
+            raise ValueError(f"mdot={self.mdot} must be positive")
+        # |a| < 1 is already enforced, with this same message, by omega_BZpower below
+        if self.s >= 1.0:
+            raise ValueError(
+                f"s={self.s} must be less than 1: the field-line exponent nu = 2 - 2s would be "
+                f"zero or negative, and the jet geometry r ~ (1 - |cos theta|)^(-1/nu) is undefined"
+            )
+        if self.s <= 0.0:
+            raise ValueError(
+                f"s={self.s} must be positive: nu = 2 - 2s >= 2 makes the jet boundary reach the "
+                f"pole at finite radius and no stagnation surface exists on most field lines"
+            )
+        if not (self.eta > 0.0):
+            raise ValueError(
+                f"eta={self.eta} must be positive; the pitch-angle normalization "
+                f"int_0^1 [1 + (eta - 1) mu^2]^(-p_eta/2) dmu diverges as eta -> 0 for p_eta >= 1"
+            )
+        if not (self.gamma_m > 1.0):
+            raise ValueError(f"gamma_m={self.gamma_m} must exceed 1")
+        if not (self.gamma_max > self.gamma_m):
+            raise ValueError(
+                f"gamma_max={self.gamma_max} must exceed gamma_m={self.gamma_m}; otherwise the "
+                f"electron normalization changes sign and the emissivity comes out negative"
+            )
+        if not (self.gamma_inf >= 1.0):
+            raise ValueError(f"gamma_inf={self.gamma_inf} must be at least 1")
+        if not (0.0 <= self.jet_cutout_fraction < 1.0):
+            raise ValueError(
+                f"jet_cutout_fraction={self.jet_cutout_fraction} must be in [0, 1)"
+            )
+        if self.p_eta < 0.0:
+            raise ValueError(f"p_eta={self.p_eta} must be non-negative")
+
+        ####################
         # derived quantities
 
         self.nu = 2.0 - (2.0 * self.s)
@@ -808,13 +852,25 @@ class JetModel:
         Stagnation surface, tabulated on n_stagnation field lines (labelled by the
         polar angle theta_H at which they thread the horizon, log-spaced in theta_H).
 
-        Along each field line, r(theta) = r_H [(1 - cos theta_H)/(1 - cos theta)]^(1/nu),
-        the stagnation point is where the field-parallel derivative of the corotation
+        The stagnation point is where the field-parallel derivative of the corotation
         energy N_co = -(g_tt + 2 g_tphi Omega_F + g_phiphi Omega_F^2) vanishes
-        (Gelles et al. 2025); it is found by bisection in theta between the far field
-        (theta -> 0) and the horizon (theta = theta_H).  Omega_F is the angular velocity
-        of the field line being traced and is therefore held fixed during the bisection.
-        All field lines are bisected together as arrays, so a fine table costs ~10 ms.
+        (Gelles et al. 2025).  Omega_F is the angular velocity of the field line being
+        traced and is therefore held fixed along it.
+
+        The field line is parameterized by *radius*, not by polar angle:
+
+            1 - cos theta(r) = (1 - cos theta_H) (r_H / r)^nu,
+
+        which is evaluated directly and so cannot overflow.  (Parameterizing by theta
+        instead requires r = r_H [(1-cos theta_H)/(1-cos theta)]^(1/nu), which overflows
+        to inf for small theta -- badly so when 1/nu is large.  Nderiv(inf, ...) is NaN,
+        `NaN > 0` is False, and a bisection then walks towards the overflowing end and
+        returns r_stag = inf with no error.)
+
+        The root is bracketed on a coarse logarithmic radius grid and then bisected in
+        log r.  All field lines are handled together as arrays, so a fine table costs
+        ~30 ms.  If any field line has no bracketed root, a RuntimeError names it rather
+        than letting a non-finite stagnation radius through.
         """
         a = self.a
         nu = self.nu
@@ -827,16 +883,51 @@ class JetModel:
         theta_H = 10.0 ** np.linspace(-5.0, np.log10(np.pi / 2.0), n)
         psi_H = psiBZpower(rH, theta_H, nu)  # stream function of each field line
         Omega_H = omega_BZpower(0, psi_H, a, nu)  # its (constant) angular velocity
-        one_minus_cos_H = 1.0 - np.cos(theta_H)
+        # 1 - cos(theta_H), by the half-angle form so that small theta_H keeps its digits
+        omc_H = 2.0 * np.sin(0.5 * theta_H) ** 2
 
-        theta_a = np.full(n, 1.0e-10)  # far along the field line
-        theta_b = theta_H.copy()  # at the horizon
-        for _ in range(30):
-            theta_c = np.sqrt(theta_a * theta_b)
-            r_c = rH * (one_minus_cos_H / (1.0 - np.cos(theta_c))) ** (1.0 / nu)
-            positive = Nderiv(r_c, theta_c, a, Omega_H, 1.0, bf) > 0.0
-            theta_a = np.where(positive, theta_c, theta_a)
-            theta_b = np.where(positive, theta_b, theta_c)
+        def _theta_of_r(r):
+            """Polar angle on each field line at radius r (r broadcast against theta_H)."""
+            omc = np.clip(omc_H * (rH / r) ** nu, 0.0, 2.0)
+            return 2.0 * np.arcsin(np.sqrt(0.5 * omc)), omc
+
+        def _Nprime(r):
+            th, _ = _theta_of_r(r)
+            with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+                return Nderiv(r, th, a, Omega_H, 1.0, bf)
+
+        # bracket: scan outwards from just outside the horizon and take the innermost
+        # sign change of N' on each field line
+        r_lo_scan = rH * (1.0 + 1.0e-9)
+        lo, hi = np.log10(r_lo_scan), np.log10(self._STAG_R_MAX)
+        n_scan = max(64, round((hi - lo) * self._STAG_SCAN_PER_DECADE))
+        r_scan = (10.0 ** np.linspace(lo, hi, n_scan)).reshape(n_scan, 1)
+        sgn = np.sign(_Nprime(r_scan))
+        sgn[~np.isfinite(sgn)] = 0.0
+        change = (sgn[:-1] * sgn[1:]) < 0.0
+        found = change.any(axis=0)
+        if not found.all():
+            bad = np.flatnonzero(~found)
+            raise RuntimeError(
+                f"the stagnation surface has no bracketed root on {bad.size} of {n} field "
+                f"lines (first at theta_H = {theta_H[bad[0]]:.4g} rad) for a={a}, s={self.s} "
+                f"(nu={nu}); the force-free jet solution is not usable at these parameters"
+            )
+        k = np.argmax(change, axis=0)  # innermost sign change
+        r_a = r_scan[:, 0][k]
+        r_b = r_scan[:, 0][k + 1]
+
+        # bisect in log r
+        f_a = _Nprime(r_a)
+        for _ in range(60):
+            r_c = np.sqrt(r_a * r_b)
+            f_c = _Nprime(r_c)
+            same = np.sign(f_c) == np.sign(f_a)
+            r_a = np.where(same, r_c, r_a)
+            f_a = np.where(same, f_c, f_a)
+            r_b = np.where(same, r_b, r_c)
+        r_c = np.sqrt(r_a * r_b)
+        theta_c, _ = _theta_of_r(r_c)
 
         self.thetahorizon_arr = theta_H
         self.rstag_arr = r_c
@@ -977,6 +1068,18 @@ class JetModel:
     _TAB_DEX_STORE = 0.01            # stored resolution; interpolation error ~5e-5
     _TAB_LOGX_FINE = (-22.0, 3.2)    # internal log10(x) range, padded on both ends
     _TAB_LOGX_STORE = (-20.0, 2.8)   # stored log10(x) range
+
+    # stagnation-surface root search: how far out to look for a bracket, and how finely.
+    # Near-axis field lines of a slowly spinning, wide (small-s) jet stagnate very far out
+    # -- r_stag ~ 7e13 r_g at a=0.01, s=0.05 -- so the scan has to reach well beyond any
+    # imaging domain.
+    _STAG_R_MAX = 1.0e20
+    _STAG_SCAN_PER_DECADE = 40
+
+    # pole-on handling: |sin(i)| below this counts as exactly along the jet axis, and a
+    # ray-centring offset more than this multiple of zmax earns a warning
+    _POLE_ON_SIN_TOL = 1.0e-12
+    _POLE_ON_ZJ_WARN = 30.0
 
     # (Stokes parameter, kernel, exponent m) for each tabulated family
     _TAB_FAMILIES = {
@@ -1133,12 +1236,20 @@ class JetModel:
 
     # compute normalizations for the anisotropic distributions
     def _compute_phi_norms(self):
-        eta = self.eta
-        p_eta = self.p_eta
+        """
+        Pitch-angle normalization
 
-        dummu = np.linspace(0.0, 1.0, 10000)
-        integrand = (1.0 + ((eta - 1.0) * (dummu * dummu))) ** (-p_eta / 2.0)
-        self.phi_norm = np.sum(0.5 * (integrand[1:] + integrand[:-1]) * (dummu[1:] - dummu[:-1]))
+            Phi(eta, p_eta) = int_0^1 [1 + (eta - 1) mu^2]^(-p_eta/2) dmu
+                            = 2F1(1/2, p_eta/2; 3/2; 1 - eta),
+
+        in closed form.  The integrand develops a spike of height eta^(-p_eta/2) and width
+        ~sqrt(eta) at mu = 1 as eta -> 0, which a uniform quadrature cannot follow: the
+        10^4-point trapezoid this replaces was 2.6% high at eta = 1e-4 for p_eta = 2 and
+        19% high for p_eta = 3, and Phi divides the emissivity, so that error goes
+        straight into the flux.  The closed form matches a converged tanh-sinh quadrature
+        to <= 5e-9 over p_eta in [0.5, 4] and eta in [1e-8, 1e4].
+        """
+        self.phi_norm = float(hyp2f1(0.5, self.p_eta / 2.0, 1.5, 1.0 - self.eta))
 
     # construct the image and jet-frame grids
     @staticmethod
@@ -1179,7 +1290,37 @@ class JetModel:
         self.z_im_1D = z_im_1D
 
         self.x_im, self.y_im = np.meshgrid(self.x_im_1D, self.y_im_1D)
-        self.z_J = -(self.x_im / np.tan(self.inc_rad))
+
+        # Each ray is sampled about z_J, the point at which it passes closest to the JET
+        # AXIS -- the right place to spend resolution for an inclined view of a narrow
+        # cone, and much better resolved than centring on the black hole (verified: at
+        # i = 17 deg, axis centring is stable to 0.05% from zmax = 1e6 to 1e9, while
+        # centring on the black hole is still drifting by tens of percent at 1e9).
+        #
+        # It is also cot(i), so it diverges as the line of sight approaches the jet axis.
+        # Exactly pole-on, every ray is parallel to the axis, there is no unique closest
+        # approach to it, and the correct limit is to sample about the closest approach to
+        # the black hole instead.  (Left as -x/tan(i), inc = 180 gives tan(0) = 0 exactly,
+        # z_J = -inf and a silently blank image, while inc = 0 gives tan(pi) = -1.2e-16 and
+        # a ZeroDivisionError from the compiled kernel.)
+        if abs(self.sin_i) < self._POLE_ON_SIN_TOL:
+            self.z_J = np.zeros_like(self.x_im)
+        else:
+            self.z_J = -(self.x_im * self.cos_i / self.sin_i)
+            zmax_sampled = float(np.abs(self.z_im_1D).max())
+            zJ_max = float(np.abs(self.z_J).max())
+            if zJ_max > self._POLE_ON_ZJ_WARN * zmax_sampled:
+                from_axis = min(self.inc, 180.0 - self.inc)
+                warnings.warn(
+                    f"the line of sight is {from_axis:.3g} deg from the jet axis, so rays are "
+                    f"sampled about |z_J| up to {zJ_max:.3g} r_g -- "
+                    f"{zJ_max / zmax_sampled:.0f}x the sampling half-range zmax="
+                    f"{zmax_sampled:.3g}, which leaves the inner jet under-sampled on the "
+                    f"outer pixels.  Use zmax >~ xmax/tan(i) = "
+                    f"{abs(self.x_im_1D).max() * abs(self.cos_i / self.sin_i):.3g}.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
 
         # flattened views used in the RT loop
         self.x_im_f = self.x_im.ravel()
@@ -1540,8 +1681,14 @@ class JetModel:
             r = np.sqrt(r2)
 
             costheta = z / r
-            one_minus_costheta = 1.0 - costheta
-            one_plus_costheta = 1.0 + costheta
+            # 1 -/+ cos(theta) without the cancellation that 1 - z/r suffers when the
+            # point is close to the axis (|z| -> r); (r - |z|) = (x^2 + y^2)/(r + |z|)
+            az = np.abs(z)
+            big = (r + az) / r
+            small = R2 / (r * (r + az))
+            pos = z >= 0.0
+            one_minus_costheta = np.where(pos, small, big)
+            one_plus_costheta = np.where(pos, big, small)
 
             # footpoint theta
             r_rH_1_s = np.power(r / rH, 1.0 - s)
@@ -2064,8 +2211,9 @@ class JetModel:
 
         # polar angle
         costheta = np.cos(theta)
-        one_minus_costheta = 1.0 - costheta
-        one_plus_costheta = 1.0 + costheta
+        # half-angle forms: exact for theta near 0 or pi, where 1 -/+ cos(theta) cancels
+        one_minus_costheta = 2.0 * np.sin(0.5 * theta) ** 2
+        one_plus_costheta = 2.0 * np.cos(0.5 * theta) ** 2
 
         # footpoint theta
         r_rH_1_s = np.power(r / rH, 1.0 - s)
