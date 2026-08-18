@@ -333,6 +333,35 @@ def getnu_cons(bf_here, r, theta, r0, theta0, Omegaf, spin, M=1.0):
     return np.real(nutot)
 
 
+def _energy_const(a, r0, theta0, omega):
+    """
+    A = sqrt(-coef0/coef1) at the stagnation point: the constant that fixes the
+    energy-conserving parallel boost.  A function of the field line alone, so it is
+    tabulated alongside (r_stag, theta_stag); see JetModel._build_stagnation_surface.
+    """
+    a2 = a * a
+    cth2 = np.cos(theta0) ** 2.0
+    sth2 = np.sin(theta0) ** 2.0
+    r2 = r0 * r0
+    rho2 = r2 + (a2 * cth2)
+    Delta = r2 - (2.0 * r0) + a2
+    Sigma = ((r2 + a2) ** 2.0) - (a2 * Delta * sth2)
+    g00 = ((a2 * sth2) - Delta) / rho2
+    g03 = -2.0 * a * r0 * sth2 / rho2
+    g33 = Sigma * sth2 / rho2
+    ginv_denom = (g00 * g33) - (g03 * g03)
+    ginv00 = g33 / ginv_denom
+    ginv03 = -g03 / ginv_denom
+    ginv33 = g00 / ginv_denom
+    gtphifac = g03 + (g33 * omega)
+    gttfac = g00 + (g03 * omega)
+    coef0 = (g00 + (omega * (2.0 * g03 + g33 * omega))) ** 2.0
+    coef1 = (ginv33 * (gtphifac * gtphifac)) + (
+        2.0 * ginv03 * gtphifac * gttfac + ginv00 * (gttfac * gttfac)
+    )
+    return np.sqrt(-coef0 / coef1)
+
+
 def u_driftframe(
     a,
     r,
@@ -344,6 +373,7 @@ def u_driftframe(
     nu_parallel=0,
     th=np.pi / 2,
     gamma_inf=None,
+    Aconst=None,
     retbunit=False,
     retqty=False,
     eps=-1,
@@ -452,7 +482,8 @@ def u_driftframe(
             2.0 * ginv03_stag * gtphifac * gttfac + ginv00_stag * (gttfac * gttfac)
         )
         efac2 = -coef0 / coef1
-        Aconst = np.sqrt(efac2)
+        if Aconst is None:
+            Aconst = np.sqrt(efac2)
         Aconst2 = Aconst * Aconst
 
         vphiupper = (alpha / (Bsq * gdet)) * (E1_cov * B2_cov - B1_cov * E2_cov)
@@ -953,6 +984,13 @@ class JetModel:
         self._stag_lut_x = lut_x
         self._stag_lut_r = np.interp(lut_x, omc_H, r_c)
         self._stag_lut_t = np.interp(lut_x, omc_H, theta_c)
+        # The energy-conservation constant of the parallel boost depends only on the
+        # field line -- through (r_stag, theta_stag, Omega_F) -- so it belongs in this
+        # table too rather than being rebuilt, with a square root and a dozen divisions,
+        # at every cell.  Omega_F on the lookup grid follows from the abscissa itself:
+        # cos(theta_fp) = 1 - omc_fp.
+        omega_lut = a / (4.0 + 8.0 / (2.0 - lut_x))
+        self._stag_lut_a = _energy_const(a, self._stag_lut_r, self._stag_lut_t, omega_lut)
         self._stag_lut_logx0 = float(lut_lo)
         self._stag_lut_invdlog = 1.0 / (lut_log[1] - lut_log[0])
         self._stag_lut_kmax = float(n_lut - 2)
@@ -975,6 +1013,17 @@ class JetModel:
         r_lut, t_lut = self._stag_lut_r, self._stag_lut_t
         return (r_lut[k] + w * (r_lut[k + 1] - r_lut[k]),
                 t_lut[k] + w * (t_lut[k + 1] - t_lut[k]))
+
+    def _stagnation_aconst(self, omc_fp):
+        """Energy-conservation constant of the parallel boost, off the same lookup grid."""
+        with np.errstate(divide="ignore", invalid="ignore"):
+            f = (np.log10(omc_fp) - self._stag_lut_logx0) * self._stag_lut_invdlog
+        f = np.clip(np.nan_to_num(f, nan=0.0), 0.0, self._stag_lut_kmax)
+        k = f.astype(np.intp)
+        x_lut = self._stag_lut_x
+        w = (np.clip(omc_fp, x_lut[0], x_lut[-1]) - x_lut[k]) / (x_lut[k + 1] - x_lut[k])
+        a_lut = self._stag_lut_a
+        return a_lut[k] + w * (a_lut[k + 1] - a_lut[k])
 
     def stagnation(self, theta_fp):
         """(r, theta) of the stagnation point on the field line with footpoint theta_fp."""
@@ -1501,7 +1550,7 @@ class JetModel:
                 float(frequency), iv["order"],
                 self.x_im_f, self.y_im_f, self.z_J_f, self.z_mid_1D, self.dz_1D,
                 iv["starts"], iv["ends"], iv["nint"],
-                P, self._stag_lut_x, self._stag_lut_r, self._stag_lut_t, *T, tau, I_out,
+                P, self._stag_lut_x, self._stag_lut_r, self._stag_lut_t, self._stag_lut_a, *T, tau, I_out,
             )
         return self.x_im_1D, self.y_im_1D, I_out.reshape(self.x_im.shape)
 
@@ -1553,7 +1602,7 @@ class JetModel:
                 f"use fewer points or raise the limit"
             )
         P = _kern.pack_params(self, heating_prescription)
-        args = (P, self._stag_lut_x, self._stag_lut_r, self._stag_lut_t)
+        args = (P, self._stag_lut_x, self._stag_lut_r, self._stag_lut_t, self._stag_lut_a)
         Tup = _kern.build_field_table(logr, ugrid, *args, 1.0)
         Tlo = _kern.build_field_table(logr, ugrid, *args, -1.0)
         self._ftab = dict(
@@ -1631,7 +1680,7 @@ class JetModel:
                 iv["order"], offsets, self.x_im_f, self.y_im_f, self.z_J_f, self.z_mid_1D,
                 iv["starts"], iv["ends"], iv["nint"],
                 _kern.pack_params(self, heating_prescription),
-                self._stag_lut_x, self._stag_lut_r, self._stag_lut_t,
+                self._stag_lut_x, self._stag_lut_r, self._stag_lut_t, self._stag_lut_a,
                 st["g"], st["nup"], st["gamma_c"], st["Cj"], st["Ca"], st["iz"],
             )
         self._state = st
@@ -1793,6 +1842,7 @@ class JetModel:
             psi = (rH**nu) * omc_fp[idx_loc]
             Omega = omega_BZpower(0, psi, a, nu)
             rstag, tstag = self._stagnation_omc(omc_fp[idx_loc])
+            Aconst_here = self._stagnation_aconst(omc_fp[idx_loc])
 
             # metric quantities
             R = np.sqrt(R2[idx_loc])
@@ -1874,6 +1924,7 @@ class JetModel:
                 E2,
                 E3,
                 signcostheta,
+                Aconst=Aconst_here,
             )
 
             # ZAMO-frame Poynting flux scaling
@@ -2295,6 +2346,7 @@ class JetModel:
         if quantity == "Omega":
             return Omega
         rstag, tstag = self._stagnation_omc(omc_fp)
+        Aconst_here = self._stagnation_aconst(omc_fp)
 
         # metric quantities
         R = np.sqrt(R2)
@@ -2378,6 +2430,7 @@ class JetModel:
             E2,
             E3,
             signcostheta,
+            Aconst=Aconst_here,
         )
 
         # ZAMO-frame Poynting flux scaling

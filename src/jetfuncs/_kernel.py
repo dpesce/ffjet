@@ -317,8 +317,22 @@ def jet_intervals(x_im_f, y_im_f, z_J_f, z_mid_1D, P, max_int):
 # -----------------------------------------------------------------------------
 
 
+@njit(cache=True, inline="always")
+def _cont(gamma_c, P):
+    """
+    gamma_2^(p_2 - p_1): the factor that makes n_e * A_norm continuous across the cooling
+    boundary.  Only the field table needs it, because only the field table interpolates
+    that quantity.
+    """
+    if gamma_c >= P[P_GAMMA_MAX]:
+        return P[P_GAMMA_MAX]
+    if gamma_c > P[P_GAMMA_M]:
+        return gamma_c
+    return P[P_GM_PM1]
+
+
 @njit(cache=True)
-def _rtheta_chain(r, omc, sgn, P, xs_tab, rs_tab, ts_tab):
+def _rtheta_chain(r, omc, sgn, P, xs_tab, rs_tab, ts_tab, as_tab):
     """
     (r, theta)-only physics of one point.  omc = 1 - |cos theta| (passed exactly, so that
     points very close to the axis keep their precision) and sgn = sign(cos theta).
@@ -345,16 +359,15 @@ def _rtheta_chain(r, omc, sgn, P, xs_tab, rs_tab, ts_tab):
     prefac_absorp = P[P_PREF_ABS]
     gamma_inf = P[P_GAMMA_INF]
     gammabeta_suppression = P[P_GB_SUPP]
-    gamma_m = P[P_GAMMA_M]
-    gamma_max = P[P_GAMMA_MAX]
     heating_is_poynting = P[P_HEAT_POYNTING] > 0.5
     rHnu = P[P_RHNU]
     inv_rHnu = P[P_INV_RHNU]
     stag_logx0 = P[P_STAG_LOGX0]
     stag_invdlog = P[P_STAG_INVDLOG]
     stag_kmax = P[P_STAG_KMAX]
+    gamma_m = P[P_GAMMA_M]
+    gamma_max = P[P_GAMMA_MAX]
     gm_p = P[P_GM_P]
-    gm_pm1 = P[P_GM_PM1]
     nm_fac = P[P_NM_FAC]
 
     # ---------------- geometry
@@ -401,7 +414,11 @@ def _rtheta_chain(r, omc, sgn, P, xs_tab, rs_tab, ts_tab):
     elif ws > 1.0:
         ws = 1.0
     rstag = rs_tab[ks] + ws * (rs_tab[ks + 1] - rs_tab[ks])
-    tstag = ts_tab[ks] + ws * (ts_tab[ks + 1] - ts_tab[ks])
+    # (theta_stag itself is no longer needed: it only fed Aconst, which is tabulated)
+    # the energy-conservation constant of the parallel boost is a function of the field
+    # line alone, so it is tabulated with the stagnation point rather than rebuilt here
+    Aconst = as_tab[ks] + ws * (as_tab[ks + 1] - as_tab[ks])
+    Aconst2 = Aconst * Aconst
 
     # metric quantities
     sth2 = omc * (2.0 - omc)  # = 1 - cos^2(theta), without cancellation
@@ -464,28 +481,6 @@ def _rtheta_chain(r, omc, sgn, P, xs_tab, rs_tab, ts_tab):
         ratio = 0.0
     if ratio > 1.0 - eps_EB:
         ratio = 1.0 - eps_EB
-
-    cth2_stag = math.cos(tstag) ** 2.0
-    sth2_stag = math.sin(tstag) ** 2.0
-    r2_stag = rstag * rstag
-    rho2_stag = r2_stag + (a2 * cth2_stag)
-    Delta_stag = r2_stag - (2.0 * rstag) + a2
-    Sigma_stag = ((r2_stag + a2) ** 2.0) - (a2 * Delta_stag * sth2_stag)
-    g00_stag = ((a2 * sth2_stag) - Delta_stag) / rho2_stag
-    g03_stag = -2.0 * a * rstag * sth2_stag / rho2_stag
-    g33_stag = Sigma_stag * sth2_stag / rho2_stag
-    ginv_denom_stag = (g00_stag * g33_stag) - (g03_stag * g03_stag)
-    ginv00_stag = g33_stag / ginv_denom_stag
-    ginv03_stag = -g03_stag / ginv_denom_stag
-    ginv33_stag = g00_stag / ginv_denom_stag
-    gtphifac = g03_stag + (g33_stag * Omega)
-    gttfac = g00_stag + (g03_stag * Omega)
-    coef0 = (g00_stag + (Omega * (2.0 * g03_stag + g33_stag * Omega))) ** 2.0
-    coef1 = (ginv33_stag * (gtphifac * gtphifac)) + (
-        2.0 * ginv03_stag * gtphifac * gttfac + ginv00_stag * (gttfac * gttfac)
-    )
-    Aconst = math.sqrt(-coef0 / coef1)
-    Aconst2 = Aconst * Aconst
 
     vphiupper = (alphalapse / (Bsq * gdet)) * (E1_cov * B2_cov - B1_cov * E2_cov)
     gammap = 1.0 / math.sqrt(1.0 - ratio)
@@ -603,15 +598,12 @@ def _rtheta_chain(r, omc, sgn, P, xs_tab, rs_tab, ts_tab):
     # ten pow calls and a dozen divisions per cell is now a multiply.
     if gamma_c >= gamma_max:
         nA = n_m * gm_p  # uncooled: one power law from gamma_m to gamma_max
-        cont = gamma_max
     elif gamma_c > gamma_m:
         nA = n_m * gm_p  # slow cooling: break at gamma_c
-        cont = gamma_c
     else:
         nA = n_m * gamma_c * gamma_m  # fast cooling: break at gamma_m
-        cont = gm_pm1
-    Kj = prefac_emis * nA * cont
-    Ka = prefac_absorp * nA * cont
+    Kj = prefac_emis * nA
+    Ka = prefac_absorp * nA
     return vr, vt, vp, gamma, alphalapse, Bpr, Bpt, Bpp, Bpm, gamma_c, Kj, Ka
 
 
@@ -630,8 +622,6 @@ def _ray_part(x, y, z, r, R, vr, vt, vp, gamma, alphalapse, Bpr, Bpt, Bpp, gamma
     eta = P[P_ETA]
     p_eta = P[P_PETA]
     phi_norm = P[P_PHI_NORM]
-    gamma_m = P[P_GAMMA_M]
-    gamma_max = P[P_GAMMA_MAX]
 
     b2 = 1.0 - 1.0 / (gamma * gamma)
     beta = math.sqrt(b2 if b2 > 0.0 else 0.0)
@@ -684,20 +674,13 @@ def _ray_part(x, y, z, r, R, vr, vt, vp, gamma, alphalapse, Bpr, Bpt, Bpp, gamma
         aniso_fac = (anisotropy_term ** (-p_eta / 2.0)) / phi_norm
     nup = (4.1987e-3) * Bpm * sinthetaB
 
-    # undo the gamma_2^(p_2 - p_1) factor of the stored prefactors (see _rtheta_chain)
-    if gamma_c >= gamma_max:
-        cont = gamma_max
-    elif gamma_c > gamma_m:
-        cont = gamma_c
-    else:
-        cont = P[P_GM_PM1]
-    Cj = (Kj / cont) * nup * aniso_fac
-    Ca = ((Ka / cont) / nup) * aniso_fac
+    Cj = Kj * nup * aniso_fac
+    Ca = (Ka / nup) * aniso_fac
     return g, nup, gamma_c, Cj, Ca
 
 
 @njit(cache=True)
-def _cell_state(xi, yi, zJ, zi, P, xs_tab, rs_tab, ts_tab):
+def _cell_state(xi, yi, zJ, zi, P, xs_tab, rs_tab, ts_tab, as_tab):
     """
     Frequency-independent physics of one cell, evaluated exactly.
     Returns (g, nu_p, gamma_c, C_j, C_a).
@@ -715,7 +698,7 @@ def _cell_state(xi, yi, zJ, zi, P, xs_tab, rs_tab, ts_tab):
     sgn = 1.0 if z >= 0.0 else -1.0
     omc = R2 / (r * (r + az))  # 1 - |cos theta|, without cancellation
     vr, vt, vp, gamma, alpha, Bpr, Bpt, Bpp, Bpm, gamma_c, Kj, Ka = _rtheta_chain(
-        r, omc, sgn, P, xs_tab, rs_tab, ts_tab
+        r, omc, sgn, P, xs_tab, rs_tab, ts_tab, as_tab
     )
     return _ray_part(x, y, z, r, R, vr, vt, vp, gamma, alpha, Bpr, Bpt, Bpp, gamma_c, Kj, Ka, P)
 
@@ -732,7 +715,7 @@ N_TAB = 12  # stored quantities per node
 
 
 @njit(cache=True, parallel=True)
-def build_field_table(logr, ugrid, P, xs_tab, rs_tab, ts_tab, hemisphere):
+def build_field_table(logr, ugrid, P, xs_tab, rs_tab, ts_tab, as_tab, hemisphere):
     """
     Table T[i_r, i_u, q] of the (r,theta)-only quantities for one hemisphere (+1/-1):
       0-2 (vr, vt, vp)   3 gamma   4 lapse   5-7 (Bpr, Bpt, Bpp)   8 |B'|
@@ -755,7 +738,7 @@ def build_field_table(logr, ugrid, P, xs_tab, rs_tab, ts_tab, hemisphere):
                 w = 1.0 - 1.0e-12
             omc = w / t  # 1 - |cos theta|, exact
             vr, vt, vp, gamma, alpha, Bpr, Bpt, Bpp, Bpm, gc, Kj, Ka = _rtheta_chain(
-                r, omc, hemisphere, P, xs_tab, rs_tab, ts_tab
+                r, omc, hemisphere, P, xs_tab, rs_tab, ts_tab, as_tab
             )
             T[i, j, 0] = vr
             T[i, j, 1] = vt
@@ -767,8 +750,13 @@ def build_field_table(logr, ugrid, P, xs_tab, rs_tab, ts_tab, hemisphere):
             T[i, j, 7] = Bpp
             T[i, j, 8] = Bpm
             T[i, j, 9] = gc
-            T[i, j, 10] = Kj
-            T[i, j, 11] = Ka
+            # Stored continuous across the cooling boundary so that the table can be
+            # interpolated: n_e*A_norm alone jumps by gamma_m^(p-2) at gamma_c = gamma_m,
+            # exactly compensated by the emissivity bracket.  _cell_state_tab divides the
+            # factor back out; the exact path never forms it at all.
+            cf = _cont(gc, P)
+            T[i, j, 10] = Kj * cf
+            T[i, j, 11] = Ka * cf
     return T
 
 
@@ -816,8 +804,10 @@ def _cell_state_tab(xi, yi, zJ, zi, P, Tup, Tlo, logr0, invdlogr, nr, invdu, nu_
             + w10 * T[ir + 1, iu, k]
             + w11 * T[ir + 1, iu + 1, k]
         )
+    inv_cont = 1.0 / _cont(q[9], P)
     return _ray_part(
-        x, y, z, r, R, q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7], q[9], q[10], q[11], P
+        x, y, z, r, R, q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7], q[9],
+        q[10] * inv_cont, q[11] * inv_cont, P
     )
 
 
@@ -896,8 +886,18 @@ def _cell_emis(frequency, g, nup, gamma_c, Cj, Ca, P, T0, T1, T2, T3, T4, T5):
 
 
 @njit(cache=True, inline="always")
-def _rt_step(I_acc, tau_acc, jI, alphaI, g, dz):
-    """One cell of the front-to-back transfer; same guards and update as make_image."""
+def _rt_step(I_acc, atten, jI, alphaI, g, dz):
+    """
+    One cell of the front-to-back transfer; same guards and update as make_image.
+
+    The running attenuation exp(-tau) is carried directly rather than the optical depth,
+    and updated multiplicatively: exp(-tau_step) is 1 - one_minus_e, which the cell has
+    already computed, so the exp(-tau_acc) of the previous form costs nothing.  It also
+    underflows gracefully to zero deep inside an optically thick region instead of
+    exponentiating a large accumulated optical depth.  (A single cell with tau_step >~ 36
+    drives the attenuation to exactly zero rather than to ~1e-16; anything behind such a
+    cell is suppressed by that same factor, so this is not observable.)
+    """
     if not math.isfinite(alphaI) or alphaI < 0.0:
         alphaI = 0.0
     a0 = alphaI / g
@@ -906,15 +906,13 @@ def _rt_step(I_acc, tau_acc, jI, alphaI, g, dz):
         a0 = 0.0
     if not math.isfinite(j0):
         j0 = 0.0
-    tau_step = a0 * dz
-    atten = math.exp(-tau_acc)
     if a0 > 0.0:
-        one_minus_e = -math.expm1(-tau_step)
+        one_minus_e = -math.expm1(-a0 * dz)
         I_acc += atten * (j0 / a0) * one_minus_e
+        atten *= 1.0 - one_minus_e
     else:
         I_acc += atten * j0 * dz
-    tau_acc += tau_step
-    return I_acc, tau_acc
+    return I_acc, atten
 
 
 # ----------------------------------------------------------------------------- drivers
@@ -934,6 +932,7 @@ def rt_kernel(
     xs_tab,
     rs_tab,
     ts_tab,
+    as_tab,
     T0,
     T1,
     T2,
@@ -944,11 +943,13 @@ def rt_kernel(
     I_out,
 ):
     """Full computation for one frequency: state and coefficients evaluated on the fly."""
+    # a stopping optical depth is a stopping attenuation
+    atten_stop = math.exp(-tau_stop) if tau_stop > 0.0 else -1.0
     Npix = order.shape[0]
     for q in prange(Npix):
         pix = order[q]
         I_acc = 0.0
-        tau_acc = 0.0
+        atten = 1.0
         xi = x_im_f[pix]
         yi = y_im_f[pix]
         zJ = z_J_f[pix]
@@ -958,13 +959,13 @@ def rt_kernel(
                 break
             for i in range(starts[pix, k], ends[pix, k]):
                 g, nup, gamma_c, Cj, Ca = _cell_state(
-                    xi, yi, zJ, z_mid_1D[i], P, xs_tab, rs_tab, ts_tab
+                    xi, yi, zJ, z_mid_1D[i], P, xs_tab, rs_tab, ts_tab, as_tab
                 )
                 jI, alphaI = _cell_emis(
                     frequency, g, nup, gamma_c, Cj, Ca, P, T0, T1, T2, T3, T4, T5
                 )
-                I_acc, tau_acc = _rt_step(I_acc, tau_acc, jI, alphaI, g, dz_1D[i])
-                if tau_stop > 0.0 and tau_acc >= tau_stop:
+                I_acc, atten = _rt_step(I_acc, atten, jI, alphaI, g, dz_1D[i])
+                if atten <= atten_stop:
                     done = True
                     break
         I_out[pix] = I_acc
@@ -985,6 +986,7 @@ def precompute_state(
     xs_tab,
     rs_tab,
     ts_tab,
+    as_tab,
     st_g,
     st_nup,
     st_gc,
@@ -1003,7 +1005,7 @@ def precompute_state(
         for k in range(nint[pix]):
             for i in range(starts[pix, k], ends[pix, k]):
                 g, nup, gamma_c, Cj, Ca = _cell_state(
-                    xi, yi, zJ, z_mid_1D[i], P, xs_tab, rs_tab, ts_tab
+                    xi, yi, zJ, z_mid_1D[i], P, xs_tab, rs_tab, ts_tab, as_tab
                 )
                 st_g[o] = g
                 st_nup[o] = nup
@@ -1037,18 +1039,20 @@ def rt_from_state(
     I_out,
 ):
     """Transfer for one frequency from the stored state (frequency-dependent part only)."""
+    # a stopping optical depth is a stopping attenuation
+    atten_stop = math.exp(-tau_stop) if tau_stop > 0.0 else -1.0
     Npix = order.shape[0]
     for q in prange(Npix):
         pix = order[q]
         I_acc = 0.0
-        tau_acc = 0.0
+        atten = 1.0
         for o in range(offsets[q], offsets[q + 1]):
             g = st_g[o]
             jI, alphaI = _cell_emis(
                 frequency, g, st_nup[o], st_gc[o], st_Cj[o], st_Ca[o], P, T0, T1, T2, T3, T4, T5
             )
-            I_acc, tau_acc = _rt_step(I_acc, tau_acc, jI, alphaI, g, dz_1D[st_iz[o]])
-            if tau_stop > 0.0 and tau_acc >= tau_stop:
+            I_acc, atten = _rt_step(I_acc, atten, jI, alphaI, g, dz_1D[st_iz[o]])
+            if atten <= atten_stop:
                 break
         I_out[pix] = I_acc
 
@@ -1083,11 +1087,13 @@ def rt_kernel_tab(
     I_out,
 ):
     """As rt_kernel, with the (r,theta)-only physics interpolated from the field table."""
+    # a stopping optical depth is a stopping attenuation
+    atten_stop = math.exp(-tau_stop) if tau_stop > 0.0 else -1.0
     Npix = order.shape[0]
     for q in prange(Npix):
         pix = order[q]
         I_acc = 0.0
-        tau_acc = 0.0
+        atten = 1.0
         xi = x_im_f[pix]
         yi = y_im_f[pix]
         zJ = z_J_f[pix]
@@ -1102,8 +1108,8 @@ def rt_kernel_tab(
                 jI, alphaI = _cell_emis(
                     frequency, g, nup, gamma_c, Cj, Ca, P, T0, T1, T2, T3, T4, T5
                 )
-                I_acc, tau_acc = _rt_step(I_acc, tau_acc, jI, alphaI, g, dz_1D[i])
-                if tau_stop > 0.0 and tau_acc >= tau_stop:
+                I_acc, atten = _rt_step(I_acc, atten, jI, alphaI, g, dz_1D[i])
+                if atten <= atten_stop:
                     done = True
                     break
         I_out[pix] = I_acc
