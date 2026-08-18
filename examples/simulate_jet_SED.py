@@ -83,6 +83,11 @@ model = jf.JetModel(
 ###################################################
 # loop through frequency to generate an SED
 
+# store the frequency-independent physics of every jet cell once, so that the loop
+# below only has to evaluate the synchrotron coefficients and the radiative transfer
+# at each frequency (this needs the numba back end, which is the default)
+model.precompute_state()
+
 # array of observing frequencies, in GHz
 frequency_arr = 10.0 ** np.linspace(0.0, 6.0, 200)
 

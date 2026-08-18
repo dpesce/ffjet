@@ -119,7 +119,7 @@ cax = fig.add_axes([0.91, 0.1, 0.02, 0.8])
 ax.set_facecolor("black")
 vmax = 10.5
 vmin = vmax - 3.0
-pc = ax.pcolormesh(x, y, np.log10(Tb)[::-1, ::-1], cmap="afmhot", vmax=vmax, vmin=vmin)
+pc = ax.pcolormesh(x, y, np.log10(Tb)[::-1, :], cmap="afmhot", vmax=vmax, vmin=vmin)
 ax.set_xlabel(r"$x$ ($r_g$)")
 ax.set_ylabel(r"$y$ ($r_g$)")
 plt.colorbar(pc, cax=cax, label=r"$\log(T_b)$")

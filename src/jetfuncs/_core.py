@@ -14,8 +14,41 @@ try:
 except Exception:
     _tqdm = None
 
+# compiled radiative-transfer kernel (requires numba); the pure-numpy path in
+# JetModel._make_image_numpy remains available as the reference implementation
+try:
+    from . import _kernel as _kern
+
+    HAS_NUMBA = True
+except ImportError:  # pragma: no cover - exercised only when numba is absent
+    _kern = None
+    HAS_NUMBA = False
+
 # suppress some numpy warnings
 np.seterr(divide="ignore", invalid="ignore")
+
+
+def numba_available():
+    """True if the compiled (numba) radiative-transfer kernel can be used."""
+    return HAS_NUMBA
+
+
+def set_num_threads(n):
+    """Set the number of threads used by the compiled kernel (default: all cores)."""
+    if not HAS_NUMBA:
+        raise ImportError("numba is not installed; there is no thread pool to configure")
+    import numba
+
+    numba.set_num_threads(int(n))
+
+
+def get_num_threads():
+    """Number of threads the compiled kernel will use."""
+    if not HAS_NUMBA:
+        return 1
+    import numba
+
+    return numba.get_num_threads()
 
 ###################################################
 # physical constants (cgs)
@@ -90,7 +123,7 @@ def _progress(iterable, enabled: bool = False, **kwargs):
 
 
 ###################################################
-# redefining some kgeo functions
+# functions from Gelles+
 
 
 # lightweight copy of Bfield class
@@ -315,7 +348,7 @@ def u_driftframe(
 ):
     """
     drift frame velocity for a given EM field in BL
-      - If called with no extra positional args: uses the original (bfield-based) implementation from kgeo
+      - If called with no extra positional args: uses the original (bfield-based) implementation
       - If called with 21 extra positional args: uses a faster precomputed path and returns a 9-tuple
     """
 
@@ -616,11 +649,24 @@ class JetModel:
     A jet model that can be used to generate images or SEDs according to the
     prescription in Pesce et al. (2026).
 
-    This class object caches all frequency-independent information, so that
-    repeated calls over frequency only need to do the RT integration.
+    All frequency-independent setup (stagnation surface, jet-power normalization,
+    synchrotron integral tables, grids) is done once at construction.  Images are
+    produced by make_image(), which has two interchangeable back ends:
+
+      backend="numba"  compiled per-ray kernel (default when numba is installed);
+                       parallel over image pixels, work proportional to the number
+                       of grid cells inside the jet
+      backend="numpy"  the original vectorized numpy loop over depth slices; slower
+                       by an order of magnitude but dependency-free, and kept as
+                       the reference implementation
+
+    The two agree to floating-point roundoff.  For loops over frequency (SEDs), call
+    precompute_state() once; subsequent make_image() calls then only evaluate the
+    frequency-dependent synchrotron coefficients and the transfer integral.
 
     Typical usage:
         model = JetModel(m=..., a=..., inc=..., mdot=..., Nx=..., Ny=..., Nz=..., s=..., p=..., ...)
+        model.precompute_state()          # optional; speeds up frequency loops
         for freq in freqs:
             x, y, I = model.make_image(freq)
     """
@@ -658,6 +704,7 @@ class JetModel:
         gammabeta_suppression=0.5,
         DTYPE=np.float64,
         stokes="I",
+        backend="auto",
     ):
         ####################
         # store inputs
@@ -691,6 +738,16 @@ class JetModel:
         self.DTYPE = DTYPE
 
         self.stokes = str(stokes).upper()
+
+        # radiative-transfer back end: "auto" (numba if installed, else numpy),
+        # "numba", or "numpy"; can be overridden per call in make_image()
+        if backend not in ("auto", "numba", "numpy"):
+            raise ValueError(f"backend must be 'auto', 'numba' or 'numpy', got {backend!r}")
+        self.backend = backend
+
+        # lazily-built caches used by the compiled back end
+        self._intervals = None  # per-ray ranges of z-cells inside the jet
+        self._state = None  # per-cell frequency-independent state (see precompute_state)
 
         ####################
         # derived quantities
@@ -1025,7 +1082,9 @@ class JetModel:
             )
         L = np.log10(np.maximum(x, 1.0e-300))
         f = (L - self._tab_logx0) * self._tab_inv_dlogx
-        k = np.clip(f, 0.0, self._tab_kmax).astype(np.intp)
+        # NaN input must give NaN output (as np.interp did) rather than an index; the
+        # NaN -> integer cast is platform dependent, so replace it before indexing
+        k = np.clip(np.nan_to_num(f, nan=0.0), 0.0, self._tab_kmax).astype(np.intp)
         t = f - k
         out = 10.0 ** (logG[k] + t * (logG[k + 1] - logG[k]))
         return np.where(f < 0.0, 10.0**logG[0], np.where(f > self._tab_kmax + 1.0, 0.0, out))
@@ -1150,6 +1209,161 @@ class JetModel:
 
     # primary image-generating function
     def make_image(
+        self,
+        frequency,
+        *,
+        tau_stop=None,
+        show_progress=False,
+        heating_prescription="Poynting",
+        backend=None,
+    ):
+        """
+        Compute the specific intensity image at the requested frequency (in GHz).
+
+        Returns (x_im_1D, y_im_1D, I_nu), with I_nu in cgs units and shape (Ny, Nx).
+
+        tau_stop:             stop integrating a ray once its accumulated optical depth
+                              exceeds this value (None = never)
+        show_progress:        show a progress bar (numpy back end only)
+        heating_prescription: "Poynting" (u_e = h S / (c gamma)) or "magnetic"
+                              (u_e = h B'^2 / 8 pi)
+        backend:              "numba", "numpy", or None to use the model's default
+        """
+        if heating_prescription not in ("Poynting", "magnetic"):
+            raise ValueError(
+                f"unrecognized heating_prescription {heating_prescription!r}; "
+                f"expected 'Poynting' or 'magnetic'"
+            )
+        if self._resolve_backend(backend) == "numba":
+            return self._make_image_numba(frequency, tau_stop, heating_prescription)
+        return self._make_image_numpy(
+            frequency,
+            tau_stop=tau_stop,
+            show_progress=show_progress,
+            heating_prescription=heating_prescription,
+        )
+
+    def _resolve_backend(self, backend):
+        backend = self.backend if backend is None else backend
+        if backend == "auto":
+            return "numba" if HAS_NUMBA else "numpy"
+        if backend == "numba" and not HAS_NUMBA:
+            raise ImportError(
+                "backend='numba' was requested but numba is not installed; "
+                "install it (pip install numba) or use backend='numpy'"
+            )
+        if backend not in ("numba", "numpy"):
+            raise ValueError(f"backend must be 'auto', 'numba' or 'numpy', got {backend!r}")
+        return backend
+
+    # ------------------------------------------------------------------
+    # compiled back end
+    # ------------------------------------------------------------------
+    def _get_intervals(self):
+        """
+        Per-ray ranges of z-cells inside the jet, computed once per model.  Also fixes
+        the (random) order in which rays are handed to the threads, which balances the
+        work across cores; the result does not depend on that order.
+        """
+        if self._intervals is None:
+            P = _kern.pack_params(self)
+            max_int = 8
+            while True:
+                starts, ends, nint, ncell = _kern.jet_intervals(
+                    self.x_im_f, self.y_im_f, self.z_J_f, self.z_mid_1D, P, max_int
+                )
+                if int(nint.max()) <= max_int:
+                    break
+                max_int *= 2
+            order = np.random.default_rng(12345).permutation(nint.shape[0]).astype(np.int64)
+            self._intervals = dict(starts=starts, ends=ends, nint=nint, ncell=ncell, order=order)
+        return self._intervals
+
+    @property
+    def n_jet_cells(self):
+        """Number of grid cells inside the jet (the work per make_image call)."""
+        return int(self._get_intervals()["ncell"].sum())
+
+    def _make_image_numba(self, frequency, tau_stop, heating_prescription):
+        iv = self._get_intervals()
+        P = _kern.pack_params(self, heating_prescription)
+        T = _kern.pack_tables(self)
+        tau = -1.0 if (tau_stop is None or float(tau_stop) <= 0.0) else float(tau_stop)
+        I_out = np.zeros(self.x_im_f.shape[0], dtype=np.float64)
+
+        st = self._state
+        if st is not None and st["heating_prescription"] == heating_prescription:
+            _kern.rt_from_state(
+                float(frequency), iv["order"], st["offsets"], self.dz_1D, P, *T, tau,
+                st["g"], st["nup"], st["gamma_c"], st["Cj"], st["Ca"], st["iz"], I_out,
+            )
+        else:
+            _kern.rt_kernel(
+                float(frequency), iv["order"],
+                self.x_im_f, self.y_im_f, self.z_J_f, self.z_mid_1D, self.dz_1D,
+                iv["starts"], iv["ends"], iv["nint"],
+                P, self.thetahorizon_arr, self.rstag_arr, self.tstag_arr, *T, tau, I_out,
+            )
+        return self.x_im_1D, self.y_im_1D, I_out.reshape(self.x_im.shape)
+
+    def precompute_state(self, heating_prescription="Poynting", max_memory_gb=8.0):
+        """
+        Evaluate and store the frequency-independent state of every jet cell (redshift
+        factor, characteristic synchrotron frequency, cooling Lorentz factor, and the
+        emissivity/absorption prefactors; 44 bytes per cell).  Subsequent make_image()
+        calls with the same heating prescription then only compute the frequency-
+        dependent synchrotron coefficients and the transfer integral, which is what
+        makes loops over frequency (SEDs) fast.  Requires the numba back end.
+
+        Returns the memory used by the stored state, in bytes.  Raises MemoryError if
+        that would exceed max_memory_gb; call clear_state() to release it.
+        """
+        if self._resolve_backend(None) != "numba":
+            raise ImportError("precompute_state() requires the numba back end")
+        if heating_prescription not in ("Poynting", "magnetic"):
+            raise ValueError(
+                f"unrecognized heating_prescription {heating_prescription!r}; "
+                f"expected 'Poynting' or 'magnetic'"
+            )
+        iv = self._get_intervals()
+        ncell_ordered = iv["ncell"][iv["order"]]
+        offsets = np.zeros(ncell_ordered.shape[0] + 1, dtype=np.int64)
+        offsets[1:] = np.cumsum(ncell_ordered)
+        N = int(offsets[-1])
+        nbytes = N * (5 * 8 + 4)
+        if nbytes > max_memory_gb * 1.0e9:
+            raise MemoryError(
+                f"the per-cell state for {N} jet cells needs {nbytes/1e9:.1f} GB, above the "
+                f"max_memory_gb={max_memory_gb} limit; use a coarser grid or raise the limit"
+            )
+        st = dict(
+            heating_prescription=heating_prescription,
+            offsets=offsets,
+            g=np.empty(N),
+            nup=np.empty(N),
+            gamma_c=np.empty(N),
+            Cj=np.empty(N),
+            Ca=np.empty(N),
+            iz=np.empty(N, dtype=np.int32),
+        )
+        _kern.precompute_state(
+            iv["order"], offsets, self.x_im_f, self.y_im_f, self.z_J_f, self.z_mid_1D,
+            iv["starts"], iv["ends"], iv["nint"],
+            _kern.pack_params(self, heating_prescription),
+            self.thetahorizon_arr, self.rstag_arr, self.tstag_arr,
+            st["g"], st["nup"], st["gamma_c"], st["Cj"], st["Ca"], st["iz"],
+        )
+        self._state = st
+        return nbytes
+
+    def clear_state(self):
+        """Release the per-cell state stored by precompute_state()."""
+        self._state = None
+
+    # ------------------------------------------------------------------
+    # numpy back end (reference implementation)
+    # ------------------------------------------------------------------
+    def _make_image_numpy(
         self, frequency, *, tau_stop=None, show_progress=False, heating_prescription="Poynting"
     ):
         """

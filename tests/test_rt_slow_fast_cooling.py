@@ -29,6 +29,8 @@ def _make_tiny_model(
 
 def test_make_image_exercises_slow_cooling_path():
     """
+    (numpy back end: the call counting below instruments the python-level lookups)
+
     slow-cooling path sets GaIx_p1 = GaIx_p (slow-only), so GaIx_p must be called at least once
     If the default params don't hit slow cooling, try a few "more slow-cooling" configs
     """
@@ -47,7 +49,7 @@ def test_make_image_exercises_slow_cooling_path():
             model.GaIx_p = wrapped
 
             _x, _y, I_nu = model.make_image(
-                230.0, show_progress=False, heating_prescription="Poynting"
+                230.0, show_progress=False, heating_prescription="Poynting", backend="numpy"
             )
             assert I_nu.shape == (len(_y), len(_x))
             assert np.all(np.isfinite(I_nu))
@@ -76,7 +78,9 @@ def test_make_image_exercises_fast_cooling_path():
 
     model.GaIx_2 = wrapped
 
-    _x, _y, I_nu = model.make_image(230.0, show_progress=False, heating_prescription="Poynting")
+    _x, _y, I_nu = model.make_image(
+        230.0, show_progress=False, heating_prescription="Poynting", backend="numpy"
+    )
     assert I_nu.shape == (len(_y), len(_x))
     assert np.all(np.isfinite(I_nu))
     assert calls["GaIx_2"] > 0
