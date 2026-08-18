@@ -750,6 +750,7 @@ class JetModel:
         # lazily-built caches used by the compiled back end
         self._intervals = None  # per-ray ranges of z-cells inside the jet
         self._state = None  # per-cell frequency-independent state (see precompute_state)
+        self._ftab = None  # 2-D table of the (r,theta)-only physics (see build_field_table)
 
         ####################
         # derived quantities
@@ -1276,10 +1277,18 @@ class JetModel:
         I_out = np.zeros(self.x_im_f.shape[0], dtype=np.float64)
 
         st = self._state
+        ft = self._ftab
         if st is not None and st["heating_prescription"] == heating_prescription:
             _kern.rt_from_state(
                 float(frequency), iv["order"], st["offsets"], self.dz_1D, P, *T, tau,
                 st["g"], st["nup"], st["gamma_c"], st["Cj"], st["Ca"], st["iz"], I_out,
+            )
+        elif ft is not None and ft["heating_prescription"] == heating_prescription:
+            _kern.rt_kernel_tab(
+                float(frequency), iv["order"],
+                self.x_im_f, self.y_im_f, self.z_J_f, self.z_mid_1D, self.dz_1D,
+                iv["starts"], iv["ends"], iv["nint"],
+                P, *self._ftab_args(), *T, tau, I_out,
             )
         else:
             _kern.rt_kernel(
@@ -1290,6 +1299,77 @@ class JetModel:
             )
         return self.x_im_1D, self.y_im_1D, I_out.reshape(self.x_im.shape)
 
+    # ------------------------------------------------------------------
+    # optional field table (approximate, ~1.8x faster than the exact kernel)
+    # ------------------------------------------------------------------
+    def build_field_table(self, points_per_decade=200, n_u=256, heating_prescription="Poynting",
+                          max_memory_gb=2.0):
+        """
+        Tabulate the (r,theta)-only physics of the jet -- fields, drift velocity, Lorentz
+        factor, lapse, fluid-frame field, cooling Lorentz factor and electron
+        normalization -- on a 2-D grid (uniform in log10(r - r_H) and in
+        u = sqrt(psi/psi_edge), one table per hemisphere), so that make_image() only has
+        to interpolate them and evaluate the line-of-sight-dependent part per cell.
+        This makes the compiled kernel about 1.8x faster; it does not affect the
+        cached-state mode (precompute_state), which is exact and faster still for loops
+        over frequency, but it does speed up precompute_state() itself.
+
+        The interpolation is bilinear and the error decreases as the square of the grid
+        spacing.  Measured against the exact kernel at 230 GHz:
+
+            points_per_decade x n_u  |  total flux  |  per-pixel 99th pct  |  memory
+                 100 x 128           |   1e-5..1e-4 |     2e-4..6e-4       |  10-20 MB
+                 200 x 256 (default) |   4e-6..3e-5 |     5e-5..2e-4       |  50-90 MB
+                 400 x 512           |   6e-7..8e-6 |     1e-5..9e-5       | 200-350 MB
+
+        (linear 100 r_g grid .. log grid to 1e5 r_g); SED errors are of the same order.
+        Requires the numba back end.  Returns the table size in bytes; call
+        clear_field_table() to go back to the exact kernel.
+        """
+        if self._resolve_backend(None) != "numba":
+            raise ImportError("build_field_table() requires the numba back end")
+        if heating_prescription not in ("Poynting", "magnetic"):
+            raise ValueError(
+                f"unrecognized heating_prescription {heating_prescription!r}; "
+                f"expected 'Poynting' or 'magnetic'"
+            )
+        # radial extent: cover every cell that can lie in the jet, generously
+        zmax = np.abs(self.z_mid_1D).max() + np.abs(self.z_J_f).max()
+        r_max = np.sqrt(np.abs(self.x_im_f).max() ** 2 + np.abs(self.y_im_f).max() ** 2 + zmax**2)
+        r_max = 1.001 * max(r_max, 2.0 * self.rH)
+        dlog = 1.0 / float(points_per_decade)
+        logr = np.arange(np.log10(0.01 * self.rH), np.log10(r_max - self.rH) + dlog, dlog)
+        ugrid = np.linspace(0.0, 1.0, int(n_u))
+        nbytes = 2 * logr.shape[0] * ugrid.shape[0] * _kern.N_TAB * 8
+        if nbytes > max_memory_gb * 1.0e9:
+            raise MemoryError(
+                f"the field table needs {nbytes/1e9:.2f} GB, above max_memory_gb={max_memory_gb}; "
+                f"use fewer points or raise the limit"
+            )
+        P = _kern.pack_params(self, heating_prescription)
+        args = (P, self.thetahorizon_arr, self.rstag_arr, self.tstag_arr)
+        Tup = _kern.build_field_table(logr, ugrid, *args, 1.0)
+        Tlo = _kern.build_field_table(logr, ugrid, *args, -1.0)
+        self._ftab = dict(
+            heating_prescription=heating_prescription,
+            Tup=Tup,
+            Tlo=Tlo,
+            logr0=float(logr[0]),
+            invdlogr=1.0 / float(logr[1] - logr[0]),
+            nr=int(logr.shape[0]),
+            invdu=1.0 / float(ugrid[1] - ugrid[0]),
+            nu=int(ugrid.shape[0]),
+        )
+        return nbytes
+
+    def clear_field_table(self):
+        """Discard the field table built by build_field_table()."""
+        self._ftab = None
+
+    def _ftab_args(self):
+        ft = self._ftab
+        return (ft["Tup"], ft["Tlo"], ft["logr0"], ft["invdlogr"], ft["nr"], ft["invdu"], ft["nu"])
+
     def precompute_state(self, heating_prescription="Poynting", max_memory_gb=8.0):
         """
         Evaluate and store the frequency-independent state of every jet cell (redshift
@@ -1297,7 +1377,9 @@ class JetModel:
         emissivity/absorption prefactors; 44 bytes per cell).  Subsequent make_image()
         calls with the same heating prescription then only compute the frequency-
         dependent synchrotron coefficients and the transfer integral, which is what
-        makes loops over frequency (SEDs) fast.  Requires the numba back end.
+        makes loops over frequency (SEDs) fast.  Requires the numba back end.  If a
+        field table has been built (build_field_table), the state is taken from it,
+        otherwise it is computed exactly.
 
         Returns the memory used by the stored state, in bytes.  Raises MemoryError if
         that would exceed max_memory_gb; call clear_state() to release it.
@@ -1330,13 +1412,22 @@ class JetModel:
             Ca=np.empty(N),
             iz=np.empty(N, dtype=np.int32),
         )
-        _kern.precompute_state(
-            iv["order"], offsets, self.x_im_f, self.y_im_f, self.z_J_f, self.z_mid_1D,
-            iv["starts"], iv["ends"], iv["nint"],
-            _kern.pack_params(self, heating_prescription),
-            self.thetahorizon_arr, self.rstag_arr, self.tstag_arr,
-            st["g"], st["nup"], st["gamma_c"], st["Cj"], st["Ca"], st["iz"],
-        )
+        ft = self._ftab
+        if ft is not None and ft["heating_prescription"] == heating_prescription:
+            _kern.precompute_state_tab(
+                iv["order"], offsets, self.x_im_f, self.y_im_f, self.z_J_f, self.z_mid_1D,
+                iv["starts"], iv["ends"], iv["nint"],
+                _kern.pack_params(self, heating_prescription), *self._ftab_args(),
+                st["g"], st["nup"], st["gamma_c"], st["Cj"], st["Ca"], st["iz"],
+            )
+        else:
+            _kern.precompute_state(
+                iv["order"], offsets, self.x_im_f, self.y_im_f, self.z_J_f, self.z_mid_1D,
+                iv["starts"], iv["ends"], iv["nint"],
+                _kern.pack_params(self, heating_prescription),
+                self.thetahorizon_arr, self.rstag_arr, self.tstag_arr,
+                st["g"], st["nup"], st["gamma_c"], st["Cj"], st["Ca"], st["iz"],
+            )
         self._state = st
         return nbytes
 

@@ -262,34 +262,52 @@ def jet_intervals(x_im_f, y_im_f, z_J_f, z_mid_1D, P, max_int):
 
 
 # ----------------------------------------------------------------------------- per-cell physics
-@njit(cache=True)
-def _cell_state(xi, yi, zJ, zi, P, th_tab, rs_tab, ts_tab):
-    """
-    Frequency-independent physics of one cell.  Follows _core.make_image line by line
-    (geometry, force-free fields, drift-frame velocity, velocity regularization, redshift,
-    fluid-frame field and pitch angle, cooling, electron normalization).
+#
+# The frequency-independent physics of a cell is evaluated in two steps:
+#
+#   _rtheta_chain : everything that depends on (r, theta) only -- force-free fields,
+#                   drift-frame velocity, velocity regularization, fluid-frame field
+#                   strength, cooling and electron normalization; returns quantities in
+#                   the spherical orthonormal basis
+#   _ray_part     : the part that depends on the line of sight -- rotation to Cartesian
+#                   components, Doppler factor, aberration, pitch angle -- and the final
+#                   assembly of the emissivity/absorption prefactors
+#
+# _cell_state chains the two exactly (agreement with _core.make_image at roundoff).
+# The split also allows the (r,theta)-only part to be tabulated once per model on a
+# 2-D grid and interpolated (build_field_table / _cell_state_tab), which is what the
+# optional "field table" mode of JetModel uses.
+# -----------------------------------------------------------------------------
 
-    Returns (g, nu_p, gamma_c, C_j, C_a).
+
+@njit(cache=True)
+def _rtheta_chain(r, omc, sgn, P, th_tab, rs_tab, ts_tab):
     """
-    cos_i = P[P_COS_I]
-    sin_i = P[P_SIN_I]
-    nx = P[P_NX]
-    ny = P[P_NY]
-    nz = P[P_NZ]
+    (r, theta)-only physics of one point.  omc = 1 - |cos theta| (passed exactly, so that
+    points very close to the axis keep their precision) and sgn = sign(cos theta).
+
+    Returns (vr, vt, vp, gamma, alphalapse, Bpr, Bpt, Bpp, Bpm, gamma_c, Kj, Ka) with
+      (vr, vt, vp)     regularized fluid velocity, spherical orthonormal basis
+      gamma            corresponding Lorentz factor
+      alphalapse       lapse
+      (Bpr, Bpt, Bpp)  fluid-frame magnetic field, spherical orthonormal basis; Bpm = |B'|
+      gamma_c          cooling Lorentz factor
+      Kj, Ka           prefac_emis/absorp * n_e * A_norm * gamma_2^(p_2 - p_1); the last
+                       factor makes this continuous across the fast/slow cooling boundary
+                       (n_e*A_norm alone jumps there by gamma_m^(p-2), compensated by the
+                       bracket in Eqs. C.4/C.9)
+    """
     rH = P[P_RH]
     nu = P[P_NU]
     a = P[P_A]
     s = P[P_S]
     p = P[P_P]
-    p_eta = P[P_PETA]
     h = P[P_H]
-    eta = P[P_ETA]
     rg = P[P_RG]
     scaling = P[P_SCALING]
     sqrt_scaling = P[P_SQRT_SCALING]
     prefac_emis = P[P_PREF_EMIS]
     prefac_absorp = P[P_PREF_ABS]
-    phi_norm = P[P_PHI_NORM]
     gamma_inf = P[P_GAMMA_INF]
     gammabeta_suppression = P[P_GB_SUPP]
     gamma_m = P[P_GAMMA_M]
@@ -297,21 +315,20 @@ def _cell_state(xi, yi, zJ, zi, P, th_tab, rs_tab, ts_tab):
     heating_is_poynting = P[P_HEAT_POYNTING] > 0.5
 
     # ---------------- geometry
-    z_im_now = zi + zJ
-    x = (xi * cos_i) + (z_im_now * sin_i)
-    y = yi
-    z = (z_im_now * cos_i) - (xi * sin_i)
-    R2 = (x * x) + (y * y)
-    r2 = R2 + (z * z)
-    r = math.sqrt(r2)
-    costheta = z / r
-    one_minus_costheta = 1.0 - costheta
-    one_plus_costheta = 1.0 + costheta
+    r2 = r * r
+    costheta = sgn * (1.0 - omc)
+    z = r * costheta
+    half_small = math.sqrt(0.5 * omc)
+    half_big = math.sqrt(0.5 * (2.0 - omc))
+    if sgn > 0.0:
+        sin_half = half_small
+        cos_half = half_big
+    else:
+        sin_half = half_big
+        cos_half = half_small
 
     # footpoint theta
     r_rH_1_s = (r / rH) ** (1.0 - s)
-    sin_half = math.sqrt(0.5 * one_minus_costheta)
-    cos_half = math.sqrt(0.5 * one_plus_costheta)
     arg_arcsin = r_rH_1_s * sin_half
     if arg_arcsin < 0.7071067811865476:
         theta_fp = 2.0 * math.asin(arg_arcsin)
@@ -335,11 +352,10 @@ def _cell_state(xi, yi, zJ, zi, P, th_tab, rs_tab, ts_tab):
         tstag = _interp_lin(tf, th_tab, ts_tab)
 
     # metric quantities
-    R = math.sqrt(R2)
-    sintheta = R / r
+    sth2 = omc * (2.0 - omc)  # = 1 - cos^2(theta), without cancellation
+    sintheta = math.sqrt(sth2)
     costh = costheta
-    cth2 = costh * costh
-    sth2 = 1.0 - cth2
+    cth2 = 1.0 - sth2
     a2 = a * a
     r2pa2 = r2 + a2
     rho2 = r2 + (a2 * cth2)
@@ -475,9 +491,6 @@ def _cell_state(xi, yi, zJ, zi, P, th_tab, rs_tab, ts_tab):
     Br *= alphalapse * sqrt_scaling
     Btheta *= alphalapse * sqrt_scaling
     Bphi *= alphalapse * sqrt_scaling
-    Bx = ((x * Br) / r) + ((x * z * Btheta) / (r * R)) - ((y * Bphi) / R)
-    By = ((y * Br) / r) + ((y * z * Btheta) / (r * R)) + ((x * Bphi) / R)
-    Bz = ((z * Br) / r) - ((R * Btheta) / r)
 
     # ---------------- velocity rescaling
     vr_orig = u1 * sq_g11 / gamma
@@ -493,81 +506,43 @@ def _cell_state(xi, yi, zJ, zi, P, th_tab, rs_tab, ts_tab):
     beta = math.sqrt(b2 if b2 > 0.0 else 0.0)
     velscale = (beta / beta_orig) if beta_orig > 0.0 else 0.0
     vr = velscale * vr_orig
-    vtheta = velscale * vtheta_orig
-    vphi = velscale * vphi_orig
-    vx = ((x * vr) / r) + ((x * z * vtheta) / (r * R)) - ((y * vphi) / R)
-    vy = ((y * vr) / r) + ((y * z * vtheta) / (r * R)) + ((x * vphi) / R)
-    vz = ((z * vr) / r) - ((R * vtheta) / r)
-    vmag = math.sqrt(vx * vx + vy * vy + vz * vz)
+    vt = velscale * vtheta_orig
+    vp = velscale * vphi_orig
+
+    # ---------------- fluid-frame B, still in the spherical basis (the boost commutes
+    # with the rotation to Cartesian components applied later)
+    vmag = math.sqrt(vr * vr + vt * vt + vp * vp)
     if vmag > 1.0e-8:
-        vhat_x = vx / vmag
-        vhat_y = vy / vmag
-        vhat_z = vz / vmag
-        small_v = False
+        vhr = vr / vmag
+        vht = vt / vmag
+        vhp = vp / vmag
+        B_par = Br * vhr + Btheta * vht + Bphi * vhp
+        Bpr = ((Br - B_par * vhr) / gamma) + (B_par * vhr)
+        Bpt = ((Btheta - B_par * vht) / gamma) + (B_par * vht)
+        Bpp = ((Bphi - B_par * vhp) / gamma) + (B_par * vhp)
     else:
-        vhat_x = 0.0
-        vhat_y = 0.0
-        vhat_z = 0.0
-        small_v = True
-
-    # redshift factor
-    k_par = (vhat_x * nx) + (vhat_y * ny) + (vhat_z * nz)
-    one_m_betak = 1.0 - (beta * k_par)
-    g = alphalapse / (gamma * one_m_betak)
-    if not math.isfinite(g):
-        g = 1.0
-
-    # photon direction in comoving frame
-    k_perp_x = nx - k_par * vhat_x
-    k_perp_y = ny - k_par * vhat_y
-    k_perp_z = nz - k_par * vhat_z
-    gamma_one_m_betak = gamma * one_m_betak
-    k_par_prime = (k_par - beta) / one_m_betak
-    k_x_prime = (k_perp_x / gamma_one_m_betak) + k_par_prime * vhat_x
-    k_y_prime = (k_perp_y / gamma_one_m_betak) + k_par_prime * vhat_y
-    k_z_prime = (k_perp_z / gamma_one_m_betak) + k_par_prime * vhat_z
-    k_prime_mag = math.sqrt(k_x_prime * k_x_prime + k_y_prime * k_y_prime + k_z_prime * k_z_prime)
-    khat_x_prime = k_x_prime / k_prime_mag
-    khat_y_prime = k_y_prime / k_prime_mag
-    khat_z_prime = k_z_prime / k_prime_mag
-
-    # transform B-field
-    B_par = Bx * vhat_x + By * vhat_y + Bz * vhat_z
-    Bprime_x = ((Bx - B_par * vhat_x) / gamma) + (B_par * vhat_x)
-    Bprime_y = ((By - B_par * vhat_y) / gamma) + (B_par * vhat_y)
-    Bprime_z = ((Bz - B_par * vhat_z) / gamma) + (B_par * vhat_z)
-    if small_v:
-        Bprime_x = Bx
-        Bprime_y = By
-        Bprime_z = Bz
-    Bprime_mag = math.sqrt(Bprime_x * Bprime_x + Bprime_y * Bprime_y + Bprime_z * Bprime_z)
-    costhetaB = (
-        (khat_x_prime * Bprime_x) + (khat_y_prime * Bprime_y) + (khat_z_prime * Bprime_z)
-    ) / Bprime_mag
-    sinthetaB = math.sqrt(1.0 - (costhetaB * costhetaB))  # NaN if cos^2 > 1, as in numpy
+        Bpr = Br
+        Bpt = Btheta
+        Bpp = Bphi
+    Bpm = math.sqrt(Bpr * Bpr + Bpt * Bpt + Bpp * Bpp)
 
     # ---------------- electrons
     t_c = abs(z * rg) / (c * gamma)
-    gamma_c = (6.0 * math.pi * m_e * c) / (sigma_T * (Bprime_mag * Bprime_mag) * t_c)
+    gamma_c = (6.0 * math.pi * m_e * c) / (sigma_T * (Bpm * Bpm) * t_c)
     if heating_is_poynting:
         u_pl = h * S / (c * gamma)
     else:
-        u_pl = h * ((Bprime_mag * Bprime_mag) / (8.0 * math.pi))
+        u_pl = h * ((Bpm * Bpm) / (8.0 * math.pi))
     n_m = (((p - 2.0) * u_pl) / ((gamma_m**p) * m_e * (c * c))) * (
         1.0 / ((gamma_m ** (2.0 - p)) - (gamma_max ** (2.0 - p)))
     )
-    anisotropy_term = 1.0 + ((eta - 1.0) * (costhetaB * costhetaB))
-    if p_eta == 2.0:
-        aniso_fac = (1.0 / anisotropy_term) / phi_norm
-    else:
-        aniso_fac = (anisotropy_term ** (-p_eta / 2.0)) / phi_norm
-    nup = (4.1987e-3) * Bprime_mag * sinthetaB
 
-    # n * A_norm for the cooling branch this cell is in
+    # n_e * A_norm for the cooling branch this point is in, times gamma_2^(p_2 - p_1)
     if gamma_c >= gamma_max:
         # uncooled: single power law between gamma_m and gamma_max
         A_norm = 1.0 / (((gamma_max ** (1.0 - p)) - (gamma_m ** (1.0 - p))) / (1.0 - p))
         n = n_m * (gamma_m**p) * (((gamma_max ** (1.0 - p)) - (gamma_m ** (1.0 - p))) / (1.0 - p))
+        cont = gamma_max
     elif gamma_c > gamma_m:
         # slow cooling: p1 = p, p2 = p+1, break at gamma_c
         p2 = p + 1.0
@@ -586,6 +561,7 @@ def _cell_state(xi, yi, zJ, zi, P, th_tab, rs_tab, ts_tab):
                 - (gamma_c * (((gamma_max ** (-p)) - (gamma_c ** (-p))) / p))
             )
         )
+        cont = gamma_c
     else:
         # fast cooling: p1 = 2, p2 = p+1, break at gamma_m
         p2 = p + 1.0
@@ -604,9 +580,220 @@ def _cell_state(xi, yi, zJ, zi, P, th_tab, rs_tab, ts_tab):
                 + ((gamma_m**p) * (((gamma_m ** (-p)) - (gamma_max ** (-p))) / p))
             )
         )
-    Cj = prefac_emis * n * A_norm * nup * aniso_fac
-    Ca = (prefac_absorp * n * A_norm / nup) * aniso_fac
+        cont = gamma_m ** (p - 1.0)
+    Kj = prefac_emis * n * A_norm * cont
+    Ka = prefac_absorp * n * A_norm * cont
+    return vr, vt, vp, gamma, alphalapse, Bpr, Bpt, Bpp, Bpm, gamma_c, Kj, Ka
+
+
+@njit(cache=True)
+def _ray_part(x, y, z, r, R, vr, vt, vp, gamma, alphalapse, Bpr, Bpt, Bpp, gamma_c, Kj, Ka, P):
+    """
+    Line-of-sight-dependent part of the cell physics: rotate the spherical-basis
+    velocity and fluid-frame field to Cartesian components, then Doppler factor,
+    aberration and pitch angle, and assemble the emissivity/absorption prefactors.
+
+    Returns (g, nu_p, gamma_c, C_j, C_a) as consumed by _cell_emis.
+    """
+    nx = P[P_NX]
+    ny = P[P_NY]
+    nz = P[P_NZ]
+    eta = P[P_ETA]
+    p_eta = P[P_PETA]
+    phi_norm = P[P_PHI_NORM]
+    p = P[P_P]
+    gamma_m = P[P_GAMMA_M]
+    gamma_max = P[P_GAMMA_MAX]
+
+    b2 = 1.0 - 1.0 / (gamma * gamma)
+    beta = math.sqrt(b2 if b2 > 0.0 else 0.0)
+    vx = ((x * vr) / r) + ((x * z * vt) / (r * R)) - ((y * vp) / R)
+    vy = ((y * vr) / r) + ((y * z * vt) / (r * R)) + ((x * vp) / R)
+    vz = ((z * vr) / r) - ((R * vt) / r)
+    vmag = math.sqrt(vx * vx + vy * vy + vz * vz)
+    if vmag > 1.0e-8:
+        vhat_x = vx / vmag
+        vhat_y = vy / vmag
+        vhat_z = vz / vmag
+    else:
+        vhat_x = 0.0
+        vhat_y = 0.0
+        vhat_z = 0.0
+
+    # redshift factor
+    k_par = (vhat_x * nx) + (vhat_y * ny) + (vhat_z * nz)
+    one_m_betak = 1.0 - (beta * k_par)
+    g = alphalapse / (gamma * one_m_betak)
+    if not math.isfinite(g):
+        g = 1.0
+
+    # photon direction in the comoving frame
+    k_perp_x = nx - k_par * vhat_x
+    k_perp_y = ny - k_par * vhat_y
+    k_perp_z = nz - k_par * vhat_z
+    gamma_one_m_betak = gamma * one_m_betak
+    k_par_prime = (k_par - beta) / one_m_betak
+    k_x_prime = (k_perp_x / gamma_one_m_betak) + k_par_prime * vhat_x
+    k_y_prime = (k_perp_y / gamma_one_m_betak) + k_par_prime * vhat_y
+    k_z_prime = (k_perp_z / gamma_one_m_betak) + k_par_prime * vhat_z
+    k_prime_mag = math.sqrt(k_x_prime * k_x_prime + k_y_prime * k_y_prime + k_z_prime * k_z_prime)
+    khat_x_prime = k_x_prime / k_prime_mag
+    khat_y_prime = k_y_prime / k_prime_mag
+    khat_z_prime = k_z_prime / k_prime_mag
+
+    # fluid-frame B in Cartesian components, and the pitch angle
+    Bpx = ((x * Bpr) / r) + ((x * z * Bpt) / (r * R)) - ((y * Bpp) / R)
+    Bpy = ((y * Bpr) / r) + ((y * z * Bpt) / (r * R)) + ((x * Bpp) / R)
+    Bpz = ((z * Bpr) / r) - ((R * Bpt) / r)
+    Bpm = math.sqrt(Bpx * Bpx + Bpy * Bpy + Bpz * Bpz)
+    costhetaB = ((khat_x_prime * Bpx) + (khat_y_prime * Bpy) + (khat_z_prime * Bpz)) / Bpm
+    sinthetaB = math.sqrt(1.0 - (costhetaB * costhetaB))  # NaN if cos^2 > 1, as in numpy
+
+    anisotropy_term = 1.0 + ((eta - 1.0) * (costhetaB * costhetaB))
+    if p_eta == 2.0:
+        aniso_fac = (1.0 / anisotropy_term) / phi_norm
+    else:
+        aniso_fac = (anisotropy_term ** (-p_eta / 2.0)) / phi_norm
+    nup = (4.1987e-3) * Bpm * sinthetaB
+
+    # undo the gamma_2^(p_2 - p_1) factor of the stored prefactors (see _rtheta_chain)
+    if gamma_c >= gamma_max:
+        cont = gamma_max
+    elif gamma_c > gamma_m:
+        cont = gamma_c
+    else:
+        cont = gamma_m ** (p - 1.0)
+    Cj = (Kj / cont) * nup * aniso_fac
+    Ca = ((Ka / cont) / nup) * aniso_fac
     return g, nup, gamma_c, Cj, Ca
+
+
+@njit(cache=True)
+def _cell_state(xi, yi, zJ, zi, P, th_tab, rs_tab, ts_tab):
+    """
+    Frequency-independent physics of one cell, evaluated exactly.
+    Returns (g, nu_p, gamma_c, C_j, C_a).
+    """
+    cos_i = P[P_COS_I]
+    sin_i = P[P_SIN_I]
+    z_im_now = zi + zJ
+    x = (xi * cos_i) + (z_im_now * sin_i)
+    y = yi
+    z = (z_im_now * cos_i) - (xi * sin_i)
+    R2 = (x * x) + (y * y)
+    r = math.sqrt(R2 + (z * z))
+    R = math.sqrt(R2)
+    costheta = z / r
+    sgn = 1.0 if costheta >= 0.0 else -1.0
+    vr, vt, vp, gamma, alpha, Bpr, Bpt, Bpp, Bpm, gamma_c, Kj, Ka = _rtheta_chain(
+        r, 1.0 - abs(costheta), sgn, P, th_tab, rs_tab, ts_tab
+    )
+    return _ray_part(x, y, z, r, R, vr, vt, vp, gamma, alpha, Bpr, Bpt, Bpp, gamma_c, Kj, Ka, P)
+
+
+# ----------------------------------------------------------------------------- field table
+#
+# Optional acceleration: the (r,theta)-only quantities are tabulated on a 2-D grid that
+# is uniform in log10(r - r_H) and in u = sqrt(psi/psi_edge) (u is proportional to the
+# polar angle near the axis, which keeps v_phi and B_phi linear there), one table per
+# hemisphere, and bilinearly interpolated per cell.  The interpolation error decreases
+# as the square of the grid spacing; see JetModel.build_field_table for measured values.
+
+N_TAB = 12  # stored quantities per node
+
+
+@njit(cache=True, parallel=True)
+def build_field_table(logr, ugrid, P, th_tab, rs_tab, ts_tab, hemisphere):
+    """
+    Table T[i_r, i_u, q] of the (r,theta)-only quantities for one hemisphere (+1/-1):
+      0-2 (vr, vt, vp)   3 gamma   4 lapse   5-7 (Bpr, Bpt, Bpp)   8 |B'|
+      9 gamma_c   10 Kj   11 Ka
+    logr is log10(r - r_H); ugrid spans [0, 1].
+    """
+    rH = P[P_RH]
+    nu = P[P_NU]
+    nr = logr.shape[0]
+    nu_ = ugrid.shape[0]
+    T = np.empty((nr, nu_, N_TAB))
+    for i in prange(nr):
+        r = rH + 10.0 ** logr[i]
+        t = (r / rH) ** nu
+        for j in range(nu_):
+            w = ugrid[j] * ugrid[j]
+            if w < 1.0e-12:
+                w = 1.0e-12
+            if w > 1.0 - 1.0e-12:  # exactly w=1 falls on the arcsin/arccos branch boundary
+                w = 1.0 - 1.0e-12
+            omc = w / t  # 1 - |cos theta|, exact
+            vr, vt, vp, gamma, alpha, Bpr, Bpt, Bpp, Bpm, gc, Kj, Ka = _rtheta_chain(
+                r, omc, hemisphere, P, th_tab, rs_tab, ts_tab
+            )
+            T[i, j, 0] = vr
+            T[i, j, 1] = vt
+            T[i, j, 2] = vp
+            T[i, j, 3] = gamma
+            T[i, j, 4] = alpha
+            T[i, j, 5] = Bpr
+            T[i, j, 6] = Bpt
+            T[i, j, 7] = Bpp
+            T[i, j, 8] = Bpm
+            T[i, j, 9] = gc
+            T[i, j, 10] = Kj
+            T[i, j, 11] = Ka
+    return T
+
+
+@njit(cache=True)
+def _cell_state_tab(xi, yi, zJ, zi, P, Tup, Tlo, logr0, invdlogr, nr, invdu, nu_):
+    """Same as _cell_state, with the (r,theta)-only part interpolated from the field table."""
+    cos_i = P[P_COS_I]
+    sin_i = P[P_SIN_I]
+    rH = P[P_RH]
+    s = P[P_S]
+    z_im_now = zi + zJ
+    x = (xi * cos_i) + (z_im_now * sin_i)
+    y = yi
+    z = (z_im_now * cos_i) - (xi * sin_i)
+    R2 = (x * x) + (y * y)
+    r = math.sqrt(R2 + (z * z))
+    R = math.sqrt(R2)
+    costheta = z / r
+    r_rH_1_s = (r / rH) ** (1.0 - s)
+    if costheta >= 0.0:
+        u = r_rH_1_s * math.sqrt(1.0 - costheta)  # sqrt(psi/psi_edge)
+        T = Tup
+    else:
+        u = r_rH_1_s * math.sqrt(1.0 + costheta)
+        T = Tlo
+    fr = (math.log10(r - rH) - logr0) * invdlogr
+    if fr < 0.0:
+        fr = 0.0
+    if fr > nr - 1.0000001:
+        fr = nr - 1.0000001
+    ir = int(fr)
+    tr = fr - ir
+    fu = u * invdu
+    if fu < 0.0:
+        fu = 0.0
+    if fu > nu_ - 1.0000001:
+        fu = nu_ - 1.0000001
+    iu = int(fu)
+    tu = fu - iu
+    w00 = (1.0 - tr) * (1.0 - tu)
+    w01 = (1.0 - tr) * tu
+    w10 = tr * (1.0 - tu)
+    w11 = tr * tu
+    q = np.empty(N_TAB)
+    for k in range(N_TAB):
+        q[k] = (
+            w00 * T[ir, iu, k]
+            + w01 * T[ir, iu + 1, k]
+            + w10 * T[ir + 1, iu, k]
+            + w11 * T[ir + 1, iu + 1, k]
+        )
+    return _ray_part(
+        x, y, z, r, R, q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7], q[9], q[10], q[11], P
+    )
 
 
 @njit(cache=True)
@@ -827,3 +1014,107 @@ def rt_from_state(
             if tau_stop > 0.0 and tau_acc >= tau_stop:
                 break
         I_out[pix] = I_acc
+
+
+@njit(cache=True, parallel=True)
+def rt_kernel_tab(
+    frequency,
+    order,
+    x_im_f,
+    y_im_f,
+    z_J_f,
+    z_mid_1D,
+    dz_1D,
+    starts,
+    ends,
+    nint,
+    P,
+    Tup,
+    Tlo,
+    logr0,
+    invdlogr,
+    nr,
+    invdu,
+    nu_,
+    T0,
+    T1,
+    T2,
+    T3,
+    T4,
+    T5,
+    tau_stop,
+    I_out,
+):
+    """As rt_kernel, with the (r,theta)-only physics interpolated from the field table."""
+    Npix = order.shape[0]
+    for q in prange(Npix):
+        pix = order[q]
+        I_acc = 0.0
+        tau_acc = 0.0
+        xi = x_im_f[pix]
+        yi = y_im_f[pix]
+        zJ = z_J_f[pix]
+        done = False
+        for k in range(nint[pix]):
+            if done:
+                break
+            for i in range(starts[pix, k], ends[pix, k]):
+                g, nup, gamma_c, Cj, Ca = _cell_state_tab(
+                    xi, yi, zJ, z_mid_1D[i], P, Tup, Tlo, logr0, invdlogr, nr, invdu, nu_
+                )
+                jI, alphaI = _cell_emis(
+                    frequency, g, nup, gamma_c, Cj, Ca, P, T0, T1, T2, T3, T4, T5
+                )
+                I_acc, tau_acc = _rt_step(I_acc, tau_acc, jI, alphaI, g, dz_1D[i])
+                if tau_stop > 0.0 and tau_acc >= tau_stop:
+                    done = True
+                    break
+        I_out[pix] = I_acc
+
+
+@njit(cache=True, parallel=True)
+def precompute_state_tab(
+    order,
+    offsets,
+    x_im_f,
+    y_im_f,
+    z_J_f,
+    z_mid_1D,
+    starts,
+    ends,
+    nint,
+    P,
+    Tup,
+    Tlo,
+    logr0,
+    invdlogr,
+    nr,
+    invdu,
+    nu_,
+    st_g,
+    st_nup,
+    st_gc,
+    st_Cj,
+    st_Ca,
+    st_iz,
+):
+    """As precompute_state, with the (r,theta)-only physics interpolated from the field table."""
+    Npix = order.shape[0]
+    for q in prange(Npix):
+        pix = order[q]
+        o = offsets[q]
+        xi = x_im_f[pix]
+        yi = y_im_f[pix]
+        zJ = z_J_f[pix]
+        for k in range(nint[pix]):
+            for i in range(starts[pix, k], ends[pix, k]):
+                g, nup, gamma_c, Cj, Ca = _cell_state_tab(
+                    xi, yi, zJ, z_mid_1D[i], P, Tup, Tlo, logr0, invdlogr, nr, invdu, nu_
+                )
+                st_g[o] = g
+                st_nup[o] = nup
+                st_gc[o] = gamma_c
+                st_Cj[o] = Cj
+                st_Ca[o] = Ca
+                st_iz[o] = i
+                o += 1
