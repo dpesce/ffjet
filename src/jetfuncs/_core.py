@@ -1029,6 +1029,45 @@ class JetModel:
         """(r, theta) of the stagnation point on the field line with footpoint theta_fp."""
         return self._stagnation_omc(1.0 - np.abs(np.cos(theta_fp)))
 
+    def _jet_edge_cylindrical(self, z, logR_lo=-1.0, logR_hi=10.0, n_bisect=80):
+        """
+        Cylindrical radius of the jet boundary at height z, by bisection in log R.
+
+        A point (R, z) belongs to the jet when r = sqrt(R^2 + z^2) is inside the field line that
+        threads the horizon at theta_H = pi/2, i.e. when r <= rH (1 - cos theta)^(-1/nu) with
+        cos theta = z / r.  At fixed z that condition is monotonic in R, so a bisection brackets
+        the boundary to machine precision; the bracket spans R = 0.1 to 10^10 r_g, which contains
+        the boundary for every usable (a, s).
+        """
+        rH, nu = self.rH, self.nu
+
+        def inside(logR):
+            R = 10.0**logR
+            r = np.sqrt((R * R) + (z * z))
+            theta = np.arccos(z / r)
+            with np.errstate(over="ignore", divide="ignore"):
+                r_jet = rH * ((1.0 / (1.0 - np.cos(theta))) ** (1.0 / nu))
+            return bool((r <= r_jet) and (r > rH))
+
+        if not inside(logR_lo):
+            raise RuntimeError(
+                f"the jet boundary at z={z:.3g} r_g lies inside R=10^{logR_lo:g} r_g for a={self.a}, "
+                f"s={self.s} (nu={self.nu}); the jet-power normalization cannot be computed"
+            )
+        if inside(logR_hi):
+            raise RuntimeError(
+                f"the jet boundary at z={z:.3g} r_g lies beyond R=10^{logR_hi:g} r_g for a={self.a}, "
+                f"s={self.s} (nu={self.nu}); the jet-power normalization cannot be computed"
+            )
+        lo, hi = float(logR_lo), float(logR_hi)
+        for _ in range(int(n_bisect)):
+            mid = 0.5 * (lo + hi)
+            if inside(mid):
+                lo = mid
+            else:
+                hi = mid
+        return 10.0**lo
+
     # determine the scaling factor necessary to ensure that the jet has the correct total power
     def _build_poynting_scaling(self):
         a = self.a
@@ -1038,10 +1077,17 @@ class JetModel:
         rg = self.rg
         Pjet = self.Pjet
 
-        Nrescale = 500
-        logzrescale = 8.0
-        zhere = (10.0**logzrescale) * np.ones((Nrescale, 1))
-        Rhere = (10.0 ** np.linspace(-1.0, logzrescale, Nrescale)).reshape((Nrescale, 1))
+        # The integration grid ends *at* the jet boundary rather than at a fixed outer radius.
+        # The boundary radius grows as z^s, so with a fixed grid it moves across grid points as
+        # the parameters change, and the integral -- hence this normalization, and with it every
+        # flux the model produces -- jumps by several per cent each time a point crosses it: a
+        # +-5% sawtooth in s with a period of ~0.0024, which turns a likelihood in s into a comb.
+        Nrescale = self._POYNTING_N
+        logzrescale = self._POYNTING_LOGZ
+        zrescale = 10.0**logzrescale
+        logR_edge = np.log10(self._jet_edge_cylindrical(zrescale))
+        zhere = zrescale * np.ones((Nrescale, 1))
+        Rhere = (10.0 ** np.linspace(-1.0, logR_edge, Nrescale)).reshape((Nrescale, 1))
 
         rhere = np.sqrt((Rhere * Rhere) + (zhere * zhere))
         thetahere = np.arccos(zhere / rhere)
@@ -1155,6 +1201,12 @@ class JetModel:
     _STAG_LUT_REFINE = 4  # lookup-grid refinement over n_stagnation
     _STAG_R_MAX = 1.0e20
     _STAG_SCAN_PER_DECADE = 40
+
+    # jet-power normalization (_build_poynting_scaling): the height at which the Poynting flux
+    # is integrated across the jet, and the number of points of the integration grid -- which
+    # ends exactly at the jet boundary, so that the result is a smooth function of the parameters
+    _POYNTING_LOGZ = 8.0
+    _POYNTING_N = 4000
 
     # pole-on handling: |sin(i)| below this counts as exactly along the jet axis, and a
     # ray-centring offset more than this multiple of zmax earns a warning

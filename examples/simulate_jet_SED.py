@@ -40,7 +40,7 @@ xmin = ymin = -100.0
 xmax = ymax = 100.0
 
 # set the number of pixels for the image
-Nx = Ny = 100
+Nx = Ny = 200
 
 # set the dimensions and resolution along the depth (z) direction; relevant for radiative transfer
 zmin = 0.0
@@ -89,7 +89,7 @@ model = jf.JetModel(
 model.precompute_state()
 
 # array of observing frequencies, in GHz
-frequency_arr = 10.0 ** np.linspace(0.0, 6.0, 200)
+frequency_arr = 10.0 ** np.linspace(0.0, 11.0, 200)
 
 # initialize an array to hold integrated luminosity density
 luminosity = np.zeros_like(frequency_arr)
