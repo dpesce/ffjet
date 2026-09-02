@@ -735,6 +735,7 @@ class JetModel:
         gamma_max=1.0e8,
         p_eta=2.0,
         gammabeta_suppression=0.5,
+        jet_power_coefficient=1.4,
         DTYPE=np.float64,
         stokes="I",
         backend="auto",
@@ -769,6 +770,7 @@ class JetModel:
         self.gamma_max = float(gamma_max)
         self.p_eta = float(p_eta)
         self.gammabeta_suppression = float(gammabeta_suppression)
+        self.jet_power_coefficient = float(jet_power_coefficient)
         self.DTYPE = DTYPE
 
         self.stokes = str(stokes).upper()
@@ -826,6 +828,14 @@ class JetModel:
             )
         if self.p_eta < 0.0:
             raise ValueError(f"p_eta={self.p_eta} must be non-negative")
+        if self.gammabeta_suppression < 0.0:
+            raise ValueError(
+                f"gammabeta_suppression={self.gammabeta_suppression} must be non-negative"
+            )
+        if not (self.jet_power_coefficient > 0.0):
+            raise ValueError(
+                f"jet_power_coefficient={self.jet_power_coefficient} must be positive"
+            )
 
         ####################
         # derived quantities
@@ -839,7 +849,9 @@ class JetModel:
 
         self.rg = (1.477e5) * self.m
         self.Mdot = self.mdot * self.m * (1.399e17)
-        self.Pjet = 1.4 * (self.a * self.a) * self.Mdot * (c * c)
+        # jet power P_jet = k a^2 Mdot c^2; k = 1.4 corresponds to a prograde MAD
+        # (Tchekhovskoy et al. 2011; Narayan et al. 2022) and is the default
+        self.Pjet = self.jet_power_coefficient * (self.a * self.a) * self.Mdot * (c * c)
 
         # magnetic field object used in setup steps
         self.bf = Bfield(p=self.nu)
