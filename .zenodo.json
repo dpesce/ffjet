@@ -1,0 +1,36 @@
+{
+  "title": "ffjet: a semi-analytic force-free jet model for images and spectral energy distributions",
+  "upload_type": "software",
+  "access_right": "open",
+  "license": "mit",
+  "version": "1.0.0",
+  "description": "ffjet is a Python implementation of the semi-analytic force-free jet model of Tsunetoe et al. (2025): an axisymmetric force-free jet in the Kerr spacetime, supplemented with a prescription for nonthermal electron heating, synchrotron cooling, and pitch-angle anisotropy in the electron distribution, with radiative transfer along straight rays. It computes model images and spectral energy distributions of relativistic jets. This release is the version used in Pesce, Narayan & Tsunetoe, \"A model for the image structure and spectral energy distribution of relativistic jets\".",
+  "creators": [
+    {
+      "name": "Pesce, Dominic W.",
+      "affiliation": "Center for Astrophysics | Harvard & Smithsonian",
+      "orcid": "0000-0002-5278-9221"
+    },
+    {
+      "name": "Narayan, Ramesh",
+      "affiliation": "Center for Astrophysics | Harvard & Smithsonian",
+      "orcid": "0000-0002-1919-2730"
+    },
+    {
+      "name": "Tsunetoe, Yuh",
+      "affiliation": "Shanghai Astronomical Observatory, Chinese Academy of Sciences",
+       "orcid": "0000-0003-0213-7628"
+    }
+  ],
+  "keywords": [
+    "astrophysical jets",
+    "black holes",
+    "force-free electrodynamics",
+    "synchrotron radiation",
+    "radiative transfer",
+    "spectral energy distribution",
+    "VLBI",
+    "M87",
+    "Sgr A*"
+  ]
+}

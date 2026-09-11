@@ -1,0 +1,27 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata below, together with the accompanying paper."
+title: "ffjet: a semi-analytic force-free jet model for images and spectral energy distributions"
+type: software
+authors:
+  - family-names: Pesce
+    given-names: Dominic W.
+    orcid: "https://orcid.org/0000-0002-5278-9221"
+    affiliation: "Center for Astrophysics | Harvard & Smithsonian"
+  - family-names: Narayan
+    given-names: Ramesh
+    orcid: "https://orcid.org/0000-0002-1919-2730"
+    affiliation: "Center for Astrophysics | Harvard & Smithsonian"
+  - family-names: Tsunetoe
+    given-names: Yuh
+    orcid: "https://orcid.org/0000-0003-0213-7628"
+    affiliation: "Shanghai Astronomical Observatory, Chinese Academy of Sciences"
+version: 1.0.0
+license: MIT
+repository-code: "https://github.com/dpesce/ffjet"
+abstract: "Python implementation of the semi-analytic force-free jet model of Tsunetoe et al. (2025), computing images and spectral energy distributions of relativistic jets."
+keywords:
+  - astrophysical jets
+  - force-free electrodynamics
+  - synchrotron radiation
+  - spectral energy distribution
+  - VLBI
