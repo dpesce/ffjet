@@ -16,6 +16,7 @@ authors:
     orcid: "https://orcid.org/0000-0003-0213-7628"
     affiliation: "Shanghai Astronomical Observatory, Chinese Academy of Sciences"
 version: 1.0.0
+doi: 10.5281/zenodo.22709525
 license: MIT
 repository-code: "https://github.com/dpesce/ffjet"
 abstract: "Python implementation of the semi-analytic force-free jet model of Tsunetoe et al. (2025), computing images and spectral energy distributions of relativistic jets."

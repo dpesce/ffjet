@@ -3,12 +3,29 @@
 [![Build status](https://github.com/dpesce/ffjet/actions/workflows/ci.yml/badge.svg)](https://github.com/dpesce/ffjet/actions)
 [![Python versions](https://img.shields.io/badge/python-3.9|3.10|3.11|3.12|3.13-blue.svg)](https://github.com/dpesce/ffjet)
 [![Code coverage](https://codecov.io/gh/dpesce/ffjet/branch/main/graph/badge.svg)](https://codecov.io/gh/dpesce/ffjet)
+[![PyPI version](https://img.shields.io/pypi/v/ffjet.svg)](https://pypi.org/project/ffjet/)
+[![conda-forge version](https://img.shields.io/conda/vn/conda-forge/ffjet.svg)](https://anaconda.org/conda-forge/ffjet)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.22709525.svg)](https://doi.org/10.5281/zenodo.22709525)
 
 A tool for simulating images and spectral energy distributions (SEDs) of astrophysical jets, particularly the relativistic jets produced by spinning black holes.  The underlying model assumes force-free electrodynamics and a nonthermal population of synchrotron-emitting electrons.  Details are provided in [Pesce et al. (TBD)]().
 
 ## Installation
 
-The code is only tested on Python 3.9 and higher, and it may break for earlier versions.  It is recommended that you install ffjet using a virtual environment, e.g.:
+The code is only tested on Python 3.9 and higher, and it may break for earlier versions.  The latest release can be installed from PyPI:
+
+```
+    pip install ffjet
+```
+
+or from conda-forge:
+
+```
+    conda install -c conda-forge ffjet
+```
+
+There is an optional progress bar functionality that uses [`tqdm`](https://tqdm.github.io/); it can be installed together with ffjet using `pip install "ffjet[progress]"`, or using `conda install -c conda-forge ffjet tqdm`.
+
+To install the development version from source instead, it is recommended that you use a virtual environment, e.g.:
 
 ```
     $ git clone https://github.com/dpesce/ffjet
@@ -18,16 +35,10 @@ The code is only tested on Python 3.9 and higher, and it may break for earlier v
     (.venv) $ pip install .
 ```
 
-You can also install directly from GitHub:
+You can also install the development version directly from GitHub:
 
 ```
     pip install "git+https://github.com/dpesce/ffjet.git"
-```
-
-There is an optional progress bar functionality that uses [`tqdm`](https://tqdm.github.io/); it can be installed using:
-
-```
-    pip install "ffjet[progress] @ git+https://github.com/dpesce/ffjet.git"
 ```
 
 ## Checking that it works
@@ -55,3 +66,7 @@ The stagnation surface used for the field-parallel velocity is tabulated on `n_s
 For parameter surveys, `jetfuncs.survey(configs, func)` evaluates `func(model)` for a list of `JetModel` configurations in parallel worker processes, dividing the machine's threads between them; see [examples/simulate_jet_survey.py](./examples/simulate_jet_survey.py).  Because the compiled kernels are already multi-threaded, the gain is modest (about 1.3-1.6x on a 10-core machine) and comes from overlapping the per-model setup and Python overhead.
 
 Synchrotron emissivity and absorption integrals are computed at model construction; pass `stokes="IQV"` to `JetModel` to also build the Stokes Q and V tables (not yet used by the radiative transfer).
+
+## Citing ffjet
+
+If you use ffjet in your research, please cite the paper describing the model (see above), together with the archived version of the code that you used.  Every release is archived on Zenodo: [10.5281/zenodo.22709525](https://doi.org/10.5281/zenodo.22709525) always points to the latest version, and the Zenodo page lists a separate DOI for each individual release.  The "Cite this repository" button on the GitHub page provides a ready-made citation.
