@@ -92,8 +92,22 @@ sigma_T = 6.65246e-25
     P_STAG_LOGX0,
     P_STAG_INVDLOG,
     P_STAG_KMAX,
+    # read only by the polarized kernel (_kernel_pol.py): constants of the Faraday
+    # rotativities, and the scheme and table grid they are evaluated on
+    P_LN_GM,
+    P_GM_2MP,
+    P_GM_MPM1,
+    P_GM_MPP1,
+    P_GM_MPP2,
+    P_GX_MPP1,
+    P_GX_MPP2,
+    P_GM_M3,
+    P_ROT_SCHEME,
+    P_RTAB_LOGX0,
+    P_RTAB_INVDLOGX,
+    P_RTAB_KMAX,
     N_PARAMS,
-) = range(44)
+) = range(56)
 
 
 def pack_params(model, heating_prescription="Poynting"):
@@ -150,6 +164,25 @@ def pack_params(model, heating_prescription="Poynting"):
     P[P_STAG_LOGX0] = model._stag_lut_logx0
     P[P_STAG_INVDLOG] = model._stag_lut_invdlog
     P[P_STAG_KMAX] = model._stag_lut_kmax
+    # gamma_m and gamma_max combinations entering rho_Q and rho_V; the unpolarized
+    # kernel never reads them.  The HS11 tables are stored scaled by x^(q+1), so the
+    # assembly needs gamma^-(q+1) at each segment edge -- constants except at gamma_c.
+    P[P_LN_GM] = math.log(gm)
+    P[P_GM_2MP] = gm ** (2.0 - pp)
+    P[P_GM_MPM1] = gm ** (-(pp + 1.0))
+    P[P_GM_MPP1] = gm ** (-(pp + 1.0))  # q = p      edge at gamma_m
+    P[P_GM_MPP2] = gm ** (-(pp + 2.0))  # q = p + 1  edge at gamma_m
+    P[P_GX_MPP1] = gx ** (-(pp + 1.0))  # q = p      edge at gamma_max
+    P[P_GX_MPP2] = gx ** (-(pp + 2.0))  # q = p + 1  edge at gamma_max
+    P[P_GM_M3] = gm**-3.0               # q = 2      edge at gamma_m
+    # rotativity scheme and the grid its tables are built on; both default to the
+    # values an unpolarized model carries, which the polarized path overwrites
+    P[P_ROT_SCHEME] = float(
+        {"none": 0, "JO77": 1, "HS11": 2}.get(getattr(model, "rotativities", "HS11"), 2)
+    )
+    P[P_RTAB_LOGX0] = getattr(model, "_rtab_logx0", 0.0)
+    P[P_RTAB_INVDLOGX] = getattr(model, "_rtab_inv_dlogx", 1.0)
+    P[P_RTAB_KMAX] = getattr(model, "_rtab_kmax", 0.0)
     return P
 
 

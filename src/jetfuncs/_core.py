@@ -10,6 +10,8 @@ from astropy.io import fits
 from astropy.wcs import WCS
 from astropy.time import Time
 
+from . import _rotativities as _rotmod
+
 # optional progress bar import
 try:
     from tqdm import tqdm as _tqdm
@@ -20,10 +22,12 @@ except Exception:
 # JetModel._make_image_numpy remains available as the reference implementation
 try:
     from . import _kernel as _kern
+    from . import _kernel_pol as _kernpol
 
     HAS_NUMBA = True
 except ImportError:  # pragma: no cover - exercised only when numba is absent
     _kern = None
+    _kernpol = None
     HAS_NUMBA = False
 
 # suppress some numpy warnings
@@ -674,6 +678,214 @@ def u_driftframe(
 
 
 ###################################################
+# full-Stokes helpers
+#
+# Conventions (see JetModel.make_image_polarized, sky_view and _kernel_pol for the
+# full statement).  Stokes Q and U are returned in the radio convention, referred to
+# (North, East), so the EVPA is 0.5*atan2(U, Q) measured East of North and is
+# perpendicular to the projected fluid-frame magnetic field for optically thin
+# emission.  V > 0 when the fluid-frame field points towards the observer.
+#
+# The observer sits on the -z_im side of the image plane, so the un-mirrored view of
+# the sky has -x_im to the right and +y_im up, putting North along +y_im and East
+# along +x_im; sky_view() may rotate the picture by 180 degrees, which flips both and
+# so leaves Q, U and V unchanged.  The triad (x_im, y_im, n) is LEFT handed, so a raw
+# pcolormesh(x, y, I) is a mirror of the sky, not a rotation of it.  The transfer runs
+# in the right-handed basis (+x_im, -y_im, n); rotating that onto (North, East) is a
+# -90 degree rotation, which negates both Q and U and leaves V alone.
+
+_Q_SIGN = -1.0  # must equal _kernel_pol._Q_SIGN; the tests assert that they agree
+_U_SIGN = -1.0  # must equal _kernel_pol._U_SIGN
+
+# row index of each rotativity table, keyed by (kernel, spectral index)
+_ROT_ROW = {key: i for i, key in enumerate(_rotmod.ROT_ROWS)}
+
+# j_V and alpha_V relative to j_I and alpha_I (Dexter 2016, A24/A43 over A22/A41)
+_V_PREFAC = 4.0 / 3.0
+
+
+def _expm1_ratio_np(a, ds):
+    """(1 - exp(-a ds))/a, exact in the limit a ds -> 0."""
+    z = a * ds
+    small = np.abs(z) < 1.0e-8
+    with np.errstate(divide="ignore", invalid="ignore"):
+        big = -np.expm1(-z) / a
+    return np.where(small, ds * (1.0 - 0.5 * z * (1.0 - z / 3.0)), big)
+
+
+def _pol_cell_operator(jI, jQ, jU, jV, aI, aQ, aU, aV, rQ, rU, rV, ds):
+    """
+    The evolution operator and the emission of one cell of constant coefficients:
+
+        O = exp(-K ds),        c = [int_0^ds exp(-K u) du] j,
+
+    returned as arrays of shape (4, 4) + s and (4,) + s, with s the broadcast shape of
+    the coefficients.  A ray is then the sum of O_cum,i c_i over its cells, with O_cum
+    the product of the operators of everything in front of cell i -- the polarized
+    generalization of the running exp(-tau) of the unpolarized transfer.
+
+    Landi Degl'Innocenti & Landi Degl'Innocenti (1985) give exp(-K ds) in closed form
+    as a combination of four fixed matrices M1..M4 with scalar coefficients built from
+    cosh(L1 ds), sinh(L1 ds), cos(L2 ds) and sin(L2 ds) (Dexter 2016, Eqs. D2-D12).
+    The same four matrices carry the emission once those scalars are replaced by their
+    integrals over the cell, which is how this avoids inverting K -- the inverse is
+    what fails in the optically thin, strongly Faraday-rotating limit that the outer
+    jet sits in.  The pure-absorption limit (no polarized structure) and the
+    geometrically thin limit are both reached continuously.
+
+    This is the numpy reference for _kernel_pol._pol_cell_operator.
+    """
+    a2 = aQ * aQ + aU * aU + aV * aV
+    r2 = rQ * rQ + rU * rU + rV * rV
+    adr = aQ * rQ + aU * rU + aV * rV
+
+    e0 = np.exp(-aI * ds)
+    A_e = _expm1_ratio_np(aI, ds)
+    shape = np.broadcast_shapes(
+        *(np.shape(v) for v in (jI, jQ, jU, jV, aI, aQ, aU, aV, rQ, rU, rV))
+    )
+    O_scalar = np.zeros((4, 4) + shape)
+    for i in range(4):
+        O_scalar[i, i] = e0
+    c_scalar = np.broadcast_to(A_e, shape) * np.stack(
+        [np.broadcast_to(v, shape) for v in (jI, jQ, jU, jV)]
+    )
+
+    d = 0.5 * (a2 - r2)
+    disc = np.sqrt(d * d + adr * adr)
+    Theta = 2.0 * disc
+    ok = np.broadcast_to(Theta > 1.0e-290, shape)
+    if not np.any(ok):
+        return O_scalar, c_scalar
+    Th = np.where(ok, Theta, 1.0)
+
+    L1 = np.sqrt(np.maximum(disc + d, 0.0))
+    L2 = np.sqrt(np.maximum(disc - d, 0.0))
+    sg = np.where(adr >= 0.0, 1.0, -1.0)
+
+    # L1 <= |alpha| <= alpha_I (the latter enforced by the polarization clamp), so
+    # these never grow
+    Em = np.exp(-(aI - L1) * ds)
+    Ep = np.exp(-(aI + L1) * ds)
+    ch = 0.5 * (Em + Ep)
+    sh = 0.5 * (Em - Ep)
+    cs = np.cos(L2 * ds)
+    sn = np.sin(L2 * ds)
+    co = e0 * cs
+    si = e0 * sn
+
+    A_ch = 0.5 * (_expm1_ratio_np(aI - L1, ds) + _expm1_ratio_np(aI + L1, ds))
+    A_sh = 0.5 * (_expm1_ratio_np(aI - L1, ds) - _expm1_ratio_np(aI + L1, ds))
+    den = aI * aI + L2 * L2
+    dok = den > 0.0
+    dd = np.where(dok, den, 1.0)
+    A_co = np.where(dok, (aI - e0 * (aI * cs - L2 * sn)) / dd, ds)
+    A_si = np.where(dok, (L2 - e0 * (L2 * cs + aI * sn)) / dd, 0.0)
+
+    c1, c2, c3, c4 = 0.5 * (ch + co), -si, -sh, 0.5 * (ch - co)
+    C1, C2, C3, C4 = 0.5 * (A_ch + A_co), -A_si, -A_sh, 0.5 * (A_ch - A_co)
+
+    invT = 1.0 / Th
+    m2_01 = (L2 * aQ - sg * L1 * rQ) * invT
+    m2_02 = (L2 * aU - sg * L1 * rU) * invT
+    m2_03 = (L2 * aV - sg * L1 * rV) * invT
+    m2_12 = (sg * L1 * aV + L2 * rV) * invT
+    m2_13 = (-sg * L1 * aU - L2 * rU) * invT
+    m2_23 = (sg * L1 * aQ + L2 * rQ) * invT
+    m3_01 = (L1 * aQ + sg * L2 * rQ) * invT
+    m3_02 = (L1 * aU + sg * L2 * rU) * invT
+    m3_03 = (L1 * aV + sg * L2 * rV) * invT
+    m3_12 = (-sg * L2 * aV + L1 * rV) * invT
+    m3_13 = (sg * L2 * aU - L1 * rU) * invT
+    m3_23 = (-sg * L2 * aQ + L1 * rQ) * invT
+    hh = 0.5 * (a2 + r2)
+    t2 = 2.0 * invT
+    m4_00 = hh * t2
+    m4_01 = (aV * rU - aU * rV) * t2
+    m4_02 = (aQ * rV - aV * rQ) * t2
+    m4_03 = (aU * rQ - aQ * rU) * t2
+    m4_11 = (aQ * aQ + rQ * rQ - hh) * t2
+    m4_12 = (aQ * aU + rQ * rU) * t2
+    m4_13 = (aV * aQ + rV * rQ) * t2
+    m4_22 = (aU * aU + rU * rU - hh) * t2
+    m4_23 = (aU * aV + rU * rV) * t2
+    m4_33 = (aV * aV + rV * rV - hh) * t2
+
+    # M1 is the identity; M2 and M3 are symmetric in the first row and column and
+    # antisymmetric in the lower 3x3 block, M4 the other way round
+    O = np.empty((4, 4) + shape)
+    O[0, 0] = c1 + c4 * m4_00
+    O[0, 1] = c2 * m2_01 + c3 * m3_01 + c4 * m4_01
+    O[0, 2] = c2 * m2_02 + c3 * m3_02 + c4 * m4_02
+    O[0, 3] = c2 * m2_03 + c3 * m3_03 + c4 * m4_03
+    O[1, 0] = c2 * m2_01 + c3 * m3_01 - c4 * m4_01
+    O[1, 1] = c1 + c4 * m4_11
+    O[1, 2] = c2 * m2_12 + c3 * m3_12 + c4 * m4_12
+    O[1, 3] = c2 * m2_13 + c3 * m3_13 + c4 * m4_13
+    O[2, 0] = c2 * m2_02 + c3 * m3_02 - c4 * m4_02
+    O[2, 1] = -c2 * m2_12 - c3 * m3_12 + c4 * m4_12
+    O[2, 2] = c1 + c4 * m4_22
+    O[2, 3] = c2 * m2_23 + c3 * m3_23 + c4 * m4_23
+    O[3, 0] = c2 * m2_03 + c3 * m3_03 - c4 * m4_03
+    O[3, 1] = -c2 * m2_13 - c3 * m3_13 + c4 * m4_13
+    O[3, 2] = -c2 * m2_23 - c3 * m3_23 + c4 * m4_23
+    O[3, 3] = c1 + c4 * m4_33
+
+    x0, x1, x2, x3 = jI, jQ, jU, jV
+    p2_0 = m2_01 * x1 + m2_02 * x2 + m2_03 * x3
+    p2_1 = m2_01 * x0 + m2_12 * x2 + m2_13 * x3
+    p2_2 = m2_02 * x0 - m2_12 * x1 + m2_23 * x3
+    p2_3 = m2_03 * x0 - m2_13 * x1 - m2_23 * x2
+    p3_0 = m3_01 * x1 + m3_02 * x2 + m3_03 * x3
+    p3_1 = m3_01 * x0 + m3_12 * x2 + m3_13 * x3
+    p3_2 = m3_02 * x0 - m3_12 * x1 + m3_23 * x3
+    p3_3 = m3_03 * x0 - m3_13 * x1 - m3_23 * x2
+    p4_0 = m4_00 * x0 + m4_01 * x1 + m4_02 * x2 + m4_03 * x3
+    p4_1 = -m4_01 * x0 + m4_11 * x1 + m4_12 * x2 + m4_13 * x3
+    p4_2 = -m4_02 * x0 + m4_12 * x1 + m4_22 * x2 + m4_23 * x3
+    p4_3 = -m4_03 * x0 + m4_13 * x1 + m4_23 * x2 + m4_33 * x3
+    cvec = np.stack([
+        C1 * x0 + C2 * p2_0 + C3 * p3_0 + C4 * p4_0,
+        C1 * x1 + C2 * p2_1 + C3 * p3_1 + C4 * p4_1,
+        C1 * x2 + C2 * p2_2 + C3 * p3_2 + C4 * p4_2,
+        C1 * x3 + C2 * p2_3 + C3 * p3_3 + C4 * p4_3,
+    ])
+    cvec = np.broadcast_to(cvec, (4,) + shape)
+
+    # the M matrices are 0/0 on the measure-zero set |alpha| = |rho|, alpha.rho = 0
+    good = ok & np.all(np.isfinite(O), axis=(0, 1)) & np.all(np.isfinite(cvec), axis=0)
+    return np.where(good, O, O_scalar), np.where(good, cvec, c_scalar)
+
+
+def _pol_transfer_step(I, Q, U, V, jI, jQ, jU, jV, aI, aQ, aU, aV, rQ, rU, rV, ds):
+    """
+    Advance (I, Q, U, V) across one cell of constant coefficients, exactly:
+    I(ds) = O I(0) + c.  Used by the tests and as the readable statement of what the
+    cell operator means; the image loop applies O and c separately so that it can
+    accumulate front to back.
+    """
+    O, cvec = _pol_cell_operator(jI, jQ, jU, jV, aI, aQ, aU, aV, rQ, rU, rV, ds)
+    x = np.stack(np.broadcast_arrays(I, Q, U, V))
+    out = np.einsum("ik...,k...->i...", O, x) + cvec
+    return out[0], out[1], out[2], out[3]
+
+
+def _clamp_polarized_np(sI, sQ, sV):
+    """
+    Hold the polarized part of a coefficient vector below its total.  j and alpha are
+    independent fitting functions, so their ratio can drift above unity where each is
+    individually poor; rescaling Q and V leaves I -- the quantity the published,
+    unpolarized model computes -- untouched.
+    """
+    pol = np.sqrt(sQ * sQ + sV * sV)
+    bad = (~np.isfinite(sI)) | (sI <= 0.0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        f = np.where(pol > sI, sI / pol, 1.0)
+    f = np.where(bad, 0.0, f)
+    return sQ * f, sV * f
+
+
+###################################################
 # primary class
 
 
@@ -738,6 +950,7 @@ class JetModel:
         jet_power_coefficient=1.4,
         DTYPE=np.float64,
         stokes="I",
+        rotativities="HS11",
         backend="auto",
         n_stagnation=1000,
     ):
@@ -776,6 +989,14 @@ class JetModel:
         self.stokes = str(stokes).upper()
         self.n_stagnation = int(n_stagnation)
 
+        # Faraday rotativity scheme used by make_image_polarized; see _rotativities.py
+        # for the formulae and the measured accuracy of each.
+        if rotativities not in ("HS11", "JO77", "none"):
+            raise ValueError(
+                f"rotativities must be 'HS11', 'JO77' or 'none', got {rotativities!r}"
+            )
+        self.rotativities = rotativities
+
         # radiative-transfer back end: "auto" (numba if installed, else numpy),
         # "numba", or "numpy"; can be overridden per call in make_image()
         if backend not in ("auto", "numba", "numpy"):
@@ -786,6 +1007,8 @@ class JetModel:
         self._intervals = None  # per-ray ranges of z-cells inside the jet
         self._state = None  # per-cell frequency-independent state (see precompute_state)
         self._ftab = None  # 2-D table of the (r,theta)-only physics (see build_field_table)
+        self._rtab = None  # Faraday rotativity tables (see _load_rotativity_tables)
+        self._rtab_p = None
 
         ####################
         # input validation
@@ -1328,15 +1551,32 @@ class JetModel:
     _X_TAIL = 1.0e-6
     _TAIL_C = 4.0 * np.pi / (np.sqrt(3.0) * _gammafn(1.0 / 3.0)) / 2.0 ** (1.0 / 3.0)
 
-    def _G_diff(self, lookup, m, x_lo, x_hi):
+    # The polarized families are built from two further kernels, whose small-argument
+    # behaviour differs from F's, so each kernel carries its own (coefficient, exponent
+    # offset) with kernel(z) -> C z^(e0 - 1):
+    #
+    #   F(z) = z int_z^inf K_{5/3}(y) dy  ->  Gamma(2/3) 2^(2/3) z^(1/3)     e0 = 4/3
+    #   G(z) = z K_{2/3}(z)               ->  Gamma(2/3) 2^(-1/3) z^(1/3)    e0 = 4/3
+    #   H(z) = int_z^inf K_{1/3} + z K_{1/3}(z)  ->  int_0^inf K_{1/3} = pi/sqrt(3)   e0 = 1
+    #
+    # so G's coefficient is exactly half of F's, and H's integral has no plateau
+    # divergence at all.  (These are checked against the tables themselves in the tests.)
+    _TAIL = {
+        "F": (_TAIL_C, 4.0 / 3.0),
+        "G": (0.5 * _TAIL_C, 4.0 / 3.0),
+        "H": (np.pi / np.sqrt(3.0), 1.0),
+    }
+
+    def _G_diff(self, lookup, m, x_lo, x_hi, kernel="F"):
         """G(x_lo) - G(x_hi) for x_lo <= x_hi, with the plateau handled analytically."""
         d = lookup(x_lo) - lookup(x_hi)
         small = x_hi <= self._X_TAIL
         if not np.any(small):
             return d
-        e = m + (4.0 / 3.0)
+        tail_c, e0 = self._TAIL[kernel]
+        e = m + e0
         with np.errstate(invalid="ignore", divide="ignore"):
-            tail = (self._TAIL_C / e) * ((x_hi**e) - (x_lo**e))
+            tail = (tail_c / e) * ((x_hi**e) - (x_lo**e))
         return np.where(small, tail, d)
 
     def _G_lookup(self, x, key):
@@ -1374,7 +1614,7 @@ class JetModel:
     def GaIx_pp1(self, x):
         return self._G_lookup(x, "GaI_pp1")
 
-    # Stokes Q (built when stokes includes "Q"; for future polarized transfer)
+    # Stokes Q (built when stokes includes "Q"; used by make_image_polarized)
     def GQx_2(self, x):
         return self._G_lookup(x, "GQ_2")
 
@@ -1393,7 +1633,7 @@ class JetModel:
     def GaQx_pp1(self, x):
         return self._G_lookup(x, "GaQ_pp1")
 
-    # Stokes V (built when stokes includes "V"; for future polarized transfer)
+    # Stokes V (built when stokes includes "V"; used by make_image_polarized)
     def GVx_2(self, x):
         return self._G_lookup(x, "GV_2")
 
@@ -1619,6 +1859,144 @@ class JetModel:
         return self.x_im_1D, self.y_im_1D, I_out.reshape(self.x_im.shape)
 
     # ------------------------------------------------------------------
+    # full-Stokes transfer
+    # ------------------------------------------------------------------
+    def _ensure_polarized_tables(self):
+        """
+        Build the Stokes Q and V synchrotron integrals if this model does not have
+        them.  They are computed from scipy's Bessel functions in a few milliseconds,
+        so a model constructed with the default stokes="I" can be used for polarized
+        imaging without being rebuilt.
+        """
+        needed = ("GQ_2", "GQ_p", "GQ_pp1", "GaQ_2", "GaQ_p", "GaQ_pp1",
+                  "GV_2", "GV_p", "GV_pp1", "GaV_2", "GaV_p", "GaV_pp1")
+        if not all(hasattr(self, "logG_" + name) for name in needed):
+            self.stokes = "IQV"
+            self._load_synchrotron_tables()
+        self._load_rotativity_tables()
+
+    def _load_rotativity_tables(self):
+        """
+        Build the nine Faraday-rotativity tables (see _rotativities.py).  They are
+        built even for the "JO77" and "none" schemes, which do not read them, so that
+        switching scheme on an existing model needs no rebuild; the cost is a few
+        milliseconds and ~150 kB.
+        """
+        if self._rtab is not None and self._rtab_p == self.p:
+            return
+        tab, logx, logx0, inv_dlogx, kmax, q = _rotmod.build_tables(self.p)
+        self._rtab = tab
+        self._rtab_logx = logx
+        self._rtab_logx0 = logx0
+        self._rtab_inv_dlogx = inv_dlogx
+        self._rtab_kmax = kmax
+        self._rtab_q = q
+        self._rtab_p = self.p
+
+    def make_image_polarized(
+        self,
+        frequency,
+        *,
+        tau_stop=None,
+        show_progress=False,
+        heating_prescription="Poynting",
+        backend=None,
+    ):
+        """
+        Compute the full-Stokes image at the requested frequency (in GHz).
+
+        Returns (x_im_1D, y_im_1D, IQUV) with IQUV of shape (4, Ny, Nx), holding
+        I, Q, U and V in the same cgs intensity units as make_image().
+
+        The emitting electrons are the same anisotropic, cooled double power law the
+        unpolarized model uses.  Their polarized synchrotron emission and absorption
+        follow Dexter (2016, Eqs. A22-A24 and A41-A43); the Faraday rotativities
+        rho_Q and rho_V come from the scheme selected by the model's `rotativities`
+        argument ("HS11", "JO77" or "none" -- see _rotativities.py), and the pitch-angle
+        anisotropy contributes the extra factor that the circular coefficients pick up
+        from a non-isotropic distribution (Tsunetoe et al. 2025).  Each cell is
+        advanced with the exact constant-coefficient solution of the 4x4 transfer
+        equation, so the result is stable in both the optically thin and the optically
+        thick limits and does not require the Faraday depth per cell to be small.
+
+        CONVENTIONS.  Q and U are in the radio convention, referred to (North, East),
+        so the EVPA is 0.5*atan2(U, Q) measured East of North and is perpendicular to
+        the projected fluid-frame magnetic field for optically thin emission.  V > 0
+        when the fluid-frame magnetic field has a component pointing towards the
+        observer, the sign convention of Dexter (2016) and of grtrans/ipole.  Use
+        jetfuncs.evpa() and jetfuncs.polarization_fractions() rather than rederiving
+        these by hand.
+
+        The returned array is indexed [.., y_im, x_im] like make_image(), and a raw
+        pcolormesh(x, y, I) of that is a MIRROR of the sky, because the observer sits
+        on the -z_im side of the image plane.  Pass the result through
+        jetfuncs.sky_view() before plotting, which is also what fixes North to be up.
+
+        Stokes I from this method is NOT identical to make_image(): polarized
+        absorption feeds Q, U and V back into I, which the unpolarized transfer
+        cannot represent.  The difference is a fraction of a percent for the
+        parameters of interest, and the two agree exactly when the polarized
+        coefficients are switched off.
+
+        tau_stop:             stop integrating a ray once the Stokes I optical depth
+                              exceeds this value (None = never)
+        show_progress:        show a progress bar (numpy back end only)
+        heating_prescription: "Poynting" (u_e = h S / (c gamma)) or "magnetic"
+                              (u_e = h B'^2 / 8 pi)
+        backend:              "numba", "numpy", or None to use the model's default
+        """
+        if heating_prescription not in ("Poynting", "magnetic"):
+            raise ValueError(
+                f"unrecognized heating_prescription {heating_prescription!r}; "
+                f"expected 'Poynting' or 'magnetic'"
+            )
+        self._ensure_polarized_tables()
+        if self._resolve_backend(backend) == "numba":
+            return self._make_image_polarized_numba(frequency, tau_stop, heating_prescription)
+        return self._make_image_polarized_numpy(
+            frequency,
+            tau_stop=tau_stop,
+            show_progress=show_progress,
+            heating_prescription=heating_prescription,
+        )
+
+    def _make_image_polarized_numba(self, frequency, tau_stop, heating_prescription):
+        iv = self._get_intervals()
+        P = _kern.pack_params(self, heating_prescription)
+        TAB = _kernpol.pack_tables_pol(self)
+        RTAB = _kernpol.pack_rot_tables(self)
+        tau = -1.0 if (tau_stop is None or float(tau_stop) <= 0.0) else float(tau_stop)
+        out = np.zeros((4, self.x_im_f.shape[0]), dtype=np.float64)
+
+        st = self._state
+        ft = self._ftab
+        if (
+            st is not None
+            and st.get("pol") is not None
+            and st["heating_prescription"] == heating_prescription
+        ):
+            _kernpol.rt_from_state_pol(
+                float(frequency), iv["order"], st["offsets"], self.dz_1D, P, TAB, RTAB, tau,
+                st["pol"], st["iz"], out,
+            )
+        elif ft is not None and ft["heating_prescription"] == heating_prescription:
+            _kernpol.rt_kernel_tab_pol(
+                float(frequency), iv["order"],
+                self.x_im_f, self.y_im_f, self.z_J_f, self.z_mid_1D, self.dz_1D,
+                iv["starts"], iv["ends"], iv["nint"],
+                P, *self._ftab_args(), TAB, RTAB, tau, out,
+            )
+        else:
+            _kernpol.rt_kernel_pol(
+                float(frequency), iv["order"],
+                self.x_im_f, self.y_im_f, self.z_J_f, self.z_mid_1D, self.dz_1D,
+                iv["starts"], iv["ends"], iv["nint"],
+                P, self._stag_lut_x, self._stag_lut_r, self._stag_lut_t, self._stag_lut_a,
+                TAB, RTAB, tau, out,
+            )
+        return self.x_im_1D, self.y_im_1D, out.reshape((4,) + self.x_im.shape)
+
+    # ------------------------------------------------------------------
     # optional field table (approximate, ~1.8x faster than the exact kernel)
     # ------------------------------------------------------------------
     def build_field_table(self, points_per_decade=200, n_u=256, heating_prescription="Poynting",
@@ -1689,7 +2067,8 @@ class JetModel:
         ft = self._ftab
         return (ft["Tup"], ft["Tlo"], ft["logr0"], ft["invdlogr"], ft["nr"], ft["invdu"], ft["nu"])
 
-    def precompute_state(self, heating_prescription="Poynting", max_memory_gb=8.0):
+    def precompute_state(self, heating_prescription="Poynting", max_memory_gb=8.0,
+                         polarized=False):
         """
         Evaluate and store the frequency-independent state of every jet cell (redshift
         factor, characteristic synchrotron frequency, cooling Lorentz factor, and the
@@ -1699,6 +2078,13 @@ class JetModel:
         makes loops over frequency (SEDs) fast.  Requires the numba back end.  If a
         field table has been built (build_field_table), the state is taken from it,
         otherwise it is computed exactly.
+
+        polarized=True stores four further quantities per cell -- the fluid-frame
+        pitch-angle cosine, the absorption scale that the Faraday rotativities are
+        built on, and the two components of the rotation into the sky basis -- so that
+        make_image_polarized() can use the cached path as well (76 bytes per cell).
+        The extra state is a superset: the unpolarized make_image() reads the same
+        arrays and is unaffected.
 
         Returns the memory used by the stored state, in bytes.  Raises MemoryError if
         that would exceed max_memory_gb; call clear_state() to release it.
@@ -1715,37 +2101,63 @@ class JetModel:
         offsets = np.zeros(ncell_ordered.shape[0] + 1, dtype=np.int64)
         offsets[1:] = np.cumsum(ncell_ordered)
         N = int(offsets[-1])
-        nbytes = N * (5 * 8 + 4)
+        nper = _kernpol.N_POL_STATE if polarized else 5
+        nbytes = N * (nper * 8 + 4)
         if nbytes > max_memory_gb * 1.0e9:
             raise MemoryError(
                 f"the per-cell state for {N} jet cells needs {nbytes/1e9:.1f} GB, above the "
                 f"max_memory_gb={max_memory_gb} limit; use a coarser grid or raise the limit"
             )
-        st = dict(
-            heating_prescription=heating_prescription,
-            offsets=offsets,
-            g=np.empty(N),
-            nup=np.empty(N),
-            gamma_c=np.empty(N),
-            Cj=np.empty(N),
-            Ca=np.empty(N),
-            iz=np.empty(N, dtype=np.int32),
-        )
+        iz = np.empty(N, dtype=np.int32)
+        if polarized:
+            self._ensure_polarized_tables()
+            # one contiguous block; its first five rows are exactly the unpolarized
+            # state, so both transfers read the same memory
+            pol = np.empty((_kernpol.N_POL_STATE, N))
+            st = dict(
+                heating_prescription=heating_prescription,
+                offsets=offsets,
+                pol=pol,
+                g=pol[0], nup=pol[1], gamma_c=pol[2], Cj=pol[3], Ca=pol[4],
+                iz=iz,
+            )
+        else:
+            st = dict(
+                heating_prescription=heating_prescription,
+                offsets=offsets,
+                pol=None,
+                g=np.empty(N),
+                nup=np.empty(N),
+                gamma_c=np.empty(N),
+                Cj=np.empty(N),
+                Ca=np.empty(N),
+                iz=iz,
+            )
         ft = self._ftab
-        if ft is not None and ft["heating_prescription"] == heating_prescription:
+        use_tab = ft is not None and ft["heating_prescription"] == heating_prescription
+        args = (
+            iv["order"], offsets, self.x_im_f, self.y_im_f, self.z_J_f, self.z_mid_1D,
+            iv["starts"], iv["ends"], iv["nint"],
+            _kern.pack_params(self, heating_prescription),
+        )
+        if polarized:
+            if use_tab:
+                _kernpol.precompute_state_tab_pol(*args, *self._ftab_args(), st["pol"], iz)
+            else:
+                _kernpol.precompute_state_pol(
+                    *args, self._stag_lut_x, self._stag_lut_r, self._stag_lut_t,
+                    self._stag_lut_a, st["pol"], iz,
+                )
+        elif use_tab:
             _kern.precompute_state_tab(
-                iv["order"], offsets, self.x_im_f, self.y_im_f, self.z_J_f, self.z_mid_1D,
-                iv["starts"], iv["ends"], iv["nint"],
-                _kern.pack_params(self, heating_prescription), *self._ftab_args(),
-                st["g"], st["nup"], st["gamma_c"], st["Cj"], st["Ca"], st["iz"],
+                *args, *self._ftab_args(),
+                st["g"], st["nup"], st["gamma_c"], st["Cj"], st["Ca"], iz,
             )
         else:
             _kern.precompute_state(
-                iv["order"], offsets, self.x_im_f, self.y_im_f, self.z_J_f, self.z_mid_1D,
-                iv["starts"], iv["ends"], iv["nint"],
-                _kern.pack_params(self, heating_prescription),
+                *args,
                 self._stag_lut_x, self._stag_lut_r, self._stag_lut_t, self._stag_lut_a,
-                st["g"], st["nup"], st["gamma_c"], st["Cj"], st["Ca"], st["iz"],
+                st["g"], st["nup"], st["gamma_c"], st["Cj"], st["Ca"], iz,
             )
         self._state = st
         return nbytes
@@ -2321,6 +2733,655 @@ class JetModel:
 
         return x_im_1D, y_im_1D, I_nu
 
+    # ------------------------------------------------------------------
+    # Faraday rotativities (the numpy reference for _kernel_pol._rotativities)
+    # ------------------------------------------------------------------
+    def _rot_V_numpy(self, row, x):
+        """The scaled rotativity integral x^(q+1) W_q(x); see _kernel_pol._rot_V."""
+        tab = self._rtab[row]
+        with np.errstate(divide="ignore"):
+            f = (np.log10(np.maximum(x, 1.0e-300)) - self._rtab_logx0) * self._rtab_inv_dlogx
+        f = np.clip(f, 0.0, self._rtab_kmax)
+        k = f.astype(np.intp)
+        t = f - k
+        return tab[k] + t * (tab[k + 1] - tab[k])
+
+    @staticmethod
+    def _pow_int_np(a, b, q):
+        """int_a^b gamma^(1-q) dgamma, with the logarithmic case at q = 2."""
+        m = 2.0 - q
+        with np.errstate(divide="ignore", invalid="ignore"):
+            val = np.log(b / a) if abs(m) < 1.0e-12 else (b**m - a**m) / m
+        return np.where(b > a, val, 0.0)
+
+    @staticmethod
+    def _log_int_np(a, b, q):
+        """int_a^b gamma^(-q-2) ln(2 gamma) dgamma."""
+        n1 = -(q + 1.0)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            fa = (a**n1) * (np.log(2.0 * a) / n1 - 1.0 / (n1 * n1))
+            fb = (b**n1) * (np.log(2.0 * b) / n1 - 1.0 / (n1 * n1))
+        return np.where(b > a, fb - fa, 0.0)
+
+    def _rot_jo77_numpy(self, nn, cot, Kap, p1, p2, g1, g2, g3, amp2):
+        """Jones & Odell (1977) / Sazonov (1969), each segment over its own range."""
+        gstar = np.sqrt(1.5 * nn)
+        has2 = amp2 > 0.0
+        acc = self._pow_int_np(g1, np.minimum(g2, gstar), p1)
+        acc = acc + np.where(
+            has2, amp2 * self._pow_int_np(g2, np.minimum(g3, gstar), p2), 0.0
+        )
+        rQ = _rotmod.JO77_Q_PREFAC * Kap * acc / (nn * nn * nn)
+        integ = self._log_int_np(g1, g2, p1) + np.where(
+            has2, amp2 * self._log_int_np(g2, g3, p2), 0.0
+        )
+        s1 = g1 ** (-p1)
+        s3 = np.where(has2, amp2 * g3 ** (-p2), g2 ** (-p1))
+        top = np.where(has2, g3, g2)
+        bnd = s1 * (np.log(2.0 * g1) - 1.0) / g1 - s3 * (np.log(2.0 * top) - 1.0) / top
+        rV = _rotmod.JO77_V_PREFAC * Kap * cot * (integ + bnd) / (nn * nn)
+        return rQ, rV
+
+    def _rot_hs11_numpy(self, nn, cot, Kap, g1, g2, g3, amp2, rows1, rows2,
+                        w1_lo, w1_hi, w2_lo, w2_hi, s1):
+        """Huang & Shcherbakov (2011), Eq. (55) integrated over the distribution."""
+        XA = np.sqrt(_rotmod.XA_CONST / nn)
+        lnXA = np.log(XA)
+        x1 = XA * g1
+        x2 = XA * g2
+        x3 = XA * g3
+        V = self._rot_V_numpy
+        JQ = V(rows1[0], x1) * w1_lo - V(rows1[0], x2) * w1_hi
+        d1 = V(rows1[1], x1) * w1_lo - V(rows1[1], x2) * w1_hi
+        d2 = V(rows1[2], x1) * w1_lo - V(rows1[2], x2) * w1_hi
+        JV = 2.0 * d2 - 2.0 * lnXA * d1
+        has2 = amp2 > 0.0
+        if np.any(has2):
+            JQ = JQ + np.where(
+                has2, amp2 * (V(rows2[0], x2) * w2_lo - V(rows2[0], x3) * w2_hi), 0.0
+            )
+            e1 = V(rows2[1], x2) * w2_lo - V(rows2[1], x3) * w2_hi
+            e2 = V(rows2[2], x2) * w2_lo - V(rows2[2], x3) * w2_hi
+            JV = JV + np.where(has2, amp2 * (2.0 * e2 - 2.0 * lnXA * e1), 0.0)
+        # boundary term at gamma_min (HS11 Eq. 56), with exact kinematics
+        mom = np.where(g1 > 1.0, np.sqrt(np.maximum(g1 * g1 - 1.0, 0.0)), 1.0e-12)
+        L1 = np.log((1.0 + mom / g1) / np.maximum(1.0 - mom / g1, 1.0e-300))
+        bq = s1 * _rotmod.H_B(x1, g1) / (g1 * mom)
+        bv = s1 * (g1 * L1 - 2.0 * mom) * _rotmod.g_B(x1) / (g1 * mom)
+        rQ = _rotmod.HS11_Q_PREFAC * Kap * (XA * JQ + bq) / nn
+        rV = _rotmod.HS11_V_PREFAC * Kap * cot * (JV + bv) / (nn * nn)
+        return rQ, rV
+
+    def _rotativities_numpy(self, nn, cot, Kap, branch, gamma_c):
+        """
+        rho_Q and rho_V for one cooling branch (0 uncooled, 1 slow, 2 fast) in the
+        scheme this model was built with.  Mirrors _kernel_pol._rotativities.
+        """
+        nn = np.asarray(nn, dtype=float)
+        if self.rotativities == "none":
+            return np.zeros_like(nn), np.zeros_like(nn)
+        self._load_rotativity_tables()
+        p, gm, gx = self.p, self.gamma_m, self.gamma_max
+        one = np.ones_like(nn)
+        gc = np.asarray(gamma_c, dtype=float) * one
+        R = _ROT_ROW
+        if branch == 0:
+            p1, p2 = p, p
+            g1, g2, g3 = gm * one, gx * one, gx * one
+            amp2 = np.zeros_like(nn)
+            rows1 = (R[("Q", "p")], R[("V1", "p")], R[("V2", "p")])
+            rows2 = rows1
+            w1_lo, w1_hi = gm ** (-(p + 1.0)) * one, gx ** (-(p + 1.0)) * one
+            w2_lo = w2_hi = np.zeros_like(nn)
+            s1 = gm ** (-p) * one
+        elif branch == 1:
+            p1, p2 = p, p + 1.0
+            g1, g2, g3 = gm * one, gc, gx * one
+            amp2 = gc
+            rows1 = (R[("Q", "p")], R[("V1", "p")], R[("V2", "p")])
+            rows2 = (R[("Q", "pp1")], R[("V1", "pp1")], R[("V2", "pp1")])
+            gc1 = gc ** (-(p + 1.0))
+            w1_lo, w1_hi = gm ** (-(p + 1.0)) * one, gc1
+            w2_lo, w2_hi = gc1 / gc, gx ** (-(p + 2.0)) * one
+            s1 = gm ** (-p) * one
+        else:
+            p1, p2 = 2.0, p + 1.0
+            g1, g2, g3 = gc, gm * one, gx * one
+            amp2 = gm ** (p - 1.0) * one
+            rows1 = (R[("Q", "2")], R[("V1", "2")], R[("V2", "2")])
+            rows2 = (R[("Q", "pp1")], R[("V1", "pp1")], R[("V2", "pp1")])
+            w1_lo, w1_hi = gc**-3.0, gm**-3.0 * one
+            w2_lo, w2_hi = gm ** (-(p + 2.0)) * one, gx ** (-(p + 2.0)) * one
+            s1 = gc**-2.0
+        if self.rotativities == "JO77":
+            return self._rot_jo77_numpy(nn, cot, Kap, p1, p2, g1, g2, g3, amp2)
+        return self._rot_hs11_numpy(
+            nn, cot, Kap, g1, g2, g3, amp2, rows1, rows2, w1_lo, w1_hi, w2_lo, w2_hi, s1
+        )
+
+    # ------------------------------------------------------------------
+    # full-Stokes coefficients and numpy back end
+    # ------------------------------------------------------------------
+    def _pol_coefficients_numpy(self, nu_nup, nup, gamma_c, costhetaB, nA):
+        """
+        Full-Stokes synchrotron coefficients of the anisotropic, cooled double
+        power-law electron distribution, in the fluid frame and in the fluid Stokes
+        basis (the projected magnetic field along the Q axis, so j_U = alpha_U = 0).
+
+        Returns (jI, jQ, jV, alphaI, alphaQ, alphaV, rhoQ, rhoV).  Emission and
+        absorption are Dexter (2016) Eqs. (A22)-(A24) and (A41)-(A43), summed over the
+        two branches exactly as the Stokes I path does; the circular coefficients carry
+        the extra factor 1 + g_eta/(p_i + 2) that a pitch-angle-dependent distribution
+        contributes (Tsunetoe et al. 2025).  The rotativities are the power-law forms
+        of Jones & Odell (1977) as given in Dexter's Appendix B1, evaluated on the
+        lowest-energy branch; the second branch is suppressed by
+        (gamma_1/gamma_2)^(1+p_1) and is negligible.
+
+        This is the numpy reference for _kernel_pol._cell_emis_pol.
+        """
+        p = self.p
+        gamma_m = self.gamma_m
+        gamma_max = self.gamma_max
+        p_eta = self.p_eta
+        eta = self.eta
+
+        nn = np.asarray(nu_nup, dtype=float)
+        cth = np.asarray(costhetaB, dtype=float)
+        cth2 = np.minimum(cth * cth, 1.0)
+        sth = np.maximum(np.sqrt(1.0 - cth2), 1.0e-12)
+        cot = cth / sth
+        aniso_term = 1.0 + ((eta - 1.0) * cth2)
+        aniso_fac = (aniso_term ** (-p_eta / 2.0)) / self.phi_norm
+        g_eta = p_eta * (eta - 1.0) * (1.0 - cth2) / aniso_term
+
+        Cj = self.prefac_emis * nA * nup * aniso_fac
+        Ca = (self.prefac_absorp * nA / nup) * aniso_fac
+        Kap = self.prefac_absorp * nA / nup
+
+        jI = np.zeros_like(nn)
+        jQ = np.zeros_like(nn)
+        jV = np.zeros_like(nn)
+        aI = np.zeros_like(nn)
+        aQ = np.zeros_like(nn)
+        aV = np.zeros_like(nn)
+        rQ = np.zeros_like(nn)
+        rV = np.zeros_like(nn)
+
+        ind_fast = gamma_c <= gamma_m
+        ind_slow = (gamma_c > gamma_m) & (gamma_c < gamma_max)
+        ind_unc = gamma_c >= gamma_max
+
+        # ---- uncooled: one power law of index p from gamma_m to gamma_max
+        if np.any(ind_unc):
+            m = ind_unc
+            x = nn[m]
+            sq = np.sqrt(x)
+            x1 = x / (gamma_m * gamma_m)
+            x2 = x / (gamma_max * gamma_max)
+            pw = x ** ((1.0 - p) / 2.0)
+            pwa = x ** (-(p + 4.0) / 2.0)
+            fV = 1.0 + g_eta[m] / (p + 2.0)
+            jI[m] = Cj[m] * pw * self._G_diff(self.GIx_p, (p - 3.0) / 2.0, x2, x1, "F")
+            jQ[m] = Cj[m] * pw * self._G_diff(self.GQx_p, (p - 3.0) / 2.0, x2, x1, "G")
+            jV[m] = (
+                _V_PREFAC * Cj[m] * cot[m] * fV * (pw / sq)
+                * self._G_diff(self.GVx_p, (p - 2.0) / 2.0, x2, x1, "H")
+            )
+            aI[m] = Ca[m] * (p + 2.0) * pwa * self._G_diff(
+                self.GaIx_p, (p - 2.0) / 2.0, x2, x1, "F"
+            )
+            aQ[m] = Ca[m] * (p + 2.0) * pwa * self._G_diff(
+                self.GaQx_p, (p - 2.0) / 2.0, x2, x1, "G"
+            )
+            aV[m] = (
+                _V_PREFAC * Ca[m] * (p + 2.0) * cot[m] * fV * (pwa / sq)
+                * self._G_diff(self.GaVx_p, (p - 1.0) / 2.0, x2, x1, "H")
+            )
+            rQ[m], rV[m] = self._rotativities_numpy(x, cot[m], Kap[m], 0, gamma_c[m])
+
+        # ---- slow cooling: index p to gamma_c, then p+1 to gamma_max
+        if np.any(ind_slow):
+            m = ind_slow
+            x = nn[m]
+            sq = np.sqrt(x)
+            gc = gamma_c[m]
+            p2 = p + 1.0
+            x1 = x / (gamma_m * gamma_m)
+            x2 = x / (gc * gc)
+            x3 = x / (gamma_max * gamma_max)
+            pw1 = x ** ((1.0 - p) / 2.0)
+            pw2 = pw1 / sq
+            pwa1 = x ** (-(p + 4.0) / 2.0)
+            pwa2 = pwa1 / sq
+            fV1 = 1.0 + g_eta[m] / (p + 2.0)
+            fV2 = 1.0 + g_eta[m] / (p2 + 2.0)
+            jI[m] = Cj[m] * (
+                pw1 * self._G_diff(self.GIx_p, (p - 3.0) / 2.0, x2, x1, "F")
+                + gc * pw2 * self._G_diff(self.GIx_pp1, (p2 - 3.0) / 2.0, x3, x2, "F")
+            )
+            jQ[m] = Cj[m] * (
+                pw1 * self._G_diff(self.GQx_p, (p - 3.0) / 2.0, x2, x1, "G")
+                + gc * pw2 * self._G_diff(self.GQx_pp1, (p2 - 3.0) / 2.0, x3, x2, "G")
+            )
+            jV[m] = _V_PREFAC * Cj[m] * cot[m] * (
+                fV1 * (pw1 / sq) * self._G_diff(self.GVx_p, (p - 2.0) / 2.0, x2, x1, "H")
+                + fV2 * gc * (pw2 / sq)
+                * self._G_diff(self.GVx_pp1, (p2 - 2.0) / 2.0, x3, x2, "H")
+            )
+            aI[m] = Ca[m] * (
+                (p + 2.0) * pwa1 * self._G_diff(self.GaIx_p, (p - 2.0) / 2.0, x2, x1, "F")
+                + (p2 + 2.0) * gc * pwa2
+                * self._G_diff(self.GaIx_pp1, (p2 - 2.0) / 2.0, x3, x2, "F")
+            )
+            aQ[m] = Ca[m] * (
+                (p + 2.0) * pwa1 * self._G_diff(self.GaQx_p, (p - 2.0) / 2.0, x2, x1, "G")
+                + (p2 + 2.0) * gc * pwa2
+                * self._G_diff(self.GaQx_pp1, (p2 - 2.0) / 2.0, x3, x2, "G")
+            )
+            aV[m] = _V_PREFAC * Ca[m] * cot[m] * (
+                (p + 2.0) * fV1 * (pwa1 / sq)
+                * self._G_diff(self.GaVx_p, (p - 1.0) / 2.0, x2, x1, "H")
+                + (p2 + 2.0) * fV2 * gc * (pwa2 / sq)
+                * self._G_diff(self.GaVx_pp1, (p2 - 1.0) / 2.0, x3, x2, "H")
+            )
+            rQ[m], rV[m] = self._rotativities_numpy(x, cot[m], Kap[m], 1, gc)
+
+        # ---- fast cooling: index 2 from gamma_c, then p+1 above gamma_m
+        if np.any(ind_fast):
+            m = ind_fast
+            x = nn[m]
+            sq = np.sqrt(x)
+            gc = gamma_c[m]
+            p1 = 2.0
+            p2 = p + 1.0
+            cont = gamma_m ** (p - 1.0)
+            x1 = x / (gc * gc)
+            x2 = x / (gamma_m * gamma_m)
+            x3 = x / (gamma_max * gamma_max)
+            pw1 = 1.0 / sq
+            pw2 = x ** ((1.0 - p2) / 2.0)
+            pwa1 = x ** (-(p1 + 4.0) / 2.0)
+            pwa2 = x ** (-(p2 + 4.0) / 2.0)
+            fV1 = 1.0 + g_eta[m] / (p1 + 2.0)
+            fV2 = 1.0 + g_eta[m] / (p2 + 2.0)
+            jI[m] = Cj[m] * (
+                pw1 * self._G_diff(self.GIx_2, (p1 - 3.0) / 2.0, x2, x1, "F")
+                + cont * pw2 * self._G_diff(self.GIx_pp1, (p2 - 3.0) / 2.0, x3, x2, "F")
+            )
+            jQ[m] = Cj[m] * (
+                pw1 * self._G_diff(self.GQx_2, (p1 - 3.0) / 2.0, x2, x1, "G")
+                + cont * pw2 * self._G_diff(self.GQx_pp1, (p2 - 3.0) / 2.0, x3, x2, "G")
+            )
+            jV[m] = _V_PREFAC * Cj[m] * cot[m] * (
+                fV1 * (pw1 / sq) * self._G_diff(self.GVx_2, (p1 - 2.0) / 2.0, x2, x1, "H")
+                + fV2 * cont * (pw2 / sq)
+                * self._G_diff(self.GVx_pp1, (p2 - 2.0) / 2.0, x3, x2, "H")
+            )
+            aI[m] = Ca[m] * (
+                (p1 + 2.0) * pwa1 * self._G_diff(self.GaIx_2, (p1 - 2.0) / 2.0, x2, x1, "F")
+                + (p2 + 2.0) * cont * pwa2
+                * self._G_diff(self.GaIx_pp1, (p2 - 2.0) / 2.0, x3, x2, "F")
+            )
+            aQ[m] = Ca[m] * (
+                (p1 + 2.0) * pwa1 * self._G_diff(self.GaQx_2, (p1 - 2.0) / 2.0, x2, x1, "G")
+                + (p2 + 2.0) * cont * pwa2
+                * self._G_diff(self.GaQx_pp1, (p2 - 2.0) / 2.0, x3, x2, "G")
+            )
+            aV[m] = _V_PREFAC * Ca[m] * cot[m] * (
+                (p1 + 2.0) * fV1 * (pwa1 / sq)
+                * self._G_diff(self.GaVx_2, (p1 - 1.0) / 2.0, x2, x1, "H")
+                + (p2 + 2.0) * fV2 * cont * (pwa2 / sq)
+                * self._G_diff(self.GaVx_pp1, (p2 - 1.0) / 2.0, x3, x2, "H")
+            )
+            rQ[m], rV[m] = self._rotativities_numpy(x, cot[m], Kap[m], 2, gc)
+
+        bad = ~np.isfinite(nn)
+        for arr in (jI, jQ, jV, aI, aQ, aV, rQ, rV):
+            arr[bad] = np.nan
+        return jI, jQ, jV, aI, aQ, aV, rQ, rV
+
+    def _sky_basis_numpy(self, gamma, beta, vhat, khat_prime, Bprime, Bprime_mag):
+        """
+        cos(2 chi) and sin(2 chi): the rotation between the fluid-frame Stokes basis
+        (aligned with the projected magnetic field) and the internal right-handed sky
+        basis (x_im, -y_im, n).  Dexter (2016), Eqs. (44) and (45).
+
+        The observer's sky basis vectors are boosted into the fluid frame and shifted
+        along the (null) photon momentum to remove the time component that the boost
+        introduces; four-dimensional inner products survive both steps, so the result
+        is orthonormal in the fluid frame without renormalization.
+        """
+        vhat_x, vhat_y, vhat_z = vhat
+        khx, khy, khz = khat_prime
+        Bx, By, Bz = Bprime
+        cos_i, sin_i = self.cos_i, self.sin_i
+
+        gm1 = gamma - 1.0
+        gb = gamma * beta
+        sa = (vhat_x * cos_i) - (vhat_z * sin_i)  # vhat . (+x_im)
+        sb = -vhat_y  # vhat . (-y_im)
+        ax = cos_i + gm1 * sa * vhat_x + gb * sa * khx
+        ay = gm1 * sa * vhat_y + gb * sa * khy
+        az = -sin_i + gm1 * sa * vhat_z + gb * sa * khz
+        bx = gm1 * sb * vhat_x + gb * sb * khx
+        by = -1.0 + gm1 * sb * vhat_y + gb * sb * khy
+        bz = gm1 * sb * vhat_z + gb * sb * khz
+
+        ca = (ax * Bx + ay * By + az * Bz) / Bprime_mag
+        cb = (bx * Bx + by * By + bz * Bz) / Bprime_mag
+        den = ca * ca + cb * cb  # = sin^2(theta_B')
+        ok = den > 1.0e-300
+        d = np.where(ok, den, 1.0)
+        cos2chi = np.where(ok, (cb * cb - ca * ca) / d, -1.0)
+        sin2chi = np.where(ok, -2.0 * ca * cb / d, 0.0)
+        return cos2chi, sin2chi
+
+    def _make_image_polarized_numpy(
+        self, frequency, *, tau_stop=None, show_progress=False, heating_prescription="Poynting"
+    ):
+        """
+        Reference implementation of the full-Stokes transfer.
+
+        The geometry, fields, velocity, redshift and fluid-frame magnetic field are
+        computed exactly as in _make_image_numpy -- the two integrate the same cells
+        with the same numbers -- with the polarized coefficients of
+        _pol_coefficients_numpy and the exact 4x4 cell solution of _pol_transfer_step
+        in place of the scalar update.
+
+        Returns (x_im_1D, y_im_1D, IQUV) with IQUV of shape (4, Ny, Nx).
+        """
+        rH = self.rH
+        nu = self.nu
+        a = self.a
+        p = self.p
+        h = self.h
+
+        rg = self.rg
+        cos_i = self.cos_i
+        sin_i = self.sin_i
+        nx, ny, nz = self.nx, self.ny, self.nz
+
+        scaling = self.scaling
+        sqrt_scaling = self.sqrt_scaling
+
+        x_im_1D = self.x_im_1D
+        y_im_1D = self.y_im_1D
+        z_im_1D = self.z_im_1D
+        z_mid_1D = self.z_mid_1D
+
+        x_im = self.x_im
+        x_im_f = self.x_im_f
+        y_im_f = self.y_im_f
+        z_J_f = self.z_J_f
+        dz_1D = self.dz_1D
+
+        jet_cutout_fraction = self.jet_cutout_fraction
+        gamma_inf = self.gamma_inf
+        gammabeta_suppression = self.gammabeta_suppression
+        gamma_m = self.gamma_m
+        gamma_max = self.gamma_max
+
+        # Front-to-back accumulation, exactly as the unpolarized transfer does it: rays
+        # are marched from the observer outwards and the emission of each cell is
+        # attenuated by the material in front of it.  The running scalar exp(-tau) of
+        # the Stokes I path becomes the cumulative 4x4 operator O_cum.
+        npix = x_im_f.shape[0]
+        Itot = np.zeros((4, npix))
+        Ocum = np.zeros((4, 4, npix))
+        for k in range(4):
+            Ocum[k, k] = 1.0
+        tau_acc_f = np.zeros(npix)
+
+        if tau_stop is not None:
+            tau_stop = float(tau_stop)
+            if tau_stop <= 0.0:
+                tau_stop = None
+        working_f = np.ones(x_im_f.shape[0], dtype=bool)
+        allpix = np.arange(x_im_f.size, dtype=np.int64)
+
+        for i in _progress(range(0, len(z_im_1D) - 1), enabled=show_progress):
+            if tau_stop is not None:
+                w = np.flatnonzero(working_f)
+                if w.size == 0:
+                    break
+            else:
+                w = allpix
+
+            z_im_now = z_mid_1D[i] + z_J_f[w]
+            x = (x_im_f[w] * cos_i) + (z_im_now * sin_i)
+            y = y_im_f[w]
+            z = (z_im_now * cos_i) - (x_im_f[w] * sin_i)
+            R2 = (x * x) + (y * y)
+            r2 = R2 + (z * z)
+            r = np.sqrt(r2)
+
+            costheta = z / r
+            az = np.abs(z)
+            big = (r + az) / r
+            small = R2 / (r * (r + az))
+            pos = z >= 0.0
+            one_minus_costheta = np.where(pos, small, big)
+            one_plus_costheta = np.where(pos, big, small)
+
+            ratio_nu = np.power(r / rH, nu)
+            w_fp = ratio_nu * one_minus_costheta
+            cos_fp = np.where(w_fp < 1.0, 1.0 - w_fp, (ratio_nu * one_plus_costheta) - 1.0)
+            omc_fp = 1.0 - np.abs(cos_fp)
+
+            eps_h = 1.0e-2
+            r_min = rH * (1.0 + eps_h)
+            ind_jet = ((w_fp <= 1.0) | ((ratio_nu * one_plus_costheta) <= 1.0)) & (r > r_min)
+            if jet_cutout_fraction > 0.0:
+                omc_fp_cut = jet_cutout_fraction * jet_cutout_fraction
+                ind_jet &= ~(omc_fp < omc_fp_cut)
+            if not ind_jet.any():
+                continue
+
+            idx_loc = np.nonzero(ind_jet)[0]
+            idx = w[idx_loc]
+
+            psi = (rH**nu) * omc_fp[idx_loc]
+            Omega = omega_BZpower(0, psi, a, nu)
+            rstag, tstag = self._stagnation_omc(omc_fp[idx_loc])
+            Aconst_here = self._stagnation_aconst(omc_fp[idx_loc])
+
+            R = np.sqrt(R2[idx_loc])
+            sintheta = R / r[idx_loc]
+            costh = costheta[idx_loc]
+            cth2 = costh * costh
+            sth2 = 1.0 - cth2
+            a2 = a * a
+            r2pa2 = r2[idx_loc] + a2
+            rho2 = r2[idx_loc] + (a2 * cth2)
+            Delta = r2pa2 - (2.0 * r[idx_loc])
+            Delta_min = (r_min * r_min) - 2.0 * r_min + a2
+            Delta = np.maximum(Delta, Delta_min)
+            Sigma = (r2pa2 * r2pa2) - (a2 * Delta * sth2)
+            alphalapse = np.sqrt(Delta * rho2 / Sigma)
+            sth2_rho2 = sth2 / rho2
+            g00 = ((a2 * sth2) - Delta) / rho2
+            g03 = -2.0 * a * r[idx_loc] * sth2_rho2
+            g11 = rho2 / Delta
+            g22 = rho2
+            g33 = Sigma * sth2_rho2
+            gdet = sintheta * rho2
+
+            r_nu = r[idx_loc] ** nu
+            signcostheta = np.sign(costh)
+            dpsidtheta = signcostheta * sintheta * r_nu
+            dpsidr = nu * psi / r[idx_loc]
+            if nu > 0:
+                Ipol = -4.0 * np.pi * psi * Omega * signcostheta
+            else:
+                Ipol = -2.0 * np.pi * psi * (2 - psi) * Omega * signcostheta
+            B1 = dpsidtheta / gdet
+            B2 = -dpsidr / gdet
+            B3 = Ipol / (2 * np.pi * Delta * sth2)
+            Br = B1 * np.sqrt(g11)
+            Btheta = B2 * np.sqrt(g22)
+            Bphi = B3 * np.sqrt(g33)
+            omegaz = 2.0 * a * r[idx_loc] / Sigma
+            E1 = (Omega - omegaz) * Sigma * sintheta * B2 / rho2
+            E2 = -(Omega - omegaz) * Sigma * sintheta * B1 / (rho2 * Delta)
+            E3 = 0.0
+
+            gamma, u0, u1, u2, u3, vperpmag, v1perp, v2perp, v3perp = u_driftframe(
+                a, r[idx_loc], rstag, tstag, Omega,
+                r2[idx_loc], a2, cth2, sth2, Delta, rho2, Sigma,
+                g00, g11, g22, g33, g03, alphalapse, gdet,
+                B1, B2, B3, E1, E2, E3, signcostheta, Aconst=Aconst_here,
+            )
+
+            B1Zamo = alphalapse * Br
+            B2Zamo = alphalapse * Btheta
+            B3Zamo = alphalapse * Bphi
+            Bsq = (B1Zamo * B1Zamo) + (B2Zamo * B2Zamo) + (B3Zamo * B3Zamo)
+            poyntingmag = Bsq * vperpmag * (c / (4.0 * np.pi))
+            poyntingmag = np.abs(np.nan_to_num(poyntingmag))
+            S = poyntingmag * scaling
+
+            Br *= alphalapse * sqrt_scaling
+            Btheta *= alphalapse * sqrt_scaling
+            Bphi *= alphalapse * sqrt_scaling
+            Bx, By, Bz = rtp_to_xyz(
+                Br, Btheta, Bphi, x[idx_loc], y[idx_loc], z[idx_loc], r[idx_loc], R
+            )
+
+            vr_orig = u1 * np.sqrt(g11) / gamma
+            vtheta_orig = u2 * np.sqrt(g22) / gamma
+            vphi_orig = u3 * np.sqrt(g33) / gamma
+            beta_orig = np.sqrt(np.maximum(0.0, 1.0 - 1.0 / (gamma * gamma)))
+            gammabeta = gammabeta_suppression * beta_orig * gamma
+            gamma = np.sqrt(1.0 + (gammabeta * gammabeta))
+            indgamma = gamma > gamma_inf
+            gamma[indgamma] = gamma_inf
+            beta = np.sqrt(np.maximum(0.0, 1.0 - 1.0 / (gamma * gamma)))
+            velscale = np.zeros_like(beta)
+            mask_boost = beta_orig > 0.0
+            velscale[mask_boost] = beta[mask_boost] / beta_orig[mask_boost]
+            vr = velscale * vr_orig
+            vtheta = velscale * vtheta_orig
+            vphi = velscale * vphi_orig
+            vx, vy, vz = rtp_to_xyz(
+                vr, vtheta, vphi, x[idx_loc], y[idx_loc], z[idx_loc], r[idx_loc], R
+            )
+            vmag = np.sqrt(vx * vx + vy * vy + vz * vz)
+            eps_v = 1.0e-8
+            mask_v = vmag > eps_v
+            vhat_x = np.zeros_like(vx)
+            vhat_y = np.zeros_like(vy)
+            vhat_z = np.zeros_like(vz)
+            vhat_x[mask_v] = vx[mask_v] / vmag[mask_v]
+            vhat_y[mask_v] = vy[mask_v] / vmag[mask_v]
+            vhat_z[mask_v] = vz[mask_v] / vmag[mask_v]
+
+            k_par = (vhat_x * nx) + (vhat_y * ny) + (vhat_z * nz)
+            one_m_betak = 1.0 - (beta * k_par)
+            g = alphalapse / (gamma * one_m_betak)
+            g[~np.isfinite(g)] = 1.0
+
+            k_perp_x = nx - k_par * vhat_x
+            k_perp_y = ny - k_par * vhat_y
+            k_perp_z = nz - k_par * vhat_z
+            gamma_one_m_betak = gamma * one_m_betak
+            k_par_prime = (k_par - beta) / one_m_betak
+            k_x_prime = (k_perp_x / gamma_one_m_betak) + k_par_prime * vhat_x
+            k_y_prime = (k_perp_y / gamma_one_m_betak) + k_par_prime * vhat_y
+            k_z_prime = (k_perp_z / gamma_one_m_betak) + k_par_prime * vhat_z
+            k_prime_mag = np.sqrt(
+                k_x_prime * k_x_prime + k_y_prime * k_y_prime + k_z_prime * k_z_prime
+            )
+            khat_x_prime = k_x_prime / k_prime_mag
+            khat_y_prime = k_y_prime / k_prime_mag
+            khat_z_prime = k_z_prime / k_prime_mag
+
+            B_par = _dot(Bx, By, Bz, vhat_x, vhat_y, vhat_z)
+            Bprime_x = ((Bx - B_par * vhat_x) / gamma) + (B_par * vhat_x)
+            Bprime_y = ((By - B_par * vhat_y) / gamma) + (B_par * vhat_y)
+            Bprime_z = ((Bz - B_par * vhat_z) / gamma) + (B_par * vhat_z)
+            Bprime_x[~mask_v] = Bx[~mask_v]
+            Bprime_y[~mask_v] = By[~mask_v]
+            Bprime_z[~mask_v] = Bz[~mask_v]
+            Bprime_mag = np.sqrt(
+                Bprime_x * Bprime_x + Bprime_y * Bprime_y + Bprime_z * Bprime_z
+            )
+
+            costhetaB = (
+                (khat_x_prime * Bprime_x)
+                + (khat_y_prime * Bprime_y)
+                + (khat_z_prime * Bprime_z)
+            ) / Bprime_mag
+            sinthetaB = np.sqrt(1.0 - (costhetaB * costhetaB))
+
+            cos2chi, sin2chi = self._sky_basis_numpy(
+                gamma, beta,
+                (vhat_x, vhat_y, vhat_z),
+                (khat_x_prime, khat_y_prime, khat_z_prime),
+                (Bprime_x, Bprime_y, Bprime_z),
+                Bprime_mag,
+            )
+
+            t_c = np.abs(z[idx_loc] * rg) / (c * gamma)
+            gamma_c = (6.0 * np.pi * m_e * c) / (sigma_T * (Bprime_mag * Bprime_mag) * t_c)
+            if heating_prescription == "Poynting":
+                u_pl = h * S / (c * gamma)
+            else:
+                u_pl = h * ((Bprime_mag * Bprime_mag) / (8.0 * np.pi))
+            n_m = (((p - 2.0) * u_pl) / ((gamma_m**p) * m_e * (c * c))) * (
+                1.0 / ((gamma_m ** (2.0 - p)) - (gamma_max ** (2.0 - p)))
+            )
+            # n_e * A_norm, which is all the coefficients need; see _kernel._rtheta_chain
+            nA = np.where(gamma_c <= gamma_m, n_m * gamma_c * gamma_m, n_m * (gamma_m**p))
+
+            nup = (4.1987e-3) * Bprime_mag * sinthetaB
+            nu_nup = (frequency / g) / nup
+
+            jI, jQ, jV, aI, aQ, aV, rQ, rV = self._pol_coefficients_numpy(
+                nu_nup, nup, gamma_c, costhetaB, nA
+            )
+
+            # guard, clamp, rotate onto the sky basis and apply the invariant scalings
+            aI = np.nan_to_num(aI, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+            aI = np.maximum(aI, 0.0)
+            for arr in (jI, jQ, jV, aQ, aV, rQ, rV):
+                np.nan_to_num(arr, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+            jQ, jV = _clamp_polarized_np(jI, jQ, jV)
+            aQ, aV = _clamp_polarized_np(aI, aQ, aV)
+
+            dz = dz_1D[i]
+            g2 = g * g
+            inv_g = 1.0 / g
+            JI = g2 * jI
+            JQ = g2 * jQ * cos2chi
+            JU = g2 * jQ * sin2chi
+            JV = g2 * jV
+            AI = aI * inv_g
+            AQ = aQ * cos2chi * inv_g
+            AU = aQ * sin2chi * inv_g
+            AV = aV * inv_g
+            RQ = rQ * cos2chi * inv_g
+            RU = rQ * sin2chi * inv_g
+            RV = rV * inv_g
+
+            O_cell, c_cell = _pol_cell_operator(
+                JI, JQ, JU, JV, AI, AQ, AU, AV, RQ, RU, RV, dz
+            )
+            sub = Ocum[:, :, idx]
+            Itot[:, idx] += np.einsum("ikn,kn->in", sub, c_cell)
+            Ocum[:, :, idx] = np.einsum("ikn,kjn->ijn", sub, O_cell)
+            tau_acc_f[idx] += AI * dz
+
+            if tau_stop is not None:
+                done = tau_acc_f[idx] >= tau_stop
+                if np.any(done):
+                    working_f[idx[done]] = False
+
+        # the transfer runs in the right-handed basis (+x_im, -y_im, n); rotate onto
+        # (North, East) for output
+        Itot[1] *= _Q_SIGN
+        Itot[2] *= _U_SIGN
+        return x_im_1D, y_im_1D, Itot.reshape((4,) + x_im.shape)
+
     # function to extract physical quantities at a given (r,theta)
     def get_quantity(
         self, r, theta, quantity="Bmag", frequency=None, heating_prescription="Poynting"
@@ -2331,16 +3392,30 @@ class JetModel:
         Understood quantities: Bmag, Bx, By, Bz, Br, Btheta, Bphi,
                                Bmag_prime, Bx_prime, By_prime, Bz_prime,
                                psi, Omega, Poynting, costhetaB, gamma, beta,
-                               t_c, gamma_c, u_e, nu_p, jI, alphaI
+                               t_c, gamma_c, u_e, nu_p, jI, alphaI,
+                               cos2chi, sin2chi, EVPA,
+                               jQ, jV, alphaQ, alphaV, rhoQ, rhoV
 
-        For jI and alphaI, the frequency must be specified in GHz.
+        For jI, jQ, jV, alphaI, alphaQ, alphaV, rhoQ, rhoV and nu_p, the frequency
+        must be specified in GHz.
 
+        The polarized coefficients are the fluid-frame ones in the fluid Stokes basis
+        (the projected magnetic field along the Q axis), as used by
+        make_image_polarized; cos2chi and sin2chi rotate them into the internal
+        right-handed sky basis, in which Stokes U carries the sign opposite to the
+        image-frame U that make_image_polarized returns.  EVPA is the image-frame
+        electric-vector position angle of the local emission, in radians, measured
+        from +x_im towards +y_im.
         """
 
         # check that the frequency is provided if necessary
-        if quantity in ["jI", "alphaI", "nu_p"]:
+        if quantity in [
+            "jI", "alphaI", "nu_p", "jQ", "jV", "alphaQ", "alphaV", "rhoQ", "rhoV"
+        ]:
             if frequency is None:
-                raise Exception("For jI, alphaI, or nu_p, the frequency must be specified in GHz.")
+                raise Exception(
+                    f"For {quantity}, the frequency must be specified in GHz."
+                )
 
         # pull cached attributes into local variables
         rH = self.rH
@@ -2628,6 +3703,23 @@ class JetModel:
         if quantity == "costhetaB":
             return costhetaB
 
+        # polarization basis (see make_image_polarized for the conventions)
+        if quantity in ("cos2chi", "sin2chi", "EVPA"):
+            cos2chi, sin2chi = self._sky_basis_numpy(
+                gamma, beta,
+                (vhat_x, vhat_y, vhat_z),
+                (khat_x_prime, khat_y_prime, khat_z_prime),
+                (Bprime_x, Bprime_y, Bprime_z),
+                Bprime_mag,
+            )
+            if quantity == "cos2chi":
+                return cos2chi
+            if quantity == "sin2chi":
+                return sin2chi
+            # the local emission has j_Q > 0, so the EVPA follows from the rotation
+            # alone, referred to (North, East) exactly as the images are
+            return 0.5 * np.arctan2(_U_SIGN * sin2chi, _Q_SIGN * cos2chi)
+
         # synchrotron emissivity/absorption
         t_c = np.abs(z * rg) / (c * gamma)
         if quantity == "t_c":
@@ -2838,11 +3930,115 @@ class JetModel:
             if quantity == "alphaI":
                 return alphaI
 
+            if quantity in ("jQ", "jV", "alphaQ", "alphaV", "rhoQ", "rhoV"):
+                self._ensure_polarized_tables()
+                # n_e * A_norm is all the coefficients need; see _kernel._rtheta_chain
+                nA = np.where(
+                    gamma_c <= gamma_m, n_m * gamma_c * gamma_m, n_m * (gamma_m**p)
+                )
+                pol = self._pol_coefficients_numpy(nu_nup, nup, gamma_c, costhetaB, nA)
+                names = ("jI", "jQ", "jV", "alphaI", "alphaQ", "alphaV", "rhoQ", "rhoV")
+                return pol[names.index(quantity)]
+
         return {}
 
 
 ###################################################
 # post-processing functions
+
+
+def sky_view(x, y, image):
+    """
+    Re-orient a model image into the observer's view of the sky.
+
+    jetfuncs places the observer on the -z_im side of the image plane (photons
+    propagate along -z_im), so the proper, un-mirrored view of the sky has -x_im to
+    the right and +y_im up.  If the approaching jet then points to the left, the
+    picture is rotated by 180 degrees so that it points right; no mirror image is
+    ever taken.  This is the convention used for the figures of Pesce et al.
+
+    `image` is either a 2-D array indexed [y, x] -- intensity, brightness temperature
+    or flux -- or the (4, Ny, Nx) Stokes cube that make_image_polarized returns.
+    Returns (X, Y, D) with D[..., j, i] at display coordinates (X[i], Y[j]), X
+    increasing to the right and Y increasing upward, ready for pcolormesh.
+
+    Both steps re-label the grid rather than reflecting the data, and Stokes Q and U
+    are referred to (North, East), which the 180 degree rotation flips together and so
+    leaves unchanged.  The Stokes values therefore pass through untouched.
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    D = np.asarray(image)
+    if D.ndim == 3:
+        if D.shape[0] != 4:
+            raise ValueError(
+                f"a 3D image must have a leading Stokes axis of length 4, got {D.shape}"
+            )
+    elif D.ndim != 2:
+        raise ValueError(f"image must be 2D, or 3D with a leading Stokes axis, got {D.shape}")
+    if D.shape[-2:] != (len(y), len(x)):
+        raise ValueError(
+            f"image shape {D.shape} must end in (len(y), len(x)) = {(len(y), len(x))}"
+        )
+    X = -x[::-1]
+    Y = y.copy()
+    D = D[..., :, ::-1]
+    total = D[0] if D.ndim == 3 else D
+    if np.nansum(total * X[None, :]) < 0.0:  # approaching (brighter) jet on the left
+        D = D[..., ::-1, ::-1]
+        X = -X[::-1]
+        Y = -Y[::-1]
+    return X, Y, np.ascontiguousarray(D)
+
+
+def evpa(Q, U, *, degrees=False):
+    """
+    Electric-vector position angle of a polarized image or of an integrated Stokes
+    pair: 0.5*atan2(U, Q), measured East of North and wrapped into (-pi/2, pi/2] (or
+    (-90, 90] degrees).  Q and U must be as JetModel.make_image_polarized returns
+    them, i.e. already referred to (North, East).
+
+    In a sky-oriented panel (see sky_view) an EVPA of 0 is a vertical tick, 45 degrees
+    runs from lower right to upper left, and 90 degrees is horizontal; the tick
+    direction in display coordinates is (-sin(EVPA), cos(EVPA)).
+    """
+    chi = 0.5 * np.arctan2(np.asarray(U, dtype=float), np.asarray(Q, dtype=float))
+    return np.degrees(chi) if degrees else chi
+
+
+def polarization_fractions(IQUV, *args, degrees=False, floor=0.0):
+    """
+    Fractional linear polarization, fractional circular polarization and EVPA.
+
+    Accepts either the (4, Ny, Nx) array that make_image_polarized returns, or four
+    separate arrays (I, Q, U, V) of any common shape -- including four scalars, for
+    image-integrated quantities.  Returns (m_linear, m_circular, EVPA), with
+    m_linear = sqrt(Q^2 + U^2)/I and m_circular = V/I set to NaN wherever I <= floor.
+
+    Note that m_circular keeps the sign of V: it is positive where the fluid-frame
+    magnetic field points towards the observer.
+    """
+    if args:
+        if len(args) != 3:
+            raise ValueError(
+                "pass either one (4, ...) array or four separate arrays (I, Q, U, V); "
+                f"got 1 + {len(args)}"
+            )
+        I, Q, U, V = (np.asarray(v, dtype=float) for v in (IQUV,) + tuple(args))
+    else:
+        arr = np.asarray(IQUV, dtype=float)
+        if arr.shape[0] != 4:
+            raise ValueError(
+                f"expected a leading axis of length 4 (I, Q, U, V), got shape {arr.shape}"
+            )
+        I, Q, U, V = arr[0], arr[1], arr[2], arr[3]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        m_lin = np.sqrt(Q * Q + U * U) / I
+        m_circ = V / I
+    ok = I > floor
+    m_lin = np.where(ok, m_lin, np.nan)
+    m_circ = np.where(ok, m_circ, np.nan)
+    return m_lin, m_circ, evpa(Q, U, degrees=degrees)
 
 
 def convert_units(model, I_nu, *xy, output_units="luminosity", D=None, frequency=None):
@@ -3087,11 +4283,23 @@ def export_fits(
     x_new *= 180.0 / np.pi
     y_new *= 180.0 / np.pi
 
-    if I_new.ndim != 2:
-        raise ValueError(f"I_new must be 2D, got shape {I_new.shape}")
-    if I_new.shape != (len(y_new), len(x_new)):
+    # a (4, ny, nx) cube -- what make_image_polarized returns -- is written with a FITS
+    # STOKES axis (I = 1, Q = 2, U = 3, V = 4)
+    n_stokes = 0
+    if I_new.ndim == 3:
+        if I_new.shape[0] != 4:
+            raise ValueError(
+                f"a 3D I_new must have a leading Stokes axis of length 4, got {I_new.shape}"
+            )
+        n_stokes = 4
+    elif I_new.ndim != 2:
         raise ValueError(
-            f"I_new shape {I_new.shape} must be (len(y_new), len(x_new)) = {(len(y_new), len(x_new))}"
+            f"I_new must be 2D, or 3D with a leading Stokes axis, got shape {I_new.shape}"
+        )
+    if I_new.shape[-2:] != (len(y_new), len(x_new)):
+        raise ValueError(
+            f"I_new shape {I_new.shape} must end in (len(y_new), len(x_new)) = "
+            f"{(len(y_new), len(x_new))}"
         )
 
     # ensure uniform spacing (required for CRVAL/CDELT WCS)
@@ -3110,7 +4318,7 @@ def export_fits(
     dx = _uniform_step(x_new, "x_new")
     dy = _uniform_step(y_new, "y_new")
 
-    ny, nx = I_new.shape
+    ny, nx = I_new.shape[-2:]
 
     # reference pixel at image center (FITS is 1-indexed)
     crpix1 = (nx + 1) / 2.0
@@ -3118,14 +4326,23 @@ def export_fits(
     ix = int(np.round(crpix1 - 1))
     iy = int(np.round(crpix2 - 1))
 
-    # build linear WCS: (x_offset, y_offset)
-    w = WCS(naxis=2)
-    w.wcs.crpix = [crpix1, crpix2]
-    w.wcs.crval = [float(x_new[ix]), float(y_new[iy])]
-    w.wcs.cdelt = [dx, dy]
-    w.wcs.pc = np.eye(2)
-    w.wcs.ctype = ["XOFFSET", "YOFFSET"]
-    w.wcs.cunit = ["deg", "deg"]
+    # build linear WCS: (x_offset, y_offset), plus a Stokes axis for a cube
+    if n_stokes:
+        w = WCS(naxis=3)
+        w.wcs.crpix = [crpix1, crpix2, 1.0]
+        w.wcs.crval = [float(x_new[ix]), float(y_new[iy]), 1.0]
+        w.wcs.cdelt = [dx, dy, 1.0]
+        w.wcs.pc = np.eye(3)
+        w.wcs.ctype = ["XOFFSET", "YOFFSET", "STOKES"]
+        w.wcs.cunit = ["deg", "deg", ""]
+    else:
+        w = WCS(naxis=2)
+        w.wcs.crpix = [crpix1, crpix2]
+        w.wcs.crval = [float(x_new[ix]), float(y_new[iy])]
+        w.wcs.cdelt = [dx, dy]
+        w.wcs.pc = np.eye(2)
+        w.wcs.ctype = ["XOFFSET", "YOFFSET"]
+        w.wcs.cunit = ["deg", "deg"]
 
     header = w.to_header()
 

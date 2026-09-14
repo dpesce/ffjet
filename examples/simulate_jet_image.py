@@ -86,6 +86,27 @@ model = jf.JetModel(
 x, y, I_nu = model.make_image(frequency, show_progress=True)
 
 ###################################################
+# re-orient into the observer's view of the sky
+
+###################################
+# jetfuncs places the observer on #
+# the -z side of the image plane, #
+# so plotting (x, y) directly     #
+# would give a MIRROR of the sky. #
+# sky_view() re-orients the image #
+# so that north is up, east is to #
+# the left, and the approaching   #
+# jet points to the right.  It    #
+# re-labels the grid rather than  #
+# reflecting the data, so the     #
+# intensities pass through it     #
+# unchanged.  Everything below is #
+# in this sky orientation.        #
+###################################
+
+x, y, I_nu = jf.sky_view(x, y, I_nu)
+
+###################################################
 # convert image units
 
 ###################################
@@ -117,9 +138,10 @@ fig = plt.figure(figsize=(4, 4))
 ax = fig.add_axes([0.1, 0.1, 0.8, 0.8])
 cax = fig.add_axes([0.91, 0.1, 0.02, 0.8])
 ax.set_facecolor("black")
+ax.set_aspect("equal")
 vmax = 10.5
 vmin = vmax - 3.0
-pc = ax.pcolormesh(x, y, np.log10(Tb)[::-1, :], cmap="afmhot", vmax=vmax, vmin=vmin)
+pc = ax.pcolormesh(x, y, np.log10(Tb), cmap="afmhot", vmax=vmax, vmin=vmin)
 ax.set_xlabel(r"$x$ ($r_g$)")
 ax.set_ylabel(r"$y$ ($r_g$)")
 plt.colorbar(pc, cax=cax, label=r"$\log(T_b)$")
@@ -128,6 +150,9 @@ plt.close()
 
 ###################################################
 # export the image as a FITS file
+#
+# the image is written in the sky orientation, so that it can be compared with an
+# observed image directly
 
 jf.export_fits("jet_image.fits", Snu_Jy, x, y, observing_frequency_hz=230.0e9, bunit="Jy/pix")
 
