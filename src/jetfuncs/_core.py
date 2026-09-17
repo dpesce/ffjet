@@ -4320,17 +4320,19 @@ def export_fits(
 
     ny, nx = I_new.shape[-2:]
 
-    # reference pixel at image center (FITS is 1-indexed)
+    # reference pixel at image center (FITS is 1-indexed), and the coordinate at that
+    # point; for an even number of pixels the center falls halfway between two pixel
+    # centers, so the value comes from the uniform grid rather than from the nearest pixel
     crpix1 = (nx + 1) / 2.0
     crpix2 = (ny + 1) / 2.0
-    ix = int(np.round(crpix1 - 1))
-    iy = int(np.round(crpix2 - 1))
+    crval1 = float(x_new[0] + (crpix1 - 1.0) * dx)
+    crval2 = float(y_new[0] + (crpix2 - 1.0) * dy)
 
     # build linear WCS: (x_offset, y_offset), plus a Stokes axis for a cube
     if n_stokes:
         w = WCS(naxis=3)
         w.wcs.crpix = [crpix1, crpix2, 1.0]
-        w.wcs.crval = [float(x_new[ix]), float(y_new[iy]), 1.0]
+        w.wcs.crval = [crval1, crval2, 1.0]
         w.wcs.cdelt = [dx, dy, 1.0]
         w.wcs.pc = np.eye(3)
         w.wcs.ctype = ["XOFFSET", "YOFFSET", "STOKES"]
@@ -4338,7 +4340,7 @@ def export_fits(
     else:
         w = WCS(naxis=2)
         w.wcs.crpix = [crpix1, crpix2]
-        w.wcs.crval = [float(x_new[ix]), float(y_new[iy])]
+        w.wcs.crval = [crval1, crval2]
         w.wcs.cdelt = [dx, dy]
         w.wcs.pc = np.eye(2)
         w.wcs.ctype = ["XOFFSET", "YOFFSET"]

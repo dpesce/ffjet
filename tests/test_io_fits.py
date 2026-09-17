@@ -63,3 +63,31 @@ def test_export_fits_rejects_nonuniform_grid(tmp_path):
     out = tmp_path / "bad.fits"
     with pytest.raises(ValueError, match="not uniformly spaced"):
         jf.export_fits(out, I_nu, x.copy(), y.copy())
+
+
+@pytest.mark.parametrize("cube", [False, True])
+@pytest.mark.parametrize("nx, ny", [(5, 7), (6, 7), (5, 8), (6, 8)])
+def test_export_fits_wcs_gives_every_pixel_its_own_centre(tmp_path, nx, ny, cube):
+    # The reference pixel sits at the image centre, which for an even number of pixels
+    # falls halfway between two pixel centres; the WCS must still map every pixel to its
+    # own centre.  The grid is deliberately offset from zero and different along x and y.
+    from astropy.wcs import WCS
+
+    x = -3.0e-6 + (np.arange(nx) + 0.5) * 1.0e-6
+    y = -2.0e-6 + (np.arange(ny) + 0.5) * 0.5e-6
+    image = np.zeros((4, ny, nx)) if cube else np.zeros((ny, nx))
+
+    out = tmp_path / "wcs.fits"
+    jf.export_fits(out, image, x, y)
+
+    with fits.open(out) as hdul:
+        w = WCS(hdul[0].header)
+    i, j = np.meshgrid(np.arange(nx), np.arange(ny))
+    if cube:
+        wx, wy, _ = w.wcs_pix2world(i, j, np.zeros_like(i), 0)
+    else:
+        wx, wy = w.wcs_pix2world(i, j, 0)
+
+    deg = 180.0 / np.pi
+    assert np.allclose(wx, x[None, :] * deg, rtol=0.0, atol=1.0e-6 * 1.0e-6 * deg)
+    assert np.allclose(wy, y[:, None] * deg, rtol=0.0, atol=1.0e-6 * 0.5e-6 * deg)
