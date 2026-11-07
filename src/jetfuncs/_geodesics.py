@@ -212,26 +212,115 @@ def state_in_step(traj, k, t, a):
 
 
 @njit(cache=True, inline="always")
-def _in_step(traj, k, target, a):
-    """The state at affine parameter target, known to lie in step k (Newton on Hermite)."""
-    l0 = traj[4, k]
-    l1 = traj[4, k + 1]
+def wu_in_step(traj, k, t):
+    """(w, u) at fraction t of step k: the values of state_in_step, without the rest."""
+    h = traj[5, k + 1] - traj[5, k]
+    t2 = t * t
+    t3 = t2 * t
+    c00 = 2.0 * t3 - 3.0 * t2 + 1.0
+    c10 = t3 - 2.0 * t2 + t
+    c01 = -2.0 * t3 + 3.0 * t2
+    c11 = t3 - t2
+    w = c00 * traj[0, k] + c10 * h * traj[2, k] + c01 * traj[0, k + 1] + c11 * h * traj[2, k + 1]
+    u = c00 * traj[1, k] + c10 * h * traj[3, k] + c01 * traj[1, k + 1] + c11 * h * traj[3, k + 1]
+    return w, u
+
+
+@njit(cache=True, inline="always")
+def step_affine(traj, k, a):
+    """
+    What the interpolation of the affine parameter over step k needs: its values at the
+    ends, and d lambda/d tau = Sigma at the ends times the step's Mino-time length.
+    """
+    h = traj[5, k + 1] - traj[5, k]
+    s0 = 1.0 / (traj[0, k] ** 2) + a * a * traj[1, k] ** 2
+    s1 = 1.0 / (traj[0, k + 1] ** 2) + a * a * traj[1, k + 1] ** 2
+    return traj[4, k], traj[4, k + 1], h * s0, h * s1
+
+
+@njit(cache=True, inline="always")
+def newton_t(target, l0, l1, s0h, s1h, t):
+    """
+    The fraction t of a step at which the Hermite interpolant of the affine parameter
+    equals target, by Newton's method from the guess t; returns t and d lambda/dt there.
+    The affine parameter grows to ~r_start along a ray, so its residual cannot fall below
+    a few units in the last place of target (1.2e-7 rg near 1e9); iterating stops there,
+    after 1-3 iterations.
+    """
+    tol = 1.0e-15 * abs(target)
+    dla = 0.0
+    for _ in range(8):
+        t2 = t * t
+        t3 = t2 * t
+        err = ((2.0 * t3 - 3.0 * t2 + 1.0) * l0 + (t3 - 2.0 * t2 + t) * s0h
+               + (-2.0 * t3 + 3.0 * t2) * l1 + (t3 - t2) * s1h) - target
+        dla = ((6.0 * t2 - 6.0 * t) * l0 + (3.0 * t2 - 4.0 * t + 1.0) * s0h
+               + (-6.0 * t2 + 6.0 * t) * l1 + (3.0 * t2 - 2.0 * t) * s1h)
+        if abs(err) <= tol or not dla > 0.0:
+            break
+        t -= err / dla
+        if t < 0.0:
+            t = 0.0
+        if t > 1.0:
+            t = 1.0
+    return t, dla
+
+
+@njit(cache=True, inline="always")
+def _cubic(t, f0, d0, f1, d1):
+    """The cubic Hermite value at fraction t, with end slopes d0, d1 per unit t."""
+    t2 = t * t
+    t3 = t2 * t
+    return ((2.0 * t3 - 3.0 * t2 + 1.0) * f0 + (t3 - 2.0 * t2 + t) * d0
+            + (-2.0 * t3 + 3.0 * t2) * f1 + (t3 - t2) * d1)
+
+
+@njit(cache=True, inline="always")
+def w_max_in_step(traj, k):
+    """
+    The largest w = 1/r on step k: the maximum of the cubic Hermite interpolant
+    (wu_in_step) over the step, at an end or where its derivative vanishes.
+    """
+    h = traj[5, k + 1] - traj[5, k]
+    w0 = traj[0, k]
+    w1 = traj[0, k + 1]
+    d0 = h * traj[2, k]
+    d1 = h * traj[2, k + 1]
+    wm = w0 if w0 > w1 else w1
+    # dw/dt = A t^2 + B t + C
+    A = 6.0 * w0 + 3.0 * d0 - 6.0 * w1 + 3.0 * d1
+    B = -6.0 * w0 - 4.0 * d0 + 6.0 * w1 - 2.0 * d1
+    C = d0
+    if A != 0.0:
+        disc = B * B - 4.0 * A * C
+        if disc >= 0.0:
+            sq = math.sqrt(disc)
+            for root in ((-B + sq) / (2.0 * A), (-B - sq) / (2.0 * A)):
+                if 0.0 < root < 1.0:
+                    wm = max(wm, _cubic(root, w0, d0, w1, d1))
+    elif B != 0.0:
+        root = -C / B
+        if 0.0 < root < 1.0:
+            wm = max(wm, _cubic(root, w0, d0, w1, d1))
+    return wm
+
+
+@njit(cache=True, inline="always")
+def linear_t(target, l0, l1):
+    """The linear guess of the fraction of a step at which the affine parameter is target."""
     t = (target - l0) / (l1 - l0) if l1 > l0 else 0.0
     if t < 0.0:
         t = 0.0
     if t > 1.0:
         t = 1.0
-    h = traj[5, k + 1] - traj[5, k]
-    s0 = 1.0 / (traj[0, k] ** 2) + a * a * traj[1, k] ** 2
-    s1 = 1.0 / (traj[0, k + 1] ** 2) + a * a * traj[1, k + 1] ** 2
-    for _ in range(4):
-        la, dla = _hermite(t, h, l0, s0, l1, s1)
-        dt = (la - target) / (dla * h) if dla > 0.0 else 0.0
-        t -= dt
-        if t < 0.0:
-            t = 0.0
-        if t > 1.0:
-            t = 1.0
+    return t
+
+
+@njit(cache=True, inline="always")
+def _in_step(traj, k, target, a):
+    """The state at affine parameter target, known to lie in step k (Newton on Hermite)."""
+    l0, l1, s0h, s1h = step_affine(traj, k, a)
+    t, _ = newton_t(target, l0, l1, s0h, s1h, linear_t(target, l0, l1))
     w, u, pw, pu, _ = state_in_step(traj, k, t, a)
     return w, u, pw, pu
 

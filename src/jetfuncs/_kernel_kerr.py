@@ -162,18 +162,6 @@ def _kerr_inside(w, u, r_min, nu, inv_rHnu, omc_fp_cut):
 
 
 @njit(cache=True, inline="always")
-def _inside_scan(traj, n, kk, target, a_geo, r_min, nu, inv_rHnu, omc_fp_cut):
-    """
-    Whether the ray is inside the jet at affine parameter target, for targets in
-    increasing order; returns (kk, inside, w).
-    """
-    if target < traj[4, 0] or target > traj[4, n - 1]:
-        return kk, False, 1.0                   # not on the ray: beyond its start or end
-    kk, w, u, pw, pu = geo.locate(traj, n, kk, target, a_geo)
-    return kk, _kerr_inside(w, u, r_min, nu, inv_rHnu, omc_fp_cut), w
-
-
-@njit(cache=True, inline="always")
 def _inside_at(traj, n, target, a_geo, r_min, nu, inv_rHnu, omc_fp_cut):
     """Whether the ray is inside the jet at an arbitrary affine parameter target."""
     if target < traj[4, 0] or target > traj[4, n - 1]:
@@ -223,25 +211,62 @@ def jet_segments_kerr(x_im_f, y_im_f, z_im_1D, P, G, max_int, bufs):
         lJ = geo.closest_approach_to_axis(traj, n, a_geo)
         lamJ[pix] = lJ
         status_out[pix] = status
+        la_first = traj[4, 0]
+        la_last = traj[4, n - 1]
+        # The scan points come in increasing order, many to a step of the ray.  Per step,
+        # the interpolation data are fetched once, and so is a bound below which no point
+        # of the step can be inside the jet: inside means 1 - |cos theta| <= (rH w)^nu,
+        # which is largest where w is, so a point with 1 - |cos theta| above (rH w_max)^nu
+        # is outside, with no pow.  Within a step, Newton starts from the previous point's
+        # solution, carried forward with the slope found there.
         kk = 0
+        k_data = -1
+        l0 = 0.0
+        l1 = 0.0
+        s0h = 0.0
+        s1h = 0.0
+        t = 0.0
+        dla = 0.0
+        target_prev = 0.0
+        omc_out = 0.0
         k = 0
         cnt = 0
         rm = 0.0
+        prev_in = False
         prev_s = z_im_1D[0]
-        kk, prev_in, w = _inside_scan(traj, n, kk, lJ + prev_s, a_geo, r_min, nu, inv_rHnu, omc_fp_cut)
-        if prev_in:
-            rm = max(rm, 1.0 / w)
         s_in = prev_s
         cell_in = 0
-        for j in range(1, nscan):
+        for j in range(nscan):
             # scan point j: cell edge j/2 for even j, the center of cell (j-1)/2 for odd j
             if j % 2 == 0:
                 s = z_im_1D[j // 2]
             else:
                 s = 0.5 * (z_im_1D[j // 2] + z_im_1D[j // 2 + 1])
-            kk, now_in, w = _inside_scan(traj, n, kk, lJ + s, a_geo, r_min, nu, inv_rHnu, omc_fp_cut)
-            if now_in:
-                rm = max(rm, 1.0 / w)
+            target = lJ + s
+            now_in = False
+            if la_first <= target <= la_last:      # on the ray, not beyond its start or end
+                while kk < n - 2 and traj[4, kk + 1] < target:
+                    kk += 1
+                if kk != k_data:
+                    k_data = kk
+                    l0, l1, s0h, s1h = geo.step_affine(traj, kk, a_geo)
+                    t = geo.linear_t(target, l0, l1)
+                    omc_out = (rH * geo.w_max_in_step(traj, kk)) ** nu * (1.0 + 1.0e-9)
+                elif dla > 0.0:
+                    t += (target - target_prev) / dla
+                    if t > 1.0:
+                        t = 1.0
+                t, dla = geo.newton_t(target, l0, l1, s0h, s1h, t)
+                target_prev = target
+                w, u = geo.wu_in_step(traj, kk, t)
+                if 1.0 - abs(u) <= omc_out:
+                    now_in = _kerr_inside(w, u, r_min, nu, inv_rHnu, omc_fp_cut)
+                    if now_in:
+                        rm = max(rm, 1.0 / w)
+            if j == 0:
+                prev_in = now_in
+                prev_s = s
+                continue
             if now_in != prev_in:
                 lo = prev_s
                 hi = s
@@ -255,7 +280,7 @@ def jet_segments_kerr(x_im_f, y_im_f, z_im_1D, P, G, max_int, bufs):
                         hi = mid
                 crossing = 0.5 * (lo + hi)
                 target = lJ + crossing
-                if traj[4, 0] <= target <= traj[4, n - 1]:
+                if la_first <= target <= la_last:
                     rm = max(rm, 1.0 / geo.state_at(traj, n, target, a_geo)[0])
                 cell = (j - 1) // 2  # the cell that holds [scan point j-1, scan point j]
                 if now_in:

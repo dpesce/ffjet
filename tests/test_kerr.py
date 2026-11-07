@@ -287,6 +287,49 @@ def test_kerr_images_converge_in_the_geodesic_step():
 
 
 @numba_only
+@pytest.mark.parametrize("name", list(CONFIGS))
+def test_kerr_segments_agree_with_the_jet_criterion(name):
+    """
+    Every scan point (cell edge and center) of every ray is inside the jet exactly when it
+    lies in one of the ray's segments.  The criterion is evaluated here the plain way, at
+    each point (state_at, then _kerr_inside), without the scan's shortcuts: the cached
+    steps, the carried Newton guess and the bound that skips points far outside.  Points
+    within 1e-5 rg of a segment end are not judged (the ends are found to ~1e-6 rg at
+    lambda ~ 1e9).
+    """
+    model = jf.JetModel(**CONFIGS[name], geometry="kerr")
+    iv = model._get_intervals()
+    G = iv["G"]
+    r_min = model.rH * (1.0 + 1.0e-2)
+    inv_rHnu = model.rH ** (-model.nu)
+    cut = model.jet_cutout_fraction
+    omc_fp_cut = cut * cut if cut > 0.0 else -1.0
+    z = model.z_im_1D
+    scan = np.empty(2 * z.size - 1)
+    scan[0::2] = z
+    scan[1::2] = 0.5 * (z[1:] + z[:-1])
+    traj = np.empty((6, geo.MAX_STEPS))
+    judged = 0
+    for pix in range(model.x_im_f.size):
+        n, status, lam, eta = geo.trace(-model.y_im_f[pix], -model.x_im_f[pix], G[KK.G_M], G[KK.G_A],
+                                        G[KK.G_THETA_O], G[KK.G_R0], G[KK.G_EPS], G[KK.G_WCAP], traj)
+        k = iv["nint"][pix]
+        ends = np.concatenate([iv["seg_in"][pix, :k], iv["seg_out"][pix, :k]])
+        for s in scan:
+            target = iv["lamJ"][pix] + s
+            inside = False
+            if traj[4, 0] <= target <= traj[4, n - 1]:
+                w, u, pw, pu = geo.state_at(traj, n, target, G[KK.G_A])
+                inside = KK._kerr_inside(w, u, r_min, model.nu, inv_rHnu, omc_fp_cut)
+            if k and np.min(np.abs(ends - s)) < 1.0e-5:
+                continue
+            in_segment = bool(np.any((iv["seg_in"][pix, :k] <= s) & (s <= iv["seg_out"][pix, :k])))
+            assert inside == in_segment, (pix, s)
+            judged += 1
+    assert judged > 0.99 * model.x_im_f.size * scan.size
+
+
+@numba_only
 def test_rays_inside_the_shadow_end_on_the_horizon():
     """
     Every ray of the log grid either escapes or is captured, and the captured ones are
