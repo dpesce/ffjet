@@ -109,8 +109,6 @@ The jet itself is unchanged: its fields, flow, electrons, synchrotron coefficien
 
 The cells of a ray are laid out on the same depth grid as in flat mode, in affine parameter about the ray's closest approach to the jet axis, and cut at the jet boundary.  Both back ends, `precompute_state` and `build_field_table` work in Kerr mode.  It requires numba even with `backend="numpy"`, which takes the rays from the compiled tracer and does the physics and the transfer itself.  The line of sight must be away from the jet axis (`|sin(inc)| >= 1e-6`).  `get_quantity` evaluates its direction-dependent quantities for the straight line of sight.  See [examples/simulate_jet_image_kerr.py](./examples/simulate_jet_image_kerr.py).
 
-In the core of an M87-like model (`inc = 17`, `a = 0.6`; a 240 x 160 r_g window of 1 r_g pixels, `Nz = 12800`), the Kerr rays raise the total intensity by 13% at 43 GHz and 24% at 86 GHz and the circular polarization by 16% and 44%, while the fraction of linear polarization falls by 10% and 19%.  A Kerr image of that window takes 1.2-1.3x as long as a flat one (20 s against 16 s on 10 cores), and locating the rays' jet segments, once per model, 22 s against 5 s.
-
 The tracer and the Kerr path are checked in `tests/test_geodesics.py` and `tests/test_kerr.py`: against the post-Newtonian deflection of light, Bardeen's shadow and a direct integration of parallel transport; against the flat model, which the Kerr path reproduces to ~1e-6 when its rays are made straight; and against the reflection symmetry of the model and convergence in the integration step.
 
 ## Citing ffjet
