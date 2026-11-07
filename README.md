@@ -57,7 +57,9 @@ The radiative transfer has two interchangeable back ends, selected with the `bac
 - `backend="numba"` (the default whenever [numba](https://numba.pydata.org/) is installed): a compiled kernel that integrates each line of sight through the cells that lie inside the jet, running rays in parallel across all cores.  The very first call on a given machine compiles the kernel (~5-10 s); the compiled code is cached on disk, so later sessions start in under a second.  The number of threads can be set with `jetfuncs.set_num_threads(n)`.
 - `backend="numpy"`: the original vectorized loop over depth slices.  It is an order of magnitude slower and is kept as the reference implementation; the two back ends agree to floating-point roundoff.
 
-When computing many frequencies on the same model (e.g. an SED), call `model.precompute_state()` once after constructing the model.  This stores the frequency-independent physics of every jet cell (44 bytes per cell; the call returns the memory used), after which each `make_image` call only evaluates the synchrotron coefficients and the transfer integral -- roughly 3x faster again than the compiled kernel alone.  Use `model.clear_state()` to release the memory.  `model.precompute_state(polarized=True)` stores four further quantities per cell (76 bytes per cell) so that `make_image_polarized` can use the cached path as well; the extra state is a superset, and `make_image` reads the same arrays.
+Each line of sight is cut at the jet boundary: the segments of the ray that lie inside the jet are located once per model (by bisection, to roundoff), and a depth-grid cell that the boundary cuts counts only its part inside the jet.  Earlier versions counted whole cells by their centers, so the path length inside the jet jumped by up to a cell from one pixel to the next; in the outer jet of an M87-like model at 43 GHz this left Stokes U off by 13% rms per pixel at `Nz = 1600` and by 1.6% at `Nz = 12800`, against 0.03% now at `Nz = 1600`.
+
+When computing many frequencies on the same model (e.g. an SED), call `model.precompute_state()` once after constructing the model.  This stores the frequency-independent physics of every jet cell (48 bytes per cell; the call returns the memory used), after which each `make_image` call only evaluates the synchrotron coefficients and the transfer integral -- roughly 3x faster again than the compiled kernel alone.  Use `model.clear_state()` to release the memory.  `model.precompute_state(polarized=True)` stores four further quantities per cell (80 bytes per cell) so that `make_image_polarized` can use the cached path as well; the extra state is a superset, and `make_image` reads the same arrays.
 
 For single images, `model.build_field_table()` tabulates the axisymmetric part of the physics (fields, velocities, cooling, electron normalization) once on a 2-D grid and interpolates it per cell, which makes the compiled kernel about 1.8x faster at the price of a small, controlled interpolation error (total flux ~1e-5, per-pixel 99th percentile ~1e-4 with the default grid; see the docstring for measured values at other resolutions).  It also speeds up `precompute_state()`.  This mode is opt-in; `model.clear_field_table()` returns to the exact kernel.
 
@@ -89,6 +91,27 @@ The Faraday rotativities are selected with the `rotativities` argument of `JetMo
 - `rotativities="none"`: emission and absorption only.
 
 A polarized image costs about 1.7x an unpolarized one with the default `"HS11"` rotativities, 1.8x with `"JO77"` and 1.4x with `"none"` (measured on a 120x120x400 grid, 0.77M jet cells).
+
+## Kerr geodesics
+
+By default the rays are straight lines of sight (`geometry="flat"`).  With `geometry="kerr"`, each ray is instead traced backwards from a distant observer along a null geodesic of the Kerr metric with the model's spin:
+
+```python
+    model = jf.JetModel(..., geometry="kerr")
+    x, y, IQUV = model.make_image_polarized(86.0)
+```
+
+The jet itself is unchanged: its fields, flow, electrons, synchrotron coefficients and transfer were already computed in the Kerr metric.  What the ray geometry adds is:
+
+- light bending: rays that pass near the hole are deflected toward it, so the bright base of the jet appears magnified, and rays inside the shadow end on the horizon;
+- the photon's direction and energy in the frame of the local zero-angular-momentum observers, the frame the flow and field are given in, so that the redshift includes frame dragging;
+- the polarization basis, carried along each ray by parallel transport (through its Walker-Penrose constant).
+
+The cells of a ray are laid out on the same depth grid as in flat mode, in affine parameter about the ray's closest approach to the jet axis, and cut at the jet boundary.  Both back ends, `precompute_state` and `build_field_table` work in Kerr mode.  It requires numba even with `backend="numpy"`, which takes the rays from the compiled tracer and does the physics and the transfer itself.  The line of sight must be away from the jet axis (`|sin(inc)| >= 1e-6`).  `get_quantity` evaluates its direction-dependent quantities for the straight line of sight.  See [examples/simulate_jet_image_kerr.py](./examples/simulate_jet_image_kerr.py).
+
+In the core of an M87-like model (`inc = 17`, `a = 0.6`; a 240 x 160 r_g window of 1 r_g pixels, `Nz = 12800`), the Kerr rays raise the total intensity by 13% at 43 GHz and 24% at 86 GHz and the circular polarization by 16% and 44%, while the fraction of linear polarization falls by 10% and 19%.  A Kerr image of that window takes 1.2-1.3x as long as a flat one (20 s against 16 s on 10 cores), and locating the rays' jet segments, once per model, 22 s against 5 s.
+
+The tracer and the Kerr path are checked in `tests/test_geodesics.py` and `tests/test_kerr.py`: against the post-Newtonian deflection of light, Bardeen's shadow and a direct integration of parallel transport; against the flat model, which the Kerr path reproduces to ~1e-6 when its rays are made straight; and against the reflection symmetry of the model and convergence in the integration step.
 
 ## Citing ffjet
 

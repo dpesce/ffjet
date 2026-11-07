@@ -67,7 +67,6 @@ import numpy as np
 from numba import njit, prange
 
 from ._kernel import (  # noqa: F401  (re-exported for the polarized drivers)
-    N_TAB,
     P_COS_I,
     P_ETA,
     P_GAMMA_M,
@@ -88,12 +87,11 @@ from ._kernel import (  # noqa: F401  (re-exported for the polarized drivers)
     P_P,
     P_PETA,
     P_PHI_NORM,
-    P_RH,
+    P_RG,
     P_ROT_SCHEME,
     P_RTAB_INVDLOGX,
     P_RTAB_KMAX,
     P_RTAB_LOGX0,
-    P_S,
     P_SIN_I,
     P_TAB_INVDLOGX,
     P_TAB_KMAX,
@@ -101,8 +99,9 @@ from ._kernel import (  # noqa: F401  (re-exported for the polarized drivers)
     P_TAIL_C,
     P_X_TAIL,
     _G_bracket,
-    _cont,
+    _cell_overlap,
     _rtheta_chain,
+    _rtheta_tab,
 )
 from ._rotativities import (
     HS11_Q_PREFAC,
@@ -395,8 +394,6 @@ def _cell_state_tab_pol(xi, yi, zJ, zi, P, Tup, Tlo, logr0, invdlogr, nr, invdu,
     """As _cell_state_pol, with the (r,theta)-only part interpolated from the field table."""
     cos_i = P[P_COS_I]
     sin_i = P[P_SIN_I]
-    rH = P[P_RH]
-    s = P[P_S]
     z_im_now = zi + zJ
     x = (xi * cos_i) + (z_im_now * sin_i)
     y = yi
@@ -405,39 +402,12 @@ def _cell_state_tab_pol(xi, yi, zJ, zi, P, Tup, Tlo, logr0, invdlogr, nr, invdu,
     r = math.sqrt(R2 + (z * z))
     R = math.sqrt(R2)
     omc = R2 / (r * (r + abs(z)))
-    r_rH_1_s = (r / rH) ** (1.0 - s)
-    u = r_rH_1_s * math.sqrt(omc)
-    T = Tup if z >= 0.0 else Tlo
-    fr = (math.log10(r - rH) - logr0) * invdlogr
-    if fr < 0.0:
-        fr = 0.0
-    if fr > nr - 1.0000001:
-        fr = nr - 1.0000001
-    ir = int(fr)
-    tr = fr - ir
-    fu = u * invdu
-    if fu < 0.0:
-        fu = 0.0
-    if fu > nu_ - 1.0000001:
-        fu = nu_ - 1.0000001
-    iu = int(fu)
-    tu = fu - iu
-    w00 = (1.0 - tr) * (1.0 - tu)
-    w01 = (1.0 - tr) * tu
-    w10 = tr * (1.0 - tu)
-    w11 = tr * tu
-    q = np.empty(N_TAB)
-    for k in range(N_TAB):
-        q[k] = (
-            w00 * T[ir, iu, k]
-            + w01 * T[ir, iu + 1, k]
-            + w10 * T[ir + 1, iu, k]
-            + w11 * T[ir + 1, iu + 1, k]
-        )
-    inv_cont = 1.0 / _cont(q[9], P)
+    sgn = 1.0 if z >= 0.0 else -1.0
+    vr, vt, vp, gamma, alpha, Bpr, Bpt, Bpp, Bpm, gc, Kj, Ka = _rtheta_tab(
+        r, omc, sgn, P, Tup, Tlo, logr0, invdlogr, nr, invdu, nu_
+    )
     return _ray_part_pol(
-        x, y, z, r, R, q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7], q[9],
-        q[10] * inv_cont, q[11] * inv_cont, P
+        x, y, z, r, R, vr, vt, vp, gamma, alpha, Bpr, Bpt, Bpp, gc, Kj, Ka, P
     )
 
 
@@ -1126,12 +1096,18 @@ def _pol_ray_store(out, pix, Itot):
 
 
 # ----------------------------------------------------------------------------- drivers
+#
+# As in _kernel.py, every driver walks a ray's jet segments front to back and, within each,
+# the grid cells the segment overlaps, evaluating each on its overlap with the jet.
+
+
 @njit(cache=True, parallel=True)
 def rt_kernel_pol(
-    frequency, order, x_im_f, y_im_f, z_J_f, z_mid_1D, dz_1D, starts, ends, nint,
+    frequency, order, x_im_f, y_im_f, z_J_f, z_im_1D, seg_in, seg_out, c_lo, c_hi, nint,
     P, xs_tab, rs_tab, ts_tab, as_tab, TAB, RTAB, tau_stop, out,
 ):
     """Full polarized computation for one frequency; state and coefficients on the fly."""
+    rg = P[P_RG]
     Npix = order.shape[0]
     for q in prange(Npix):
         pix = order[q]
@@ -1149,14 +1125,17 @@ def rt_kernel_pol(
         for k in range(nint[pix]):
             if done:
                 break
-            for i in range(starts[pix, k], ends[pix, k]):
+            s_in = seg_in[pix, k]
+            s_out = seg_out[pix, k]
+            for i in range(c_lo[pix, k], c_hi[pix, k] + 1):
+                zi, ds = _cell_overlap(z_im_1D, i, s_in, s_out, rg)
                 g, nup, gc, Cj, Ca, cth, Kap, c2, s2 = _cell_state_pol(
-                    xi, yi, zJ, z_mid_1D[i], P, xs_tab, rs_tab, ts_tab, as_tab
+                    xi, yi, zJ, zi, P, xs_tab, rs_tab, ts_tab, as_tab
                 )
                 jI, jQ, jV, aI, aQ, aV, rQ, rV = _cell_emis_pol(
                     frequency, g, nup, gc, Cj, Ca, cth, Kap, P, TAB, RTAB
                 )
-                tau += _pol_cell(jI, jQ, jV, aI, aQ, aV, rQ, rV, c2, s2, g, dz_1D[i], O, cv)
+                tau += _pol_cell(jI, jQ, jV, aI, aQ, aV, rQ, rV, c2, s2, g, ds, O, cv)
                 _pol_accumulate(Itot, Ocum, O, cv, tmp)
                 if tau_stop > 0.0 and tau >= tau_stop:
                     done = True
@@ -1166,10 +1145,11 @@ def rt_kernel_pol(
 
 @njit(cache=True, parallel=True)
 def rt_kernel_tab_pol(
-    frequency, order, x_im_f, y_im_f, z_J_f, z_mid_1D, dz_1D, starts, ends, nint,
+    frequency, order, x_im_f, y_im_f, z_J_f, z_im_1D, seg_in, seg_out, c_lo, c_hi, nint,
     P, Tup, Tlo, logr0, invdlogr, nr, invdu, nu_, TAB, RTAB, tau_stop, out,
 ):
     """As rt_kernel_pol, with the (r,theta)-only physics from the field table."""
+    rg = P[P_RG]
     Npix = order.shape[0]
     for q in prange(Npix):
         pix = order[q]
@@ -1187,14 +1167,17 @@ def rt_kernel_tab_pol(
         for k in range(nint[pix]):
             if done:
                 break
-            for i in range(starts[pix, k], ends[pix, k]):
+            s_in = seg_in[pix, k]
+            s_out = seg_out[pix, k]
+            for i in range(c_lo[pix, k], c_hi[pix, k] + 1):
+                zi, ds = _cell_overlap(z_im_1D, i, s_in, s_out, rg)
                 g, nup, gc, Cj, Ca, cth, Kap, c2, s2 = _cell_state_tab_pol(
-                    xi, yi, zJ, z_mid_1D[i], P, Tup, Tlo, logr0, invdlogr, nr, invdu, nu_
+                    xi, yi, zJ, zi, P, Tup, Tlo, logr0, invdlogr, nr, invdu, nu_
                 )
                 jI, jQ, jV, aI, aQ, aV, rQ, rV = _cell_emis_pol(
                     frequency, g, nup, gc, Cj, Ca, cth, Kap, P, TAB, RTAB
                 )
-                tau += _pol_cell(jI, jQ, jV, aI, aQ, aV, rQ, rV, c2, s2, g, dz_1D[i], O, cv)
+                tau += _pol_cell(jI, jQ, jV, aI, aQ, aV, rQ, rV, c2, s2, g, ds, O, cv)
                 _pol_accumulate(Itot, Ocum, O, cv, tmp)
                 if tau_stop > 0.0 and tau >= tau_stop:
                     done = True
@@ -1204,10 +1187,11 @@ def rt_kernel_tab_pol(
 
 @njit(cache=True, parallel=True)
 def precompute_state_pol(
-    order, offsets, x_im_f, y_im_f, z_J_f, z_mid_1D, starts, ends, nint,
-    P, xs_tab, rs_tab, ts_tab, as_tab, st, st_iz,
+    order, offsets, x_im_f, y_im_f, z_J_f, z_im_1D, seg_in, seg_out, c_lo, c_hi, nint,
+    P, xs_tab, rs_tab, ts_tab, as_tab, st, st_ds,
 ):
-    """Store the frequency-independent polarized state of every jet cell, ray by ray."""
+    """Store the frequency-independent polarized state and path length of every jet cell."""
+    rg = P[P_RG]
     Npix = order.shape[0]
     for q in prange(Npix):
         pix = order[q]
@@ -1216,9 +1200,12 @@ def precompute_state_pol(
         yi = y_im_f[pix]
         zJ = z_J_f[pix]
         for k in range(nint[pix]):
-            for i in range(starts[pix, k], ends[pix, k]):
+            s_in = seg_in[pix, k]
+            s_out = seg_out[pix, k]
+            for i in range(c_lo[pix, k], c_hi[pix, k] + 1):
+                zi, ds = _cell_overlap(z_im_1D, i, s_in, s_out, rg)
                 g, nup, gc, Cj, Ca, cth, Kap, c2, s2 = _cell_state_pol(
-                    xi, yi, zJ, z_mid_1D[i], P, xs_tab, rs_tab, ts_tab, as_tab
+                    xi, yi, zJ, zi, P, xs_tab, rs_tab, ts_tab, as_tab
                 )
                 st[0, o] = g
                 st[1, o] = nup
@@ -1229,16 +1216,17 @@ def precompute_state_pol(
                 st[6, o] = Kap
                 st[7, o] = c2
                 st[8, o] = s2
-                st_iz[o] = i
+                st_ds[o] = ds
                 o += 1
 
 
 @njit(cache=True, parallel=True)
 def precompute_state_tab_pol(
-    order, offsets, x_im_f, y_im_f, z_J_f, z_mid_1D, starts, ends, nint,
-    P, Tup, Tlo, logr0, invdlogr, nr, invdu, nu_, st, st_iz,
+    order, offsets, x_im_f, y_im_f, z_J_f, z_im_1D, seg_in, seg_out, c_lo, c_hi, nint,
+    P, Tup, Tlo, logr0, invdlogr, nr, invdu, nu_, st, st_ds,
 ):
     """As precompute_state_pol, with the (r,theta)-only physics from the field table."""
+    rg = P[P_RG]
     Npix = order.shape[0]
     for q in prange(Npix):
         pix = order[q]
@@ -1247,9 +1235,12 @@ def precompute_state_tab_pol(
         yi = y_im_f[pix]
         zJ = z_J_f[pix]
         for k in range(nint[pix]):
-            for i in range(starts[pix, k], ends[pix, k]):
+            s_in = seg_in[pix, k]
+            s_out = seg_out[pix, k]
+            for i in range(c_lo[pix, k], c_hi[pix, k] + 1):
+                zi, ds = _cell_overlap(z_im_1D, i, s_in, s_out, rg)
                 g, nup, gc, Cj, Ca, cth, Kap, c2, s2 = _cell_state_tab_pol(
-                    xi, yi, zJ, z_mid_1D[i], P, Tup, Tlo, logr0, invdlogr, nr, invdu, nu_
+                    xi, yi, zJ, zi, P, Tup, Tlo, logr0, invdlogr, nr, invdu, nu_
                 )
                 st[0, o] = g
                 st[1, o] = nup
@@ -1260,12 +1251,12 @@ def precompute_state_tab_pol(
                 st[6, o] = Kap
                 st[7, o] = c2
                 st[8, o] = s2
-                st_iz[o] = i
+                st_ds[o] = ds
                 o += 1
 
 
 @njit(cache=True, parallel=True)
-def rt_from_state_pol(frequency, order, offsets, dz_1D, P, TAB, RTAB, tau_stop, st, st_iz, out):
+def rt_from_state_pol(frequency, order, offsets, P, TAB, RTAB, tau_stop, st, st_ds, out):
     """Polarized transfer for one frequency from the stored state."""
     Npix = order.shape[0]
     for q in prange(Npix):
@@ -1284,7 +1275,7 @@ def rt_from_state_pol(frequency, order, offsets, dz_1D, P, TAB, RTAB, tau_stop, 
                 P, TAB, RTAB,
             )
             tau += _pol_cell(
-                jI, jQ, jV, aI, aQ, aV, rQ, rV, st[7, o], st[8, o], g, dz_1D[st_iz[o]], O, cv
+                jI, jQ, jV, aI, aQ, aV, rQ, rV, st[7, o], st[8, o], g, st_ds[o], O, cv
             )
             _pol_accumulate(Itot, Ocum, O, cv, tmp)
             if tau_stop > 0.0 and tau >= tau_stop:

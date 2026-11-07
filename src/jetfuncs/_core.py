@@ -1,6 +1,7 @@
 ###################################################
 # imports and etc.
 
+import itertools
 import warnings
 
 import numpy as np
@@ -23,15 +24,23 @@ except Exception:
 try:
     from . import _kernel as _kern
     from . import _kernel_pol as _kernpol
+    from . import _kernel_kerr as _kernkerr
+    from . import _geodesics as _geo
 
     HAS_NUMBA = True
 except ImportError:  # pragma: no cover - exercised only when numba is absent
     _kern = None
     _kernpol = None
+    _kernkerr = None
+    _geo = None
     HAS_NUMBA = False
 
 # suppress some numpy warnings
 np.seterr(divide="ignore", invalid="ignore")
+
+# bisection steps that locate the end of a jet segment (as _kernel.N_BISECT); stops early
+# once the bracket is at float resolution
+_N_BISECT = 60
 
 
 def numba_available():
@@ -909,6 +918,21 @@ class JetModel:
     precompute_state() once; subsequent make_image() calls then only evaluate the
     frequency-dependent synchrotron coefficients and the transfer integral.
 
+    Rays follow one of two geometries, selected with `geometry`:
+
+      geometry="flat"  straight lines of sight (the default)
+      geometry="kerr"  null geodesics of the Kerr metric of the model's spin a, traced
+                       backwards from a distant observer at polar angle inc; light
+                       bending, the photon's local direction and energy (including
+                       frame dragging) and the transport of the polarization basis
+                       along each ray are all included.  Requires numba (the rays are
+                       traced by compiled code for both back ends), and an inclination
+                       away from the jet axis.
+
+    In both, the cells of a ray are laid out on the z-grid about the ray's closest
+    approach to the jet axis -- in distance along a straight ray, in affine parameter
+    along a geodesic -- and cut at the jet boundary.
+
     Typical usage:
         model = JetModel(m=..., a=..., inc=..., mdot=..., Nx=..., Ny=..., Nz=..., s=..., p=..., ...)
         model.precompute_state()          # optional; speeds up frequency loops
@@ -951,6 +975,7 @@ class JetModel:
         DTYPE=np.float64,
         stokes="I",
         rotativities="HS11",
+        geometry="flat",
         backend="auto",
         n_stagnation=1000,
     ):
@@ -997,6 +1022,22 @@ class JetModel:
             )
         self.rotativities = rotativities
 
+        # ray geometry: straight lines of sight, or null geodesics of the Kerr metric
+        if geometry not in ("flat", "kerr"):
+            raise ValueError(f"geometry must be 'flat' or 'kerr', got {geometry!r}")
+        if geometry == "kerr" and not HAS_NUMBA:
+            raise ImportError(
+                "geometry='kerr' requires numba, which traces the rays for both back ends; "
+                "install it (pip install numba)"
+            )
+        self.geometry = geometry
+        if geometry == "kerr":
+            # the metric the rays follow, (M, a), and the tracer's step parameters
+            # (eps, wcap) of _geodesics.trace; the first is (0, 0) in the tests that check
+            # the flat limit, the second is halved to check convergence
+            self._ray_metric = (1.0, self.a)
+            self._geodesic_steps = (_geo.EPS_STEP, _geo.WCAP_STEP)
+
         # radiative-transfer back end: "auto" (numba if installed, else numpy),
         # "numba", or "numpy"; can be overridden per call in make_image()
         if backend not in ("auto", "numba", "numpy"):
@@ -1009,6 +1050,7 @@ class JetModel:
         self._ftab = None  # 2-D table of the (r,theta)-only physics (see build_field_table)
         self._rtab = None  # Faraday rotativity tables (see _load_rotativity_tables)
         self._rtab_p = None
+        self._kerr_bufs = None  # per-thread trajectory buffers (geometry="kerr")
 
         ####################
         # input validation
@@ -1069,6 +1111,13 @@ class JetModel:
         self.inc_rad = np.pi - (self.inc * np.pi / 180.0)
         self.cos_i = np.cos(self.inc_rad)
         self.sin_i = np.sin(self.inc_rad)
+        if self.geometry == "kerr" and abs(self.sin_i) < self._KERR_POLE_ON_SIN_TOL:
+            raise ValueError(
+                f"geometry='kerr' needs a line of sight away from the jet axis "
+                f"(|sin(inc)| >= {self._KERR_POLE_ON_SIN_TOL:g}), got inc={self.inc}: the "
+                f"observer's screen coordinates and polarization basis are those of an "
+                f"observer off the spin axis"
+            )
 
         self.rg = (1.477e5) * self.m
         self.Mdot = self.mdot * self.m * (1.399e17)
@@ -1448,6 +1497,11 @@ class JetModel:
     _POLE_ON_SIN_TOL = 1.0e-12
     _POLE_ON_ZJ_WARN = 30.0
 
+    # geometry="kerr": the smallest |sin(i)| accepted, and the least radius at which rays
+    # start (they start at ten times the extent of the grid if that is larger)
+    _KERR_POLE_ON_SIN_TOL = 1.0e-6
+    _KERR_R_START = 1.0e9
+
     # (Stokes parameter, kernel, exponent m) for each tabulated family
     _TAB_FAMILIES = {
         "GI": ("I", "F", lambda p: (p - 3.0) / 2.0),
@@ -1805,27 +1859,123 @@ class JetModel:
     # ------------------------------------------------------------------
     def _get_intervals(self):
         """
-        Per-ray ranges of z-cells inside the jet, computed once per model.  Also fixes
-        the (random) order in which rays are handed to the threads, which balances the
-        work across cores; the result does not depend on that order.
+        Per-ray segments of the line of sight inside the jet, with the first and last
+        grid cells each one overlaps (see _kernel.jet_segments), computed once per
+        model.  Also fixes the (random) order in which rays are handed to the threads,
+        which balances the work across cores; the result does not depend on that order.
         """
         if self._intervals is None:
             P = _kern.pack_params(self)
             max_int = 8
-            while True:
-                starts, ends, nint, ncell = _kern.jet_intervals(
-                    self.x_im_f, self.y_im_f, self.z_J_f, self.z_mid_1D, P, max_int
-                )
-                if int(nint.max()) <= max_int:
-                    break
-                max_int *= 2
+            extra = {}
+            if self.geometry == "kerr":
+                # the segments are found along the geodesics, in affine offset from each
+                # ray's closest approach to the jet axis; the ray geometry is fixed here
+                # for every later kernel call, so that they all see the same rays
+                G = self._kerr_ray_geometry()
+                while True:
+                    (seg_in, seg_out, c_lo, c_hi, nint, ncell, lamJ, status,
+                     rmax) = _kernkerr.jet_segments_kerr(
+                        self.x_im_f, self.y_im_f, self.z_im_1D, P, G, max_int,
+                        self._kerr_buffers(),
+                    )
+                    if int(nint.max()) <= max_int:
+                        break
+                    max_int *= 2
+                n_lost = int(np.count_nonzero(status == _geo.OUT_OF_STEPS))
+                if n_lost:
+                    warnings.warn(
+                        f"{n_lost} rays ran out of steps ({_geo.MAX_STEPS}) before reaching "
+                        f"the horizon or escaping, and are truncated there",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                extra = dict(lamJ=lamJ, status=status, rmax=rmax, G=G)
+            else:
+                while True:
+                    seg_in, seg_out, c_lo, c_hi, nint, ncell = _kern.jet_segments(
+                        self.x_im_f, self.y_im_f, self.z_J_f, self.z_im_1D, P, max_int
+                    )
+                    if int(nint.max()) <= max_int:
+                        break
+                    max_int *= 2
             order = np.random.default_rng(12345).permutation(nint.shape[0]).astype(np.int64)
-            self._intervals = dict(starts=starts, ends=ends, nint=nint, ncell=ncell, order=order)
+            self._intervals = dict(seg_in=seg_in, seg_out=seg_out, c_lo=c_lo, c_hi=c_hi,
+                                   nint=nint, ncell=ncell, order=order, **extra)
         return self._intervals
+
+    def _kerr_ray_geometry(self):
+        """
+        The ray geometry of geometry="kerr", packed for the kernels: the metric and step
+        parameters (_ray_metric, _geodesic_steps), the observer at polar angle inc, and the
+        start radius of every ray, beyond the farthest cell by a factor of ten at least.
+        """
+        M, a = self._ray_metric
+        eps, wcap = self._geodesic_steps
+        extent = (float(np.abs(self.z_im_1D).max()) + float(np.abs(self.z_J_f).max())
+                  + float(np.hypot(self.x_im_f, self.y_im_f).max()))
+        r0 = max(self._KERR_R_START, 10.0 * extent)
+        return _kernkerr.pack_geometry(M, a, np.radians(self.inc), r0, eps, wcap)
+
+    def _kerr_buffers(self):
+        """Per-thread trajectory buffers for the Kerr kernels, allocated once."""
+        if self._kerr_bufs is None:
+            self._kerr_bufs = _kernkerr.trajectory_buffers()
+        return self._kerr_bufs
+
+    def _kerr_args(self, heating_prescription):
+        """
+        The arguments the Kerr drivers take after (frequency, order) or (order, offsets),
+        up to the synchrotron tables: rays, segments, parameters, ray geometry, buffers
+        and the physics tables, with the field table selected if it was built for this
+        heating prescription.
+        """
+        iv = self._get_intervals()
+        ft = self._ftab
+        use_tab = ft is not None and ft["heating_prescription"] == heating_prescription
+        ftab = self._ftab_args() if use_tab else _kernkerr.no_field_table()
+        return (
+            self.x_im_f, self.y_im_f, iv["lamJ"], self.z_im_1D,
+            iv["seg_in"], iv["seg_out"], iv["c_lo"], iv["c_hi"], iv["nint"],
+            _kern.pack_params(self, heating_prescription), iv["G"], self._kerr_buffers(),
+            use_tab, self._stag_lut_x, self._stag_lut_r, self._stag_lut_t, self._stag_lut_a,
+            *ftab,
+        )
+
+    def _kerr_cells(self):
+        """
+        The geometry of every jet cell of geometry="kerr" for the numpy reference path,
+        from the compiled tracer (_kernel_kerr.kerr_cell_geometry), in pixel order:
+        returns (kg, base) with kg[KG_*, column] and base[pix, k] the column of the first
+        cell of segment k of pixel pix.
+        """
+        iv = self._get_intervals()
+        npix = self.x_im_f.shape[0]
+        offsets = np.zeros(npix + 1, dtype=np.int64)
+        offsets[1:] = np.cumsum(iv["ncell"])
+        kg = np.empty((_kernkerr.N_KG, int(offsets[-1])))
+        args = self._kerr_args("Poynting")
+        _kernkerr.kerr_cell_geometry(
+            np.arange(npix, dtype=np.int64), offsets, *args[:12], kg,
+        )
+        nseg = iv["seg_in"].shape[1]
+        used = np.arange(nseg)[None, :] < iv["nint"][:, None]
+        counts = np.where(used, iv["c_hi"] - iv["c_lo"] + 1, 0).astype(np.int64)
+        base = offsets[:-1, None] + np.cumsum(counts, axis=1) - counts
+        return kg, base
+
+    def _segment_args(self):
+        """The ray geometry and jet segments, in the order the compiled drivers take them."""
+        iv = self._get_intervals()
+        return (self.x_im_f, self.y_im_f, self.z_J_f, self.z_im_1D,
+                iv["seg_in"], iv["seg_out"], iv["c_lo"], iv["c_hi"], iv["nint"])
 
     @property
     def n_jet_cells(self):
-        """Number of grid cells inside the jet (the work per make_image call)."""
+        """
+        Number of grid cells evaluated per make_image call: those that overlap the jet,
+        each counted once whether it lies wholly inside or is cut by the jet boundary.
+        """
         return int(self._get_intervals()["ncell"].sum())
 
     def _make_image_numba(self, frequency, tau_stop, heating_prescription):
@@ -1839,21 +1989,22 @@ class JetModel:
         ft = self._ftab
         if st is not None and st["heating_prescription"] == heating_prescription:
             _kern.rt_from_state(
-                float(frequency), iv["order"], st["offsets"], self.dz_1D, P, *T, tau,
-                st["g"], st["nup"], st["gamma_c"], st["Cj"], st["Ca"], st["iz"], I_out,
+                float(frequency), iv["order"], st["offsets"], P, *T, tau,
+                st["g"], st["nup"], st["gamma_c"], st["Cj"], st["Ca"], st["ds"], I_out,
+            )
+        elif self.geometry == "kerr":
+            _kernkerr.rt_kernel_kerr(
+                float(frequency), iv["order"], *self._kerr_args(heating_prescription),
+                *T, tau, I_out,
             )
         elif ft is not None and ft["heating_prescription"] == heating_prescription:
             _kern.rt_kernel_tab(
-                float(frequency), iv["order"],
-                self.x_im_f, self.y_im_f, self.z_J_f, self.z_mid_1D, self.dz_1D,
-                iv["starts"], iv["ends"], iv["nint"],
+                float(frequency), iv["order"], *self._segment_args(),
                 P, *self._ftab_args(), *T, tau, I_out,
             )
         else:
             _kern.rt_kernel(
-                float(frequency), iv["order"],
-                self.x_im_f, self.y_im_f, self.z_J_f, self.z_mid_1D, self.dz_1D,
-                iv["starts"], iv["ends"], iv["nint"],
+                float(frequency), iv["order"], *self._segment_args(),
                 P, self._stag_lut_x, self._stag_lut_r, self._stag_lut_t, self._stag_lut_a, *T, tau, I_out,
             )
         return self.x_im_1D, self.y_im_1D, I_out.reshape(self.x_im.shape)
@@ -1976,21 +2127,22 @@ class JetModel:
             and st["heating_prescription"] == heating_prescription
         ):
             _kernpol.rt_from_state_pol(
-                float(frequency), iv["order"], st["offsets"], self.dz_1D, P, TAB, RTAB, tau,
-                st["pol"], st["iz"], out,
+                float(frequency), iv["order"], st["offsets"], P, TAB, RTAB, tau,
+                st["pol"], st["ds"], out,
+            )
+        elif self.geometry == "kerr":
+            _kernkerr.rt_kernel_pol_kerr(
+                float(frequency), iv["order"], *self._kerr_args(heating_prescription),
+                TAB, RTAB, tau, out,
             )
         elif ft is not None and ft["heating_prescription"] == heating_prescription:
             _kernpol.rt_kernel_tab_pol(
-                float(frequency), iv["order"],
-                self.x_im_f, self.y_im_f, self.z_J_f, self.z_mid_1D, self.dz_1D,
-                iv["starts"], iv["ends"], iv["nint"],
+                float(frequency), iv["order"], *self._segment_args(),
                 P, *self._ftab_args(), TAB, RTAB, tau, out,
             )
         else:
             _kernpol.rt_kernel_pol(
-                float(frequency), iv["order"],
-                self.x_im_f, self.y_im_f, self.z_J_f, self.z_mid_1D, self.dz_1D,
-                iv["starts"], iv["ends"], iv["nint"],
+                float(frequency), iv["order"], *self._segment_args(),
                 P, self._stag_lut_x, self._stag_lut_r, self._stag_lut_t, self._stag_lut_a,
                 TAB, RTAB, tau, out,
             )
@@ -2031,8 +2183,12 @@ class JetModel:
                 f"expected 'Poynting' or 'magnetic'"
             )
         # radial extent: cover every cell that can lie in the jet, generously
-        zmax = np.abs(self.z_mid_1D).max() + np.abs(self.z_J_f).max()
-        r_max = np.sqrt(np.abs(self.x_im_f).max() ** 2 + np.abs(self.y_im_f).max() ** 2 + zmax**2)
+        if self.geometry == "kerr":
+            # the largest radius inside the jet along any geodesic
+            r_max = float(self._get_intervals()["rmax"].max())
+        else:
+            zmax = np.abs(self.z_mid_1D).max() + np.abs(self.z_J_f).max()
+            r_max = np.sqrt(np.abs(self.x_im_f).max() ** 2 + np.abs(self.y_im_f).max() ** 2 + zmax**2)
         r_max = 1.001 * max(r_max, 2.0 * self.rH)
         dlog = 1.0 / float(points_per_decade)
         logr = np.arange(np.log10(0.01 * self.rH), np.log10(r_max - self.rH) + dlog, dlog)
@@ -2071,8 +2227,9 @@ class JetModel:
                          polarized=False):
         """
         Evaluate and store the frequency-independent state of every jet cell (redshift
-        factor, characteristic synchrotron frequency, cooling Lorentz factor, and the
-        emissivity/absorption prefactors; 44 bytes per cell).  Subsequent make_image()
+        factor, characteristic synchrotron frequency, cooling Lorentz factor, the
+        emissivity/absorption prefactors, and the path length of the part of the cell
+        inside the jet; 48 bytes per cell).  Subsequent make_image()
         calls with the same heating prescription then only compute the frequency-
         dependent synchrotron coefficients and the transfer integral, which is what
         makes loops over frequency (SEDs) fast.  Requires the numba back end.  If a
@@ -2082,7 +2239,7 @@ class JetModel:
         polarized=True stores four further quantities per cell -- the fluid-frame
         pitch-angle cosine, the absorption scale that the Faraday rotativities are
         built on, and the two components of the rotation into the sky basis -- so that
-        make_image_polarized() can use the cached path as well (76 bytes per cell).
+        make_image_polarized() can use the cached path as well (80 bytes per cell).
         The extra state is a superset: the unpolarized make_image() reads the same
         arrays and is unaffected.
 
@@ -2102,13 +2259,13 @@ class JetModel:
         offsets[1:] = np.cumsum(ncell_ordered)
         N = int(offsets[-1])
         nper = _kernpol.N_POL_STATE if polarized else 5
-        nbytes = N * (nper * 8 + 4)
+        nbytes = N * (nper * 8 + 8)
         if nbytes > max_memory_gb * 1.0e9:
             raise MemoryError(
                 f"the per-cell state for {N} jet cells needs {nbytes/1e9:.1f} GB, above the "
                 f"max_memory_gb={max_memory_gb} limit; use a coarser grid or raise the limit"
             )
-        iz = np.empty(N, dtype=np.int32)
+        ds = np.empty(N)
         if polarized:
             self._ensure_polarized_tables()
             # one contiguous block; its first five rows are exactly the unpolarized
@@ -2119,7 +2276,7 @@ class JetModel:
                 offsets=offsets,
                 pol=pol,
                 g=pol[0], nup=pol[1], gamma_c=pol[2], Cj=pol[3], Ca=pol[4],
-                iz=iz,
+                ds=ds,
             )
         else:
             st = dict(
@@ -2131,33 +2288,42 @@ class JetModel:
                 gamma_c=np.empty(N),
                 Cj=np.empty(N),
                 Ca=np.empty(N),
-                iz=iz,
+                ds=ds,
             )
         ft = self._ftab
         use_tab = ft is not None and ft["heating_prescription"] == heating_prescription
+        if self.geometry == "kerr":
+            kargs = (iv["order"], offsets, *self._kerr_args(heating_prescription))
+            if polarized:
+                _kernkerr.precompute_state_pol_kerr(*kargs, st["pol"], ds)
+            else:
+                _kernkerr.precompute_state_kerr(
+                    *kargs, st["g"], st["nup"], st["gamma_c"], st["Cj"], st["Ca"], ds,
+                )
+            self._state = st
+            return nbytes
         args = (
-            iv["order"], offsets, self.x_im_f, self.y_im_f, self.z_J_f, self.z_mid_1D,
-            iv["starts"], iv["ends"], iv["nint"],
+            iv["order"], offsets, *self._segment_args(),
             _kern.pack_params(self, heating_prescription),
         )
         if polarized:
             if use_tab:
-                _kernpol.precompute_state_tab_pol(*args, *self._ftab_args(), st["pol"], iz)
+                _kernpol.precompute_state_tab_pol(*args, *self._ftab_args(), st["pol"], ds)
             else:
                 _kernpol.precompute_state_pol(
                     *args, self._stag_lut_x, self._stag_lut_r, self._stag_lut_t,
-                    self._stag_lut_a, st["pol"], iz,
+                    self._stag_lut_a, st["pol"], ds,
                 )
         elif use_tab:
             _kern.precompute_state_tab(
                 *args, *self._ftab_args(),
-                st["g"], st["nup"], st["gamma_c"], st["Cj"], st["Ca"], iz,
+                st["g"], st["nup"], st["gamma_c"], st["Cj"], st["Ca"], ds,
             )
         else:
             _kern.precompute_state(
                 *args,
                 self._stag_lut_x, self._stag_lut_r, self._stag_lut_t, self._stag_lut_a,
-                st["g"], st["nup"], st["gamma_c"], st["Cj"], st["Ca"], iz,
+                st["g"], st["nup"], st["gamma_c"], st["Cj"], st["Ca"], ds,
             )
         self._state = st
         return nbytes
@@ -2169,6 +2335,89 @@ class JetModel:
     # ------------------------------------------------------------------
     # numpy back end (reference implementation)
     # ------------------------------------------------------------------
+    def _inside_numpy(self, s, pix):
+        """
+        Whether the points at offsets s along the straight rays of pixels pix lie inside
+        the jet; numpy counterpart of _kernel._flat_inside, with the same arithmetic.
+        """
+        x_im = self.x_im_f[pix]
+        z_im_now = s + self.z_J_f[pix]
+        x = (x_im * self.cos_i) + (z_im_now * self.sin_i)
+        y = self.y_im_f[pix]
+        z = (z_im_now * self.cos_i) - (x_im * self.sin_i)
+        R2 = (x * x) + (y * y)
+        r = np.sqrt(R2 + (z * z))
+        az = np.abs(z)
+        big = (r + az) / r
+        small = R2 / (r * (r + az))
+        pos = z >= 0.0
+        omc = np.where(pos, small, big)
+        opc = np.where(pos, big, small)
+        rnu = r**self.nu
+        inv_rHnu = self.rH ** (-self.nu)
+        w_up = rnu * omc * inv_rHnu
+        w_lo = rnu * opc * inv_rHnu
+        inside = ((w_up <= 1.0) | (w_lo <= 1.0)) & (r > self.rH * (1.0 + 1.0e-2))
+        if self.jet_cutout_fraction > 0.0:
+            cos_fp = np.where(w_up < 1.0, 1.0 - w_up, w_lo - 1.0)
+            cut = self.jet_cutout_fraction * self.jet_cutout_fraction
+            inside &= ~((1.0 - np.abs(cos_fp)) < cut)
+        return inside
+
+    def _jet_segments_numpy(self):
+        """
+        The segments [s_in, s_out] of each line of sight that lie inside the jet --
+        numpy counterpart of _kernel.jet_segments, found the same way: the ray is
+        sampled at every cell edge and center, and where the inside/outside status
+        changes the crossing is located by bisection.  Returns (seg_in, seg_out, nint),
+        with seg_in and seg_out of shape (Npix, max(nint)) and nint segments per pixel.
+        """
+        z = self.z_im_1D
+        scan = np.empty(2 * z.shape[0] - 1)
+        scan[0::2] = z
+        scan[1::2] = 0.5 * (z[1:] + z[:-1])
+        npix = self.x_im_f.shape[0]
+        allpix = np.arange(npix)
+        inside = np.empty((scan.shape[0], npix), dtype=bool)
+        for j in range(scan.shape[0]):
+            inside[j] = self._inside_numpy(scan[j], allpix)
+
+        # every change of status between neighboring samples, located by bisection
+        jj, pp = np.nonzero(inside[1:] != inside[:-1])
+        lo = scan[jj].copy()
+        hi = scan[jj + 1].copy()
+        before = inside[jj, pp]
+        for _ in range(_N_BISECT):
+            mid = 0.5 * (lo + hi)
+            live = (mid > lo) & (mid < hi)
+            if not live.any():
+                break
+            same = self._inside_numpy(mid, pp) == before
+            lo = np.where(live & same, mid, lo)
+            hi = np.where(live & ~same, mid, hi)
+        crossing = 0.5 * (lo + hi)
+
+        # per pixel, the ordered list of segment ends: a ray that starts (ends) inside
+        # the jet opens (closes) a segment at the end of the grid
+        order = np.lexsort((jj, pp))
+        pp, crossing = pp[order], crossing[order]
+        n_cross = np.bincount(pp, minlength=npix)
+        first = np.concatenate(([0], np.cumsum(n_cross)))
+        n_ends = n_cross + inside[0] + inside[-1]
+        nint = (n_ends // 2).astype(np.int64)
+        width = max(1, int(nint.max()))
+        seg_in = np.zeros((npix, width))
+        seg_out = np.zeros((npix, width))
+        for pix in np.flatnonzero(n_ends):
+            ends = list(crossing[first[pix]:first[pix + 1]])
+            if inside[0, pix]:
+                ends.insert(0, scan[0])
+            if inside[-1, pix]:
+                ends.append(scan[-1])
+            seg_in[pix, :len(ends) // 2] = ends[0::2]
+            seg_out[pix, :len(ends) // 2] = ends[1::2]
+        return seg_in, seg_out, nint
+
     def _make_image_numpy(
         self, frequency, *, tau_stop=None, show_progress=False, heating_prescription="Poynting"
     ):
@@ -2251,7 +2500,23 @@ class JetModel:
         ####################
         # RT loop
 
-        for i in _progress(range(0, len(z_im_1D) - 1), enabled=show_progress):
+        # the segments of each line of sight that lie inside the jet; every grid cell
+        # is evaluated on its overlap with each of them, in order along the ray, so a
+        # cell cut by the jet boundary counts only the part inside the jet
+        kerr = self.geometry == "kerr"
+        if kerr:
+            # the segments, the cells' points and the photon's local frame come from the
+            # compiled tracer; the physics and the transfer below are this path's own
+            iv = self._get_intervals()
+            seg_in, seg_out, nint = iv["seg_in"], iv["seg_out"], iv["nint"]
+            kc_lo = iv["c_lo"]
+            kg, kbase = self._kerr_cells()
+        else:
+            seg_in, seg_out, nint = self._jet_segments_numpy()
+        n_seg = seg_in.shape[1]
+        cells = itertools.product(range(0, len(z_im_1D) - 1), range(n_seg))
+
+        for i, kseg in _progress(cells, enabled=show_progress, total=(len(z_im_1D) - 1) * n_seg):
             if tau_stop is not None:
                 w = np.flatnonzero(working_f)
                 if w.size == 0:
@@ -2259,26 +2524,51 @@ class JetModel:
             else:
                 w = allpix
 
-            # observer z coordinate (same geometry as before)
-            z_im_now = z_mid_1D[i] + z_J_f[w]
+            # the part of cell i inside segment kseg: its midpoint and path length (for a
+            # cell wholly inside the jet, exactly z_mid_1D[i] and dz_1D[i])
+            lo = np.maximum(z_im_1D[i], seg_in[w, kseg])
+            hi = np.minimum(z_im_1D[i + 1], seg_out[w, kseg])
+            sel = (nint[w] > kseg) & (hi > lo)
+            if not sel.any():
+                continue
+            w = w[sel]
+            dz_cells = rg * (hi[sel] - lo[sel])
+            z_im_now = 0.5 * (lo[sel] + hi[sel]) + z_J_f[w]
 
-            # jet coordinates
-            x = (x_im_f[w] * cos_i) + (z_im_now * sin_i)
-            y = y_im_f[w]
-            z = (z_im_now * cos_i) - (x_im_f[w] * sin_i)
-            R2 = (x * x) + (y * y)
-            r2 = R2 + (z * z)
-            r = np.sqrt(r2)
+            if kerr:
+                # the cells' points on the geodesics and the photon's local frame there,
+                # from the compiled tracer
+                o = kbase[w, kseg] + (i - kc_lo[w, kseg])
+                r = kg[_kernkerr.KG_R, o]
+                costheta = kg[_kernkerr.KG_U, o]
+                r2 = r * r
+                one_minus_costheta = 1.0 - costheta
+                one_plus_costheta = 1.0 + costheta
+                R2 = r2 * (one_minus_costheta * one_plus_costheta)
+                z = r * costheta
+                nx = kg[_kernkerr.KG_N0, o]
+                ny = kg[_kernkerr.KG_N1, o]
+                nz = kg[_kernkerr.KG_N2, o]
+                fd = kg[_kernkerr.KG_FD, o]
+            else:
+                # jet coordinates
+                x = (x_im_f[w] * cos_i) + (z_im_now * sin_i)
+                y = y_im_f[w]
+                z = (z_im_now * cos_i) - (x_im_f[w] * sin_i)
+                R2 = (x * x) + (y * y)
+                r2 = R2 + (z * z)
+                r = np.sqrt(r2)
 
-            costheta = z / r
-            # 1 -/+ cos(theta) without the cancellation that 1 - z/r suffers when the
-            # point is close to the axis (|z| -> r); (r - |z|) = (x^2 + y^2)/(r + |z|)
-            az = np.abs(z)
-            big = (r + az) / r
-            small = R2 / (r * (r + az))
-            pos = z >= 0.0
-            one_minus_costheta = np.where(pos, small, big)
-            one_plus_costheta = np.where(pos, big, small)
+                costheta = z / r
+                # 1 -/+ cos(theta) without the cancellation that 1 - z/r suffers when the
+                # point is close to the axis (|z| -> r); (r - |z|) = (x^2 + y^2)/(r + |z|)
+                az = np.abs(z)
+                big = (r + az) / r
+                small = R2 / (r * (r + az))
+                pos = z >= 0.0
+                one_minus_costheta = np.where(pos, small, big)
+                one_plus_costheta = np.where(pos, big, small)
+                fd = 1.0
 
             # Footpoint of the field line through this point.  sin(theta_fp/2) =
             # (r/rH)^(1-s) sin(theta/2) and nu = 2 - 2s give, without any inverse
@@ -2290,26 +2580,13 @@ class JetModel:
             cos_fp = np.where(w_fp < 1.0, 1.0 - w_fp, (ratio_nu * one_plus_costheta) - 1.0)
             omc_fp = 1.0 - np.abs(cos_fp)
 
-            # horizon buffer (avoids numerical artifacts)
+            # horizon buffer (avoids numerical artifacts); it sets the floor on Delta below
             eps_h = 1.0e-2
             r_min = rH * (1.0 + eps_h)
 
-            # jet region: psi <= psi_edge in either lobe, i.e. (r/rH)^nu (1 -/+ cos
-            # theta) <= 1.  Equivalent to r <= rH (1 -/+ cos theta)^(-1/nu) for nu > 0,
-            # but reuses ratio_nu above and never forms 1/(1 - cos theta).
-            ind_jet = ((w_fp <= 1.0) | ((ratio_nu * one_plus_costheta) <= 1.0)) & (r > r_min)
-
-            if jet_cutout_fraction > 0.0:
-                # both halves of the two-sided cut are the single condition
-                # 1 - |cos theta_fp| < 1 - cos(theta_fp_cut)
-                omc_fp_cut = jet_cutout_fraction * jet_cutout_fraction
-                ind_jet &= ~(omc_fp < omc_fp_cut)
-
-            if not ind_jet.any():
-                continue
-
-            # local indices into arrays defined on w
-            idx_loc = np.nonzero(ind_jet)[0]
+            # every point selected above lies inside the jet: the segments were cut at its
+            # boundary (see _inside_numpy for the criterion)
+            idx_loc = np.arange(w.size)
 
             # global indices into flattened full image arrays (I_nu_f, tau_acc_f, working_f, etc.)
             idx = w[idx_loc]
@@ -2416,9 +2693,15 @@ class JetModel:
             Br *= alphalapse * sqrt_scaling
             Btheta *= alphalapse * sqrt_scaling
             Bphi *= alphalapse * sqrt_scaling
-            Bx, By, Bz = rtp_to_xyz(
-                Br, Btheta, Bphi, x[idx_loc], y[idx_loc], z[idx_loc], r[idx_loc], R
-            )
+            if kerr:
+                # the line-of-sight algebra below holds in any orthonormal basis; along
+                # geodesics it runs in the ZAMO frame's (r, theta, phi) basis, the one the
+                # photon direction n is given in
+                Bx, By, Bz = Br, Btheta, Bphi
+            else:
+                Bx, By, Bz = rtp_to_xyz(
+                    Br, Btheta, Bphi, x[idx_loc], y[idx_loc], z[idx_loc], r[idx_loc], R
+                )
 
             # velocity rescaling
             vr_orig = u1 * np.sqrt(g11) / gamma
@@ -2440,9 +2723,12 @@ class JetModel:
             vr = velscale * vr_orig
             vtheta = velscale * vtheta_orig
             vphi = velscale * vphi_orig
-            vx, vy, vz = rtp_to_xyz(
-                vr, vtheta, vphi, x[idx_loc], y[idx_loc], z[idx_loc], r[idx_loc], R
-            )
+            if kerr:
+                vx, vy, vz = vr, vtheta, vphi
+            else:
+                vx, vy, vz = rtp_to_xyz(
+                    vr, vtheta, vphi, x[idx_loc], y[idx_loc], z[idx_loc], r[idx_loc], R
+                )
             vmag = np.sqrt(vx * vx + vy * vy + vz * vz)
 
             # avoid v/|v| when |v|~0
@@ -2459,7 +2745,7 @@ class JetModel:
             # redshift factor
             k_par = (vhat_x * nx) + (vhat_y * ny) + (vhat_z * nz)
             one_m_betak = 1.0 - (beta * k_par)
-            g = alphalapse / (gamma * one_m_betak)
+            g = alphalapse / (gamma * fd * one_m_betak)
             g[~np.isfinite(g)] = 1.0
 
             # photon direction in comoving frame
@@ -2532,8 +2818,8 @@ class JetModel:
             nup = (4.1987e-3) * Bprime_mag * sinthetaB
             nu_nup = (frequency / g) / nup
 
-            jI = np.zeros_like(x[idx_loc])
-            alphaI = np.zeros_like(x[idx_loc])
+            jI = np.zeros_like(r[idx_loc])
+            alphaI = np.zeros_like(r[idx_loc])
 
             # uncooled branch
             if np.any(ind_uncooled):
@@ -2699,7 +2985,7 @@ class JetModel:
             alphaI = np.maximum(alphaI, 0.0)
 
             # radiative transfer
-            dz = dz_1D[i]
+            dz = dz_cells
 
             a0 = alphaI / g
             j0 = (g * g) * jI
@@ -2721,7 +3007,7 @@ class JetModel:
 
             if np.any(~has_abs):
                 # pure emission, no absorption: dI = j ds (still attenuated by foreground τ)
-                dI[~has_abs] = atten[~has_abs] * j0[~has_abs] * dz
+                dI[~has_abs] = atten[~has_abs] * j0[~has_abs] * dz[~has_abs]
 
             I_nu_f[idx] += dI
             tau_acc_f[idx] += tau_step
@@ -3040,7 +3326,7 @@ class JetModel:
             arr[bad] = np.nan
         return jI, jQ, jV, aI, aQ, aV, rQ, rV
 
-    def _sky_basis_numpy(self, gamma, beta, vhat, khat_prime, Bprime, Bprime_mag):
+    def _sky_basis_numpy(self, gamma, beta, vhat, khat_prime, Bprime, Bprime_mag, basis=None):
         """
         cos(2 chi) and sin(2 chi): the rotation between the fluid-frame Stokes basis
         (aligned with the projected magnetic field) and the internal right-handed sky
@@ -3050,22 +3336,37 @@ class JetModel:
         along the (null) photon momentum to remove the time component that the boost
         introduces; four-dimensional inner products survive both steps, so the result
         is orthonormal in the fluid frame without renormalization.
+
+        basis: None for the flat model's fixed sky vectors, or, for geometry="kerr",
+        the observer's basis carried to the cells, (a0, a1, a2, b0, b1, b2) in the
+        basis of vhat (see _kernel_kerr._cell_basis).
         """
         vhat_x, vhat_y, vhat_z = vhat
         khx, khy, khz = khat_prime
         Bx, By, Bz = Bprime
-        cos_i, sin_i = self.cos_i, self.sin_i
 
         gm1 = gamma - 1.0
         gb = gamma * beta
-        sa = (vhat_x * cos_i) - (vhat_z * sin_i)  # vhat . (+x_im)
-        sb = -vhat_y  # vhat . (-y_im)
-        ax = cos_i + gm1 * sa * vhat_x + gb * sa * khx
-        ay = gm1 * sa * vhat_y + gb * sa * khy
-        az = -sin_i + gm1 * sa * vhat_z + gb * sa * khz
-        bx = gm1 * sb * vhat_x + gb * sb * khx
-        by = -1.0 + gm1 * sb * vhat_y + gb * sb * khy
-        bz = gm1 * sb * vhat_z + gb * sb * khz
+        if basis is None:
+            cos_i, sin_i = self.cos_i, self.sin_i
+            sa = (vhat_x * cos_i) - (vhat_z * sin_i)  # vhat . (+x_im)
+            sb = -vhat_y  # vhat . (-y_im)
+            ax = cos_i + gm1 * sa * vhat_x + gb * sa * khx
+            ay = gm1 * sa * vhat_y + gb * sa * khy
+            az = -sin_i + gm1 * sa * vhat_z + gb * sa * khz
+            bx = gm1 * sb * vhat_x + gb * sb * khx
+            by = -1.0 + gm1 * sb * vhat_y + gb * sb * khy
+            bz = gm1 * sb * vhat_z + gb * sb * khz
+        else:
+            a0, a1, a2, b0, b1, b2 = basis
+            sa = (vhat_x * a0) + (vhat_y * a1) + (vhat_z * a2)
+            sb = (vhat_x * b0) + (vhat_y * b1) + (vhat_z * b2)
+            ax = a0 + gm1 * sa * vhat_x + gb * sa * khx
+            ay = a1 + gm1 * sa * vhat_y + gb * sa * khy
+            az = a2 + gm1 * sa * vhat_z + gb * sa * khz
+            bx = b0 + gm1 * sb * vhat_x + gb * sb * khx
+            by = b1 + gm1 * sb * vhat_y + gb * sb * khy
+            bz = b2 + gm1 * sb * vhat_z + gb * sb * khz
 
         ca = (ax * Bx + ay * By + az * Bz) / Bprime_mag
         cb = (bx * Bx + by * By + bz * Bz) / Bprime_mag
@@ -3139,7 +3440,23 @@ class JetModel:
         working_f = np.ones(x_im_f.shape[0], dtype=bool)
         allpix = np.arange(x_im_f.size, dtype=np.int64)
 
-        for i in _progress(range(0, len(z_im_1D) - 1), enabled=show_progress):
+        # the segments of each line of sight that lie inside the jet; every grid cell
+        # is evaluated on its overlap with each of them, in order along the ray, so a
+        # cell cut by the jet boundary counts only the part inside the jet
+        kerr = self.geometry == "kerr"
+        if kerr:
+            # the segments, the cells' points and the photon's local frame come from the
+            # compiled tracer; the physics and the transfer below are this path's own
+            iv = self._get_intervals()
+            seg_in, seg_out, nint = iv["seg_in"], iv["seg_out"], iv["nint"]
+            kc_lo = iv["c_lo"]
+            kg, kbase = self._kerr_cells()
+        else:
+            seg_in, seg_out, nint = self._jet_segments_numpy()
+        n_seg = seg_in.shape[1]
+        cells = itertools.product(range(0, len(z_im_1D) - 1), range(n_seg))
+
+        for i, kseg in _progress(cells, enabled=show_progress, total=(len(z_im_1D) - 1) * n_seg):
             if tau_stop is not None:
                 w = np.flatnonzero(working_f)
                 if w.size == 0:
@@ -3147,21 +3464,47 @@ class JetModel:
             else:
                 w = allpix
 
-            z_im_now = z_mid_1D[i] + z_J_f[w]
-            x = (x_im_f[w] * cos_i) + (z_im_now * sin_i)
-            y = y_im_f[w]
-            z = (z_im_now * cos_i) - (x_im_f[w] * sin_i)
-            R2 = (x * x) + (y * y)
-            r2 = R2 + (z * z)
-            r = np.sqrt(r2)
+            # the part of cell i inside segment kseg: its midpoint and path length (for a
+            # cell wholly inside the jet, exactly z_mid_1D[i] and dz_1D[i])
+            lo = np.maximum(z_im_1D[i], seg_in[w, kseg])
+            hi = np.minimum(z_im_1D[i + 1], seg_out[w, kseg])
+            sel = (nint[w] > kseg) & (hi > lo)
+            if not sel.any():
+                continue
+            w = w[sel]
+            dz_cells = rg * (hi[sel] - lo[sel])
+            z_im_now = 0.5 * (lo[sel] + hi[sel]) + z_J_f[w]
+            if kerr:
+                # the cells' points on the geodesics and the photon's local frame there,
+                # from the compiled tracer
+                o = kbase[w, kseg] + (i - kc_lo[w, kseg])
+                r = kg[_kernkerr.KG_R, o]
+                costheta = kg[_kernkerr.KG_U, o]
+                r2 = r * r
+                one_minus_costheta = 1.0 - costheta
+                one_plus_costheta = 1.0 + costheta
+                R2 = r2 * (one_minus_costheta * one_plus_costheta)
+                z = r * costheta
+                nx = kg[_kernkerr.KG_N0, o]
+                ny = kg[_kernkerr.KG_N1, o]
+                nz = kg[_kernkerr.KG_N2, o]
+                fd = kg[_kernkerr.KG_FD, o]
+            else:
+                x = (x_im_f[w] * cos_i) + (z_im_now * sin_i)
+                y = y_im_f[w]
+                z = (z_im_now * cos_i) - (x_im_f[w] * sin_i)
+                R2 = (x * x) + (y * y)
+                r2 = R2 + (z * z)
+                r = np.sqrt(r2)
 
-            costheta = z / r
-            az = np.abs(z)
-            big = (r + az) / r
-            small = R2 / (r * (r + az))
-            pos = z >= 0.0
-            one_minus_costheta = np.where(pos, small, big)
-            one_plus_costheta = np.where(pos, big, small)
+                costheta = z / r
+                az = np.abs(z)
+                big = (r + az) / r
+                small = R2 / (r * (r + az))
+                pos = z >= 0.0
+                one_minus_costheta = np.where(pos, small, big)
+                one_plus_costheta = np.where(pos, big, small)
+                fd = 1.0
 
             ratio_nu = np.power(r / rH, nu)
             w_fp = ratio_nu * one_minus_costheta
@@ -3170,15 +3513,9 @@ class JetModel:
 
             eps_h = 1.0e-2
             r_min = rH * (1.0 + eps_h)
-            ind_jet = ((w_fp <= 1.0) | ((ratio_nu * one_plus_costheta) <= 1.0)) & (r > r_min)
-            if jet_cutout_fraction > 0.0:
-                omc_fp_cut = jet_cutout_fraction * jet_cutout_fraction
-                ind_jet &= ~(omc_fp < omc_fp_cut)
-            if not ind_jet.any():
-                continue
-
-            idx_loc = np.nonzero(ind_jet)[0]
-            idx = w[idx_loc]
+            # every point selected above lies inside the jet (the segments end at its edge)
+            idx_loc = np.arange(w.size)
+            idx = w
 
             psi = (rH**nu) * omc_fp[idx_loc]
             Omega = omega_BZpower(0, psi, a, nu)
@@ -3243,9 +3580,15 @@ class JetModel:
             Br *= alphalapse * sqrt_scaling
             Btheta *= alphalapse * sqrt_scaling
             Bphi *= alphalapse * sqrt_scaling
-            Bx, By, Bz = rtp_to_xyz(
-                Br, Btheta, Bphi, x[idx_loc], y[idx_loc], z[idx_loc], r[idx_loc], R
-            )
+            if kerr:
+                # the line-of-sight algebra below holds in any orthonormal basis; along
+                # geodesics it runs in the ZAMO frame's (r, theta, phi) basis, the one the
+                # photon direction n is given in
+                Bx, By, Bz = Br, Btheta, Bphi
+            else:
+                Bx, By, Bz = rtp_to_xyz(
+                    Br, Btheta, Bphi, x[idx_loc], y[idx_loc], z[idx_loc], r[idx_loc], R
+                )
 
             vr_orig = u1 * np.sqrt(g11) / gamma
             vtheta_orig = u2 * np.sqrt(g22) / gamma
@@ -3262,9 +3605,12 @@ class JetModel:
             vr = velscale * vr_orig
             vtheta = velscale * vtheta_orig
             vphi = velscale * vphi_orig
-            vx, vy, vz = rtp_to_xyz(
-                vr, vtheta, vphi, x[idx_loc], y[idx_loc], z[idx_loc], r[idx_loc], R
-            )
+            if kerr:
+                vx, vy, vz = vr, vtheta, vphi
+            else:
+                vx, vy, vz = rtp_to_xyz(
+                    vr, vtheta, vphi, x[idx_loc], y[idx_loc], z[idx_loc], r[idx_loc], R
+                )
             vmag = np.sqrt(vx * vx + vy * vy + vz * vz)
             eps_v = 1.0e-8
             mask_v = vmag > eps_v
@@ -3277,7 +3623,7 @@ class JetModel:
 
             k_par = (vhat_x * nx) + (vhat_y * ny) + (vhat_z * nz)
             one_m_betak = 1.0 - (beta * k_par)
-            g = alphalapse / (gamma * one_m_betak)
+            g = alphalapse / (gamma * fd * one_m_betak)
             g[~np.isfinite(g)] = 1.0
 
             k_perp_x = nx - k_par * vhat_x
@@ -3319,6 +3665,7 @@ class JetModel:
                 (khat_x_prime, khat_y_prime, khat_z_prime),
                 (Bprime_x, Bprime_y, Bprime_z),
                 Bprime_mag,
+                basis=(tuple(kg[_kernkerr.KG_A0 + k, o] for k in range(6)) if kerr else None),
             )
 
             t_c = np.abs(z[idx_loc] * rg) / (c * gamma)
@@ -3348,7 +3695,7 @@ class JetModel:
             jQ, jV = _clamp_polarized_np(jI, jQ, jV)
             aQ, aV = _clamp_polarized_np(aI, aQ, aV)
 
-            dz = dz_1D[i]
+            dz = dz_cells
             g2 = g * g
             inv_g = 1.0 / g
             JI = g2 * jI
@@ -3406,6 +3753,12 @@ class JetModel:
         image-frame U that make_image_polarized returns.  EVPA is the image-frame
         electric-vector position angle of the local emission, in radians, measured
         from +x_im towards +y_im.
+
+        The quantities that depend on the direction of the photon (costhetaB, nu_p, the
+        emission and absorption coefficients, cos2chi, sin2chi, EVPA) are evaluated for
+        the straight line of sight towards the observer, also for geometry="kerr": along
+        a geodesic the photon direction at a point depends on which ray passes through
+        it, so these are the flat-space values.
         """
 
         # check that the frequency is provided if necessary

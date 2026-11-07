@@ -365,7 +365,7 @@ def test_polarized_state_matches_the_full_kernel(name):
     freqs = (2.0, 86.0, 1.0e5)
     full = [model.make_image_polarized(f)[2] for f in freqs]
     nbytes = model.precompute_state(polarized=True)
-    assert nbytes == 76 * model.n_jet_cells
+    assert nbytes == 80 * model.n_jet_cells
     for f, S_full in zip(freqs, full):
         _compare(S_full, model.make_image_polarized(f)[2], rtol=1e-11, ref=S_full[0])
     model.clear_state()

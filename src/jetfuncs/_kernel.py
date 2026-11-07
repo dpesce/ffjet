@@ -5,9 +5,11 @@ This module reproduces the numpy implementation in _core.py cell for cell -- sam
 formulas, same table lookups, same radiative-transfer update -- but organized as a
 loop over image pixels (rays) rather than a loop over depth slices:
 
-  * the set of z-cells that lie inside the jet is found once per model
-    (`jet_intervals`), so each call does work proportional to the number of jet
-    cells rather than the number of grid cells (typically a ~10x difference);
+  * the segments of each line of sight that lie inside the jet are found once per
+    model (`jet_segments`), with their ends located by bisection, so each call does
+    work proportional to the number of jet cells rather than the number of grid cells
+    (typically a ~10x difference), and a cell cut by the jet boundary counts only the
+    part of its length inside the jet;
   * each ray is marched sequentially through its jet cells inside one compiled
     function, so no large temporary arrays are created and the rays run in parallel
     across cores;
@@ -23,6 +25,8 @@ The frequency-independent state of a cell is five numbers:
     gamma_c  cooling Lorentz factor
     C_j      everything multiplying the bracket in Eq. (C.4) of the paper
     C_a      everything multiplying the bracket in Eq. (C.9) of the paper
+
+and the stored state keeps each cell's path length (cm) alongside them.
 
 Agreement with the numpy path is at the level of floating-point roundoff (relative
 differences ~1e-13); the only intentional arithmetic difference is that the powers of
@@ -249,86 +253,160 @@ def _G_diff(x_lo, x_hi, k_lo, t_lo, f_lo, k_hi, t_hi, f_hi, logG, m, tailC, xtai
     return _G_eval(k_lo, t_lo, f_lo, logG) - _G_eval(k_hi, t_hi, f_hi, logG)
 
 
-# ----------------------------------------------------------------------------- jet mask
-@njit(cache=True, parallel=True)
-def jet_intervals(x_im_f, y_im_f, z_J_f, z_mid_1D, P, max_int):
-    """
-    For every pixel, the half-open ranges [start, end) of z-slice indices whose cell
-    centres lie inside the jet.  Uses exactly the same criterion and arithmetic as the
-    numpy path in make_image, so the set of cells integrated is identical.
+# ----------------------------------------------------------------------------- jet segments
+#
+# The jet boundary is a sharp surface, so each line of sight is inside the jet along a few
+# continuous segments.  Each ray's segments are found once per model, with their ends
+# located by bisection, and a grid cell that overlaps a segment is evaluated on the
+# overlap only: physics at the overlap's midpoint, path length equal to the overlap.
+# Counting each cell wholly in or out of the jet instead, by its center, makes the
+# integrated emission jump whenever the boundary crosses a cell edge from one pixel to
+# the next -- the "staircase" that put U in the outer jet 13% off per pixel at Nz = 1600.
+# Cells that lie wholly inside the jet are evaluated exactly as before (same midpoint,
+# same path length, bit for bit).
 
-    Returns (starts, ends, nint, ncell); nint[pix] may exceed max_int, in which case the
-    caller must retry with a larger max_int.
+
+@njit(cache=True, inline="always")
+def _flat_inside(xi, yi, zJ, s, cos_i, sin_i, r_min, nu, inv_rHnu, omc_fp_cut):
+    """
+    Whether the point at offset s along the straight ray of pixel (xi, yi) lies inside
+    the jet: inside either lobe's edge field line, outside the horizon buffer, and not
+    cut out.  The lobe test is r^nu (1 -/+ cos theta) <= rH^nu, which is the condition
+    r <= rH (1 -/+ cos theta)^(-1/nu) for nu > 0 but costs one pow and never forms 1/omc.
+    """
+    z_im_now = s + zJ
+    x = (xi * cos_i) + (z_im_now * sin_i)
+    y = yi
+    z = (z_im_now * cos_i) - (xi * sin_i)
+    R2 = (x * x) + (y * y)
+    r = math.sqrt(R2 + (z * z))
+    az = abs(z)
+    big = (r + az) / r  # 1 + |cos theta|
+    small = R2 / (r * (r + az))  # 1 - |cos theta|, without cancellation
+    if z >= 0.0:
+        omc = small
+        opc = big
+    else:
+        omc = big
+        opc = small
+    rnu = r**nu
+    w_up = rnu * omc * inv_rHnu
+    w_lo = rnu * opc * inv_rHnu
+    inj = ((w_up <= 1.0) or (w_lo <= 1.0)) and (r > r_min)
+    if inj and omc_fp_cut > 0.0:
+        # footpoint via the half-angle identity (see _rtheta_chain); the two-sided cut
+        # theta_fp < theta_cut or theta_fp > pi - theta_cut is 1 - |cos theta_fp| < omc_cut
+        cos_fp = (1.0 - w_up) if w_up < 1.0 else (w_lo - 1.0)
+        if (1.0 - abs(cos_fp)) < omc_fp_cut:
+            inj = False
+    return inj
+
+
+N_BISECT = 60  # bisection steps that locate a segment end; stops early at float resolution
+
+
+@njit(cache=True, parallel=True)
+def jet_segments(x_im_f, y_im_f, z_J_f, z_im_1D, P, max_int):
+    """
+    For every pixel, the segments [s_in, s_out] of its line of sight (offsets s from z_J)
+    that lie inside the jet, and the first and last grid cells each one overlaps.  The
+    ray is sampled at every cell edge and center, and where the inside/outside status
+    changes the crossing is located by bisection.  (A dip in or out of the jet shorter
+    than half a cell can be missed, as the cell-center test missed it before.)
+
+    Returns (seg_in, seg_out, c_lo, c_hi, nint, ncell): ncell[pix] is the number of cells
+    the pixel's segments overlap, i.e. the number of cells evaluated.  nint[pix] may
+    exceed max_int, in which case the caller must retry with a larger max_int.
     """
     cos_i = P[P_COS_I]
     sin_i = P[P_SIN_I]
     rH = P[P_RH]
     nu = P[P_NU]
     cut = P[P_JET_CUTOUT]
-    r_min = rH * (1.0 + 1.0e-2)
-    Npix = x_im_f.shape[0]
-    Nz = z_mid_1D.shape[0]
-    starts = np.full((Npix, max_int), -1, dtype=np.int32)
-    ends = np.full((Npix, max_int), -1, dtype=np.int32)
-    nint = np.zeros(Npix, dtype=np.int32)
-    ncell = np.zeros(Npix, dtype=np.int64)
     inv_rHnu = P[P_INV_RHNU]
+    r_min = rH * (1.0 + 1.0e-2)
     # 1 - cos(theta_fp_cut) with theta_fp_cut = 2 arcsin(cut/sqrt(2))
     omc_fp_cut = cut * cut if cut > 0.0 else -1.0
+    Npix = x_im_f.shape[0]
+    Nz = z_im_1D.shape[0]
+    nscan = 2 * Nz - 1
+    seg_in = np.zeros((Npix, max_int))
+    seg_out = np.zeros((Npix, max_int))
+    c_lo = np.full((Npix, max_int), -1, dtype=np.int32)
+    c_hi = np.full((Npix, max_int), -1, dtype=np.int32)
+    nint = np.zeros(Npix, dtype=np.int32)
+    ncell = np.zeros(Npix, dtype=np.int64)
     for pix in prange(Npix):
-        inside = False
+        xi = x_im_f[pix]
+        yi = y_im_f[pix]
+        zJ = z_J_f[pix]
         k = 0
         cnt = 0
-        for i in range(Nz):
-            z_im_now = z_mid_1D[i] + z_J_f[pix]
-            x = (x_im_f[pix] * cos_i) + (z_im_now * sin_i)
-            y = y_im_f[pix]
-            z = (z_im_now * cos_i) - (x_im_f[pix] * sin_i)
-            R2 = (x * x) + (y * y)
-            r = math.sqrt(R2 + (z * z))
-            az = abs(z)
-            big = (r + az) / r  # 1 + |cos theta|
-            small = R2 / (r * (r + az))  # 1 - |cos theta|, without cancellation
-            if z >= 0.0:
-                omc = small
-                opc = big
+        prev_s = z_im_1D[0]
+        prev_in = _flat_inside(xi, yi, zJ, prev_s, cos_i, sin_i, r_min, nu, inv_rHnu, omc_fp_cut)
+        s_in = prev_s
+        cell_in = 0
+        for j in range(1, nscan):
+            # scan point j: cell edge j/2 for even j, the center of cell (j-1)/2 for odd j
+            if j % 2 == 0:
+                s = z_im_1D[j // 2]
             else:
-                omc = big
-                opc = small
-            # A point is inside a jet lobe when its stream function does not exceed the
-            # edge value: r^nu (1 -/+ cos theta) <= rH^nu.  Testing it that way rather
-            # than as r <= rH (1 -/+ cos theta)^(-1/nu) is the same condition for nu > 0,
-            # but costs one pow instead of two and never forms 1/omc -- which is what
-            # underflowed to a division by zero for near-axis samples on wide log grids.
-            rnu = r**nu
-            w_up = rnu * omc * inv_rHnu
-            w_lo = rnu * opc * inv_rHnu
-            inj = ((w_up <= 1.0) or (w_lo <= 1.0)) and (r > r_min)
-            if inj and omc_fp_cut > 0.0:
-                # footpoint via the half-angle identity (see _rtheta_chain); the two-sided
-                # cut theta_fp < theta_cut or theta_fp > pi - theta_cut is the single
-                # condition 1 - |cos theta_fp| < 1 - cos(theta_cut)
-                cos_fp = (1.0 - w_up) if w_up < 1.0 else (w_lo - 1.0)
-                if (1.0 - abs(cos_fp)) < omc_fp_cut:
-                    inj = False
-            if inj:
-                cnt += 1
-                if not inside:
-                    inside = True
+                s = 0.5 * (z_im_1D[j // 2] + z_im_1D[j // 2 + 1])
+            now_in = _flat_inside(xi, yi, zJ, s, cos_i, sin_i, r_min, nu, inv_rHnu, omc_fp_cut)
+            if now_in != prev_in:
+                lo = prev_s
+                hi = s
+                for _ in range(N_BISECT):
+                    mid = 0.5 * (lo + hi)
+                    if mid <= lo or mid >= hi:
+                        break
+                    if _flat_inside(xi, yi, zJ, mid, cos_i, sin_i, r_min, nu, inv_rHnu,
+                                    omc_fp_cut) == prev_in:
+                        lo = mid
+                    else:
+                        hi = mid
+                crossing = 0.5 * (lo + hi)
+                cell = (j - 1) // 2  # the cell that holds [scan point j-1, scan point j]
+                if now_in:
+                    s_in = crossing
+                    cell_in = cell
+                else:
                     if k < max_int:
-                        starts[pix, k] = i
-            elif inside:
-                inside = False
-                if k < max_int:
-                    ends[pix, k] = i
-                k += 1
-        if inside:
+                        seg_in[pix, k] = s_in
+                        seg_out[pix, k] = crossing
+                        c_lo[pix, k] = cell_in
+                        c_hi[pix, k] = cell
+                    cnt += cell - cell_in + 1
+                    k += 1
+            prev_in = now_in
+            prev_s = s
+        if prev_in:
             if k < max_int:
-                ends[pix, k] = Nz
+                seg_in[pix, k] = s_in
+                seg_out[pix, k] = z_im_1D[Nz - 1]
+                c_lo[pix, k] = cell_in
+                c_hi[pix, k] = Nz - 2
+            cnt += (Nz - 2) - cell_in + 1
             k += 1
         nint[pix] = k
         ncell[pix] = cnt
-    return starts, ends, nint, ncell
+    return seg_in, seg_out, c_lo, c_hi, nint, ncell
+
+
+@njit(cache=True, inline="always")
+def _cell_overlap(z_im_1D, i, s_in, s_out, rg):
+    """
+    Midpoint (offset s) and path length (cm) of the part of grid cell i that lies inside
+    the segment [s_in, s_out].  For a cell wholly inside the segment these are the
+    cell's center and full length, computed exactly as z_mid_1D and dz_1D are.
+    """
+    lo = z_im_1D[i]
+    hi = z_im_1D[i + 1]
+    if s_in > lo:
+        lo = s_in
+    if s_out < hi:
+        hi = s_out
+    return 0.5 * (lo + hi), rg * (hi - lo)
 
 
 # ----------------------------------------------------------------------------- per-cell physics
@@ -793,24 +871,29 @@ def build_field_table(logr, ugrid, P, xs_tab, rs_tab, ts_tab, as_tab, hemisphere
     return T
 
 
+@njit(cache=True, inline="always")
+def _bilinear(T, ir, iu, k, w00, w01, w10, w11):
+    """Quantity k of the field table, bilinearly interpolated in cell (ir, iu)."""
+    return (
+        w00 * T[ir, iu, k]
+        + w01 * T[ir, iu + 1, k]
+        + w10 * T[ir + 1, iu, k]
+        + w11 * T[ir + 1, iu + 1, k]
+    )
+
+
 @njit(cache=True)
-def _cell_state_tab(xi, yi, zJ, zi, P, Tup, Tlo, logr0, invdlogr, nr, invdu, nu_):
-    """Same as _cell_state, with the (r,theta)-only part interpolated from the field table."""
-    cos_i = P[P_COS_I]
-    sin_i = P[P_SIN_I]
+def _rtheta_tab(r, omc, sgn, P, Tup, Tlo, logr0, invdlogr, nr, invdu, nu_):
+    """
+    The (r,theta)-only physics of one point interpolated from the field table: the
+    counterpart of _rtheta_chain, with the same arguments (omc = 1 - |cos theta|,
+    sgn = sign(cos theta)) and the same return values.
+    """
     rH = P[P_RH]
     s = P[P_S]
-    z_im_now = zi + zJ
-    x = (xi * cos_i) + (z_im_now * sin_i)
-    y = yi
-    z = (z_im_now * cos_i) - (xi * sin_i)
-    R2 = (x * x) + (y * y)
-    r = math.sqrt(R2 + (z * z))
-    R = math.sqrt(R2)
-    omc = R2 / (r * (r + abs(z)))  # 1 - |cos theta|, without cancellation
     r_rH_1_s = (r / rH) ** (1.0 - s)
     u = r_rH_1_s * math.sqrt(omc)  # sqrt(psi/psi_edge)
-    T = Tup if z >= 0.0 else Tlo
+    T = Tup if sgn > 0.0 else Tlo
     fr = (math.log10(r - rH) - logr0) * invdlogr
     if fr < 0.0:
         fr = 0.0
@@ -829,19 +912,42 @@ def _cell_state_tab(xi, yi, zJ, zi, P, Tup, Tlo, logr0, invdlogr, nr, invdu, nu_
     w01 = (1.0 - tr) * tu
     w10 = tr * (1.0 - tu)
     w11 = tr * tu
-    q = np.empty(N_TAB)
-    for k in range(N_TAB):
-        q[k] = (
-            w00 * T[ir, iu, k]
-            + w01 * T[ir, iu + 1, k]
-            + w10 * T[ir + 1, iu, k]
-            + w11 * T[ir + 1, iu + 1, k]
-        )
-    inv_cont = 1.0 / _cont(q[9], P)
-    return _ray_part(
-        x, y, z, r, R, q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7], q[9],
-        q[10] * inv_cont, q[11] * inv_cont, P
+    gc = _bilinear(T, ir, iu, 9, w00, w01, w10, w11)
+    inv_cont = 1.0 / _cont(gc, P)
+    return (
+        _bilinear(T, ir, iu, 0, w00, w01, w10, w11),
+        _bilinear(T, ir, iu, 1, w00, w01, w10, w11),
+        _bilinear(T, ir, iu, 2, w00, w01, w10, w11),
+        _bilinear(T, ir, iu, 3, w00, w01, w10, w11),
+        _bilinear(T, ir, iu, 4, w00, w01, w10, w11),
+        _bilinear(T, ir, iu, 5, w00, w01, w10, w11),
+        _bilinear(T, ir, iu, 6, w00, w01, w10, w11),
+        _bilinear(T, ir, iu, 7, w00, w01, w10, w11),
+        _bilinear(T, ir, iu, 8, w00, w01, w10, w11),
+        gc,
+        _bilinear(T, ir, iu, 10, w00, w01, w10, w11) * inv_cont,
+        _bilinear(T, ir, iu, 11, w00, w01, w10, w11) * inv_cont,
     )
+
+
+@njit(cache=True)
+def _cell_state_tab(xi, yi, zJ, zi, P, Tup, Tlo, logr0, invdlogr, nr, invdu, nu_):
+    """Same as _cell_state, with the (r,theta)-only part interpolated from the field table."""
+    cos_i = P[P_COS_I]
+    sin_i = P[P_SIN_I]
+    z_im_now = zi + zJ
+    x = (xi * cos_i) + (z_im_now * sin_i)
+    y = yi
+    z = (z_im_now * cos_i) - (xi * sin_i)
+    R2 = (x * x) + (y * y)
+    r = math.sqrt(R2 + (z * z))
+    R = math.sqrt(R2)
+    omc = R2 / (r * (r + abs(z)))  # 1 - |cos theta|, without cancellation
+    sgn = 1.0 if z >= 0.0 else -1.0
+    vr, vt, vp, gamma, alpha, Bpr, Bpt, Bpp, Bpm, gc, Kj, Ka = _rtheta_tab(
+        r, omc, sgn, P, Tup, Tlo, logr0, invdlogr, nr, invdu, nu_
+    )
+    return _ray_part(x, y, z, r, R, vr, vt, vp, gamma, alpha, Bpr, Bpt, Bpp, gc, Kj, Ka, P)
 
 
 @njit(cache=True)
@@ -949,6 +1055,12 @@ def _rt_step(I_acc, atten, jI, alphaI, g, dz):
 
 
 # ----------------------------------------------------------------------------- drivers
+#
+# Every driver walks a ray's jet segments in order (front to back) and, within each, the
+# grid cells the segment overlaps; _cell_overlap gives the midpoint and path length of
+# the part of the cell inside the jet.
+
+
 @njit(cache=True, parallel=True)
 def rt_kernel(
     frequency,
@@ -956,10 +1068,11 @@ def rt_kernel(
     x_im_f,
     y_im_f,
     z_J_f,
-    z_mid_1D,
-    dz_1D,
-    starts,
-    ends,
+    z_im_1D,
+    seg_in,
+    seg_out,
+    c_lo,
+    c_hi,
     nint,
     P,
     xs_tab,
@@ -978,6 +1091,7 @@ def rt_kernel(
     """Full computation for one frequency: state and coefficients evaluated on the fly."""
     # a stopping optical depth is a stopping attenuation
     atten_stop = math.exp(-tau_stop) if tau_stop > 0.0 else -1.0
+    rg = P[P_RG]
     Npix = order.shape[0]
     for q in prange(Npix):
         pix = order[q]
@@ -990,14 +1104,17 @@ def rt_kernel(
         for k in range(nint[pix]):
             if done:
                 break
-            for i in range(starts[pix, k], ends[pix, k]):
+            s_in = seg_in[pix, k]
+            s_out = seg_out[pix, k]
+            for i in range(c_lo[pix, k], c_hi[pix, k] + 1):
+                zi, ds = _cell_overlap(z_im_1D, i, s_in, s_out, rg)
                 g, nup, gamma_c, Cj, Ca = _cell_state(
-                    xi, yi, zJ, z_mid_1D[i], P, xs_tab, rs_tab, ts_tab, as_tab
+                    xi, yi, zJ, zi, P, xs_tab, rs_tab, ts_tab, as_tab
                 )
                 jI, alphaI = _cell_emis(
                     frequency, g, nup, gamma_c, Cj, Ca, P, T0, T1, T2, T3, T4, T5
                 )
-                I_acc, atten = _rt_step(I_acc, atten, jI, alphaI, g, dz_1D[i])
+                I_acc, atten = _rt_step(I_acc, atten, jI, alphaI, g, ds)
                 if atten <= atten_stop:
                     done = True
                     break
@@ -1011,9 +1128,11 @@ def precompute_state(
     x_im_f,
     y_im_f,
     z_J_f,
-    z_mid_1D,
-    starts,
-    ends,
+    z_im_1D,
+    seg_in,
+    seg_out,
+    c_lo,
+    c_hi,
     nint,
     P,
     xs_tab,
@@ -1025,9 +1144,10 @@ def precompute_state(
     st_gc,
     st_Cj,
     st_Ca,
-    st_iz,
+    st_ds,
 ):
-    """Store the frequency-independent state of every jet cell, ray by ray."""
+    """Store the frequency-independent state and path length of every jet cell, ray by ray."""
+    rg = P[P_RG]
     Npix = order.shape[0]
     for q in prange(Npix):
         pix = order[q]
@@ -1036,16 +1156,19 @@ def precompute_state(
         yi = y_im_f[pix]
         zJ = z_J_f[pix]
         for k in range(nint[pix]):
-            for i in range(starts[pix, k], ends[pix, k]):
+            s_in = seg_in[pix, k]
+            s_out = seg_out[pix, k]
+            for i in range(c_lo[pix, k], c_hi[pix, k] + 1):
+                zi, ds = _cell_overlap(z_im_1D, i, s_in, s_out, rg)
                 g, nup, gamma_c, Cj, Ca = _cell_state(
-                    xi, yi, zJ, z_mid_1D[i], P, xs_tab, rs_tab, ts_tab, as_tab
+                    xi, yi, zJ, zi, P, xs_tab, rs_tab, ts_tab, as_tab
                 )
                 st_g[o] = g
                 st_nup[o] = nup
                 st_gc[o] = gamma_c
                 st_Cj[o] = Cj
                 st_Ca[o] = Ca
-                st_iz[o] = i
+                st_ds[o] = ds
                 o += 1
 
 
@@ -1054,7 +1177,6 @@ def rt_from_state(
     frequency,
     order,
     offsets,
-    dz_1D,
     P,
     T0,
     T1,
@@ -1068,7 +1190,7 @@ def rt_from_state(
     st_gc,
     st_Cj,
     st_Ca,
-    st_iz,
+    st_ds,
     I_out,
 ):
     """Transfer for one frequency from the stored state (frequency-dependent part only)."""
@@ -1084,7 +1206,7 @@ def rt_from_state(
             jI, alphaI = _cell_emis(
                 frequency, g, st_nup[o], st_gc[o], st_Cj[o], st_Ca[o], P, T0, T1, T2, T3, T4, T5
             )
-            I_acc, atten = _rt_step(I_acc, atten, jI, alphaI, g, dz_1D[st_iz[o]])
+            I_acc, atten = _rt_step(I_acc, atten, jI, alphaI, g, st_ds[o])
             if atten <= atten_stop:
                 break
         I_out[pix] = I_acc
@@ -1097,10 +1219,11 @@ def rt_kernel_tab(
     x_im_f,
     y_im_f,
     z_J_f,
-    z_mid_1D,
-    dz_1D,
-    starts,
-    ends,
+    z_im_1D,
+    seg_in,
+    seg_out,
+    c_lo,
+    c_hi,
     nint,
     P,
     Tup,
@@ -1122,6 +1245,7 @@ def rt_kernel_tab(
     """As rt_kernel, with the (r,theta)-only physics interpolated from the field table."""
     # a stopping optical depth is a stopping attenuation
     atten_stop = math.exp(-tau_stop) if tau_stop > 0.0 else -1.0
+    rg = P[P_RG]
     Npix = order.shape[0]
     for q in prange(Npix):
         pix = order[q]
@@ -1134,14 +1258,17 @@ def rt_kernel_tab(
         for k in range(nint[pix]):
             if done:
                 break
-            for i in range(starts[pix, k], ends[pix, k]):
+            s_in = seg_in[pix, k]
+            s_out = seg_out[pix, k]
+            for i in range(c_lo[pix, k], c_hi[pix, k] + 1):
+                zi, ds = _cell_overlap(z_im_1D, i, s_in, s_out, rg)
                 g, nup, gamma_c, Cj, Ca = _cell_state_tab(
-                    xi, yi, zJ, z_mid_1D[i], P, Tup, Tlo, logr0, invdlogr, nr, invdu, nu_
+                    xi, yi, zJ, zi, P, Tup, Tlo, logr0, invdlogr, nr, invdu, nu_
                 )
                 jI, alphaI = _cell_emis(
                     frequency, g, nup, gamma_c, Cj, Ca, P, T0, T1, T2, T3, T4, T5
                 )
-                I_acc, atten = _rt_step(I_acc, atten, jI, alphaI, g, dz_1D[i])
+                I_acc, atten = _rt_step(I_acc, atten, jI, alphaI, g, ds)
                 if atten <= atten_stop:
                     done = True
                     break
@@ -1155,9 +1282,11 @@ def precompute_state_tab(
     x_im_f,
     y_im_f,
     z_J_f,
-    z_mid_1D,
-    starts,
-    ends,
+    z_im_1D,
+    seg_in,
+    seg_out,
+    c_lo,
+    c_hi,
     nint,
     P,
     Tup,
@@ -1172,9 +1301,10 @@ def precompute_state_tab(
     st_gc,
     st_Cj,
     st_Ca,
-    st_iz,
+    st_ds,
 ):
     """As precompute_state, with the (r,theta)-only physics interpolated from the field table."""
+    rg = P[P_RG]
     Npix = order.shape[0]
     for q in prange(Npix):
         pix = order[q]
@@ -1183,14 +1313,17 @@ def precompute_state_tab(
         yi = y_im_f[pix]
         zJ = z_J_f[pix]
         for k in range(nint[pix]):
-            for i in range(starts[pix, k], ends[pix, k]):
+            s_in = seg_in[pix, k]
+            s_out = seg_out[pix, k]
+            for i in range(c_lo[pix, k], c_hi[pix, k] + 1):
+                zi, ds = _cell_overlap(z_im_1D, i, s_in, s_out, rg)
                 g, nup, gamma_c, Cj, Ca = _cell_state_tab(
-                    xi, yi, zJ, z_mid_1D[i], P, Tup, Tlo, logr0, invdlogr, nr, invdu, nu_
+                    xi, yi, zJ, zi, P, Tup, Tlo, logr0, invdlogr, nr, invdu, nu_
                 )
                 st_g[o] = g
                 st_nup[o] = nup
                 st_gc[o] = gamma_c
                 st_Cj[o] = Cj
                 st_Ca[o] = Ca
-                st_iz[o] = i
+                st_ds[o] = ds
                 o += 1

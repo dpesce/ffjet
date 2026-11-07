@@ -105,7 +105,7 @@ def test_precomputed_state_matches_full_kernel(name):
     freqs = (2.0, 86.0, 1.0e5)
     full = [model.make_image(f, backend="numba")[2] for f in freqs]
     nbytes = model.precompute_state()
-    assert nbytes == 44 * model.n_jet_cells
+    assert nbytes == 48 * model.n_jet_cells
     for f, I_full in zip(freqs, full):
         _, _, I_cached = model.make_image(f, backend="numba")
         _compare(I_full, I_cached, rtol=1e-11)
@@ -125,31 +125,20 @@ def test_precompute_state_memory_guard():
 
 
 @numba_only
-def test_jet_cell_count_matches_numpy_mask():
-    """The compiled interval finder must select exactly the cells the numpy loop uses."""
-    model = jf.JetModel(**CONFIGS["log"])
-    rH, nu, s = model.rH, model.nu, model.s
-    count = 0
-    for i in range(len(model.z_im_1D) - 1):
-        z_im_now = model.z_mid_1D[i] + model.z_J_f
-        x = model.x_im_f * model.cos_i + z_im_now * model.sin_i
-        y = model.y_im_f
-        z = z_im_now * model.cos_i - model.x_im_f * model.sin_i
-        r = np.sqrt(x * x + y * y + z * z)
-        ct = z / r
-        rjet1 = rH * np.power(1.0 / (1.0 - ct), 1.0 / nu)
-        rjet2 = rH * np.power(1.0 / (1.0 + ct), 1.0 / nu)
-        ind = ((r <= rjet1) | (r <= rjet2)) & (r > rH * 1.01)
-        r_rH_1_s = np.power(r / rH, 1.0 - s)
-        arg_s = r_rH_1_s * np.sqrt(0.5 * (1.0 - ct))
-        arg_c = r_rH_1_s * np.sqrt(0.5 * (1.0 + ct))
-        theta_fp = np.where(
-            arg_s < 1.0 / np.sqrt(2.0), 2.0 * np.arcsin(arg_s), 2.0 * np.arccos(arg_c)
-        )
-        cut = 2.0 * np.arcsin(model.jet_cutout_fraction / np.sqrt(2.0))
-        ind &= ~((theta_fp < cut) | (theta_fp > np.pi - cut))
-        count += int(ind.sum())
-    assert model.n_jet_cells == count
+@pytest.mark.parametrize("name", list(CONFIGS))
+def test_jet_segments_match_numpy(name):
+    """The compiled segment finder and its numpy counterpart must find the same segments."""
+    model = jf.JetModel(**CONFIGS[name])
+    iv = model._get_intervals()
+    seg_in, seg_out, nint = model._jet_segments_numpy()
+    np.testing.assert_array_equal(iv["nint"], nint)
+    assert nint.sum() > 0
+    for pix in np.flatnonzero(nint):
+        k = nint[pix]
+        # the two bisections follow the same arithmetic; allow for the last ulp of pow
+        scale = np.abs(model.z_im_1D).max()
+        np.testing.assert_allclose(iv["seg_in"][pix, :k], seg_in[pix, :k], rtol=0, atol=1e-12 * scale)
+        np.testing.assert_allclose(iv["seg_out"][pix, :k], seg_out[pix, :k], rtol=0, atol=1e-12 * scale)
 
 
 def test_backend_selection_and_errors():
