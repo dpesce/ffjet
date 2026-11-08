@@ -10,7 +10,8 @@ packing) and adds
     Tsunetoe et al. 2025);
   * the Faraday rotativities rho_Q and rho_V, in either of two schemes -- see
     _rotativities.py for the formulae, the measured accuracy of each, and why the
-    HS11 scheme reduces to table lookups;
+    HS11 scheme reduces to table lookups -- made those of the model's anisotropic
+    electrons by the factors of _anisotropy.py;
   * the local Stokes basis: the observer's sky basis boosted into the fluid frame
     and projected perpendicular to the aberrated photon direction, which fixes the
     rotation angle chi between the fluid-frame magnetic field and the image axes;
@@ -72,6 +73,15 @@ import numpy as np
 from numba import njit, prange
 
 from ._kernel import (  # noqa: F401  (re-exported for the polarized drivers)
+    P_ATAB_FLIP,
+    P_ATAB_INVDLG,
+    P_ATAB_INVL,
+    P_ATAB_INVR0,
+    P_ATAB_LG0,
+    P_ATAB_NG,
+    P_ATAB_NTH,
+    P_ATAB_ON,
+    P_ATAB_ROW0,
     P_COS_I,
     P_ETA,
     P_GAMMA_M,
@@ -215,7 +225,8 @@ def pack_tables_pol(model):
 def pack_rot_tables(model):
     """
     The nine rotativity tables followed by the exact-kinematics correction tables
-    (N_CORR blocks of n_xa rows, each with as many columns as the nine), or a
+    (N_CORR blocks of n_xa rows, each with as many columns as the nine) and the two
+    anisotropy-factor tables of _anisotropy.py (rho_V's rows, then rho_Q's), or a
     placeholder when none are needed.
     """
     tab = getattr(model, "_rtab", None)
@@ -226,7 +237,14 @@ def pack_rot_tables(model):
     ctab = model._ctab
     if ctab.shape[0] != N_CORR or ctab.shape[2] != tab.shape[1]:
         raise ValueError("the rotativity correction tables do not match the rotativity tables")
-    return np.ascontiguousarray(np.vstack([tab, ctab.reshape(-1, ctab.shape[2])]))
+    atab = model._atab
+    if atab.shape[0] != 2 or atab.shape[2] != tab.shape[1]:
+        raise ValueError("the anisotropy-factor tables do not match the rotativity tables")
+    if model._atab_row0 != tab.shape[0] + ctab.shape[0] * ctab.shape[1]:
+        raise ValueError("the anisotropy-factor tables are not where the parameters say")
+    return np.ascontiguousarray(
+        np.vstack([tab, ctab.reshape(-1, ctab.shape[2]), atab.reshape(-1, atab.shape[2])])
+    )
 
 
 # ----------------------------------------------------------------------------- table lookup
@@ -630,6 +648,50 @@ def _rot_hs11(nu_nup, cot, Kap, p1, p2, g1, g2, g3, amp2,
     return rQ, rV
 
 
+@njit(cache=True, inline="always")
+def _aniso_factors(RTAB, cot, gamma_c, branch, P):
+    """
+    The factors (R_V, R_Q) that turn the rotativities of isotropic electrons into those
+    of the cell's anisotropic ones (_anisotropy.py): bilinear in the tables' angle
+    variable u = ln(1 + r/r0)/ln(1 + 1/r0), r = 1 - |cos theta_B'| (|cos theta_B'| when
+    eta > 1), and in log10 gamma_c, clamped at the grid's edges; uncooled cells (branch
+    0) read the column gamma_c = gamma_max.  Exactly (1, 1) for isotropic electrons.
+    """
+    if P[P_ATAB_ON] == 0.0:
+        return 1.0, 1.0
+    c2 = cot * cot
+    c = math.sqrt(c2 / (1.0 + c2))
+    r = c if P[P_ATAB_FLIP] != 0.0 else 1.0 - c
+    nth = P[P_ATAB_NTH]
+    fj = math.log1p(r * P[P_ATAB_INVR0]) * P[P_ATAB_INVL] * (nth - 1.0)
+    if fj < 0.0:
+        fj = 0.0
+    elif fj > nth - 1.000001:
+        fj = nth - 1.000001
+    j = int(fj)
+    tj = fj - j
+    ng = P[P_ATAB_NG]
+    if branch == 0:
+        fi = ng - 1.000001
+    else:
+        fi = (math.log10(gamma_c) - P[P_ATAB_LG0]) * P[P_ATAB_INVDLG]
+        if fi < 0.0:
+            fi = 0.0
+        elif fi > ng - 1.000001:
+            fi = ng - 1.000001
+    i = int(fi)
+    ti = fi - i
+    row = int(P[P_ATAB_ROW0]) + j
+    lo = RTAB[row, i] + ti * (RTAB[row, i + 1] - RTAB[row, i])
+    hi = RTAB[row + 1, i] + ti * (RTAB[row + 1, i + 1] - RTAB[row + 1, i])
+    fV = lo + tj * (hi - lo)
+    row += int(nth)
+    lo = RTAB[row, i] + ti * (RTAB[row, i + 1] - RTAB[row, i])
+    hi = RTAB[row + 1, i] + ti * (RTAB[row + 1, i + 1] - RTAB[row + 1, i])
+    fQ = lo + tj * (hi - lo)
+    return fV, fQ
+
+
 @njit(cache=True)
 def _rotativities(scheme, nu_nup, cot, Kap, P, RTAB, branch, gamma_c):
     """
@@ -641,6 +703,9 @@ def _rotativities(scheme, nu_nup, cot, Kap, P, RTAB, branch, gamma_c):
     p_c = 1/sinh(1/gamma_c) up, i.e. from gamma_c' = coth(1/gamma_c) >= 1 rather than
     from gamma_c, which falls below 1 in the innermost cells (_rotativities.
     fast_cooling_lower_edge).  The JO77 scheme keeps its textbook form.
+
+    Both schemes give the rotativities of isotropic electrons; the factors of
+    _aniso_factors make them those of the model's anisotropic ones.
     """
     if scheme == ROT_NONE:
         return 0.0, 0.0
@@ -691,27 +756,30 @@ def _rotativities(scheme, nu_nup, cot, Kap, P, RTAB, branch, gamma_c):
         w2_lo = P[P_GM_MPP2]
         w2_hi = P[P_GX_MPP2]
     if scheme == ROT_JO77:
-        return _rot_jo77(nu_nup, cot, Kap, p1, p2, g1, g2, g3, amp2)
-    # the HS11 scheme: segment kinds and the log10 |p| of the edges for the corrections
-    lp2 = _log10_momentum(g2)
-    lp3 = _log10_momentum(g3)
-    if branch == 2:
-        u = 1.0 / gamma_c
-        g1 = 1.0 / math.tanh(u)
-        w1_lo = 1.0 / (g1 * g1 * g1)
-        if u > 20.0:
-            lp1 = -(u - math.log(2.0)) / math.log(10.0)
-        else:
-            lp1 = -math.log10(math.sinh(u))
-        seg1 = C_SEG_2
+        rQ, rV = _rot_jo77(nu_nup, cot, Kap, p1, p2, g1, g2, g3, amp2)
     else:
-        lp1 = _log10_momentum(g1)
-        seg1 = C_SEG_P
-    return _rot_hs11(
-        nu_nup, cot, Kap, p1, p2, g1, g2, g3, amp2,
-        rowQ1, rowV1_1, rowV2_1, rowQ2, rowV1_2, rowV2_2,
-        w1_lo, w1_hi, w2_lo, w2_hi, seg1, C_SEG_PP1, lp1, lp2, lp3, RTAB, P,
-    )
+        # the HS11 scheme: segment kinds and the log10 |p| of the edges for the corrections
+        lp2 = _log10_momentum(g2)
+        lp3 = _log10_momentum(g3)
+        if branch == 2:
+            u = 1.0 / gamma_c
+            g1 = 1.0 / math.tanh(u)
+            w1_lo = 1.0 / (g1 * g1 * g1)
+            if u > 20.0:
+                lp1 = -(u - math.log(2.0)) / math.log(10.0)
+            else:
+                lp1 = -math.log10(math.sinh(u))
+            seg1 = C_SEG_2
+        else:
+            lp1 = _log10_momentum(g1)
+            seg1 = C_SEG_P
+        rQ, rV = _rot_hs11(
+            nu_nup, cot, Kap, p1, p2, g1, g2, g3, amp2,
+            rowQ1, rowV1_1, rowV2_1, rowQ2, rowV1_2, rowV2_2,
+            w1_lo, w1_hi, w2_lo, w2_hi, seg1, C_SEG_PP1, lp1, lp2, lp3, RTAB, P,
+        )
+    fV, fQ = _aniso_factors(RTAB, cot, gamma_c, branch, P)
+    return fQ * rQ, fV * rV
 
 
 # ----------------------------------------------------------------------------- coefficients
@@ -729,7 +797,8 @@ def _cell_emis_pol(frequency, g, nup, gamma_c, Cj, Ca, cthB, Kap, P, TAB, RTAB):
     (_kernel._edge_absorption); the anisotropy of the electron distribution enters through the factor
     already folded into C_j and C_a, plus the extra factor 1 + g_eta/(p_i + 2) that a
     pitch-angle-dependent distribution contributes to the circular coefficients
-    (Tsunetoe et al. 2025).  The rotativities come from _rotativities.py.
+    (Tsunetoe et al. 2025).  The rotativities come from _rotativities.py, with the
+    anisotropy factors of _anisotropy.py.
     """
     p = P[P_P]
     gamma_m = P[P_GAMMA_M]

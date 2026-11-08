@@ -218,7 +218,7 @@ def test_circular_emissivity_follows_the_sign_of_the_pitch_angle_cosine(pol_mode
     assert jV[0] == pytest.approx(-jV[1], rel=1e-12)
     assert abs(jV[2]) < 1e-12 * jI[2]
     assert aV[0] == pytest.approx(-aV[1], rel=1e-12)
-    assert rV[0] > 0.0 and rV[1] < 0.0
+    assert rV[0] == pytest.approx(-rV[1], rel=1e-12)
     # and the linear coefficients are even in cos(theta_B')
     assert jQ[0] == pytest.approx(jQ[1], rel=1e-12)
     assert jI[0] > 0.0 and aI[0] > 0.0
@@ -230,8 +230,12 @@ def test_circular_emissivity_follows_the_sign_of_the_pitch_angle_cosine(pol_mode
     # change sign (_kernel._edge_absorption).
     iso = jf.JetModel(m=10.0, a=0.5, inc=60.0, mdot=1e-3, Nx=2, Ny=2, Nz=2, p=2.14, eta=1.0,
                       stokes="IQV")
-    aV_iso = iso._pol_coefficients_numpy(n, nup, gc, cth, nA)[5]
-    assert aV_iso[0] > 0.0 and aV_iso[1] < 0.0
+    c_iso = iso._pol_coefficients_numpy(n, nup, gc, cth, nA)
+    assert c_iso[5][0] > 0.0 and c_iso[5][1] < 0.0
+    # rho_V follows the sign of cos(theta_B') for isotropic electrons; electrons crowded
+    # along the field, as above, rotate the other way beyond some 20-30 deg from it
+    # (_anisotropy.py), so for them only its oddness in cos(theta_B') is checked
+    assert c_iso[7][0] > 0.0 and c_iso[7][1] < 0.0
 
 
 def test_isotropic_distribution_leaves_the_circular_correction_alone():
@@ -669,6 +673,7 @@ def test_hs11_matches_direct_numerical_integration(branch, gamma_c, nu_nup):
     model = jf.JetModel(
         m=10.0, a=0.5, inc=60.0, mdot=1e-3, Nx=2, Ny=2, Nz=2, p=p,
         gamma_m=gm, gamma_max=gx, rotativities="HS11",
+        eta=1.0,  # the isotropic scheme itself; the anisotropy factors: test_anisotropy.py
     )
     cth = 0.5
     # K_a/nu_p is the scale the schemes are written in; any positive value will do
@@ -719,6 +724,7 @@ def test_fast_cooled_rotation_tends_to_that_of_cold_electrons():
     model = jf.JetModel(
         m=10.0, a=0.5, inc=60.0, mdot=1e-3, Nx=2, Ny=2, Nz=2, p=p,
         gamma_m=gm, gamma_max=gx, rotativities="HS11",
+        eta=1.0,  # the isotropic scheme itself; the anisotropy factors: test_anisotropy.py
     )
     cth, nu_nup, Kap = 0.5, 3.0e4, 1.0
     cot = cth / np.sqrt(1.0 - cth * cth)
@@ -744,6 +750,7 @@ def test_jo77_reduces_to_the_single_power_law_form(nu_nup):
     model = jf.JetModel(
         m=10.0, a=0.5, inc=60.0, mdot=1e-3, Nx=2, Ny=2, Nz=2, p=p,
         gamma_m=gm, gamma_max=gx, rotativities="JO77",
+        eta=1.0,  # the isotropic scheme itself; the anisotropy factors: test_anisotropy.py
     )
     cth = 0.5
     Kap = model.prefac_absorp * 1.0e-4 / 1.0
@@ -770,6 +777,7 @@ def test_jo77_rotation_is_the_sum_over_the_electrons(branch, gamma_c):
     model = jf.JetModel(
         m=10.0, a=0.5, inc=60.0, mdot=1e-3, Nx=2, Ny=2, Nz=2, p=p,
         gamma_m=gm, gamma_max=gx, rotativities="JO77",
+        eta=1.0,  # the isotropic scheme itself; the anisotropy factors: test_anisotropy.py
     )
     cth, nA, nup_ghz, nu_nup = 0.5, 1.0e-4, 1.0, 3.0e4
     Kap = model.prefac_absorp * nA / nup_ghz
@@ -804,7 +812,7 @@ def test_hs11_is_the_better_approximation_for_faraday_conversion():
     """
     p, gm, gx = 2.23, 10.0, 1e8
     kw = dict(m=10.0, a=0.5, inc=60.0, mdot=1e-3, Nx=2, Ny=2, Nz=2, p=p,
-              gamma_m=gm, gamma_max=gx)
+              gamma_m=gm, gamma_max=gx, eta=1.0)  # isotropic: the schemes themselves
     hs = jf.JetModel(**kw, rotativities="HS11")
     jo = jf.JetModel(**kw, rotativities="JO77")
     Kap = hs.prefac_absorp * 1.0e-4

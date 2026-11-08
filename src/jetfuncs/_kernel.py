@@ -117,8 +117,19 @@ sigma_T = 6.65246e-25
     P_CTAB_LOGP0,
     P_CTAB_INVDLOGP,
     P_CTAB_NP,
+    # the anisotropy factors of the rotativities (_anisotropy.py): whether they apply, and
+    # the place and grid of their tables in the rotativity table array
+    P_ATAB_ON,
+    P_ATAB_ROW0,
+    P_ATAB_NTH,
+    P_ATAB_INVR0,
+    P_ATAB_INVL,
+    P_ATAB_FLIP,
+    P_ATAB_LG0,
+    P_ATAB_INVDLG,
+    P_ATAB_NG,
     N_PARAMS,
-) = range(62)
+) = range(71)
 
 
 def pack_params(model, heating_prescription="Poynting"):
@@ -200,6 +211,15 @@ def pack_params(model, heating_prescription="Poynting"):
     P[P_CTAB_LOGP0] = getattr(model, "_ctab_logp0", 0.0)
     P[P_CTAB_INVDLOGP] = getattr(model, "_ctab_inv_dlogp", 1.0)
     P[P_CTAB_NP] = getattr(model, "_ctab_np", 0.0)
+    P[P_ATAB_ON] = getattr(model, "_atab_on", 0.0)
+    P[P_ATAB_ROW0] = getattr(model, "_atab_row0", 0.0)
+    P[P_ATAB_NTH] = getattr(model, "_atab_nth", 0.0)
+    P[P_ATAB_INVR0] = getattr(model, "_atab_inv_r0", 1.0)
+    P[P_ATAB_INVL] = getattr(model, "_atab_inv_L", 1.0)
+    P[P_ATAB_FLIP] = getattr(model, "_atab_flip", 0.0)
+    P[P_ATAB_LG0] = getattr(model, "_atab_lg0", 0.0)
+    P[P_ATAB_INVDLG] = getattr(model, "_atab_inv_dlg", 1.0)
+    P[P_ATAB_NG] = getattr(model, "_atab_ng", 0.0)
     return P
 
 

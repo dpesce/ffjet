@@ -11,6 +11,7 @@ from astropy.io import fits
 from astropy.wcs import WCS
 from astropy.time import Time
 
+from . import _anisotropy as _aniso
 from . import _rotativities as _rotmod
 
 # optional progress bar import
@@ -1049,7 +1050,7 @@ class JetModel:
         self._state = None  # per-cell frequency-independent state (see precompute_state)
         self._ftab = None  # 2-D table of the (r,theta)-only physics (see build_field_table)
         self._rtab = None  # Faraday rotativity tables (see _load_rotativity_tables)
-        self._rtab_p = None
+        self._rtab_key = None
         self._kerr_bufs = None  # per-thread trajectory buffers (geometry="kerr")
 
         ####################
@@ -2038,14 +2039,32 @@ class JetModel:
     def _load_rotativity_tables(self):
         """
         Build the nine Faraday-rotativity tables and their exact-kinematics correction
-        tables (see _rotativities.py).  They are built even for the "JO77" and "none"
-        schemes, which do not read them, so that switching scheme on an existing model
-        needs no rebuild; the cost is about 0.3 s and 12 MB.
+        tables (see _rotativities.py), and the tables of the factors that make them the
+        rotativities of the model's anisotropic electrons (see _anisotropy.py).  They are
+        built even for the "JO77" and "none" schemes, which do not read all of them, so
+        that switching scheme on an existing model needs no rebuild; the cost is about
+        0.3 s and 12 MB, and for anisotropic electrons about 0.5 s more (the first time
+        a given eta and p_eta are seen in a process) and 4 MB.
         """
-        if self._rtab is not None and self._rtab_p == self.p:
+        key = (self.p, self.eta, self.p_eta, self.gamma_m, self.gamma_max)
+        if self._rtab is not None and self._rtab_key == key:
             return
         tab, logx, logx0, inv_dlogx, kmax, q = _rotmod.build_tables(self.p)
         ctab, lxa0, inv_dlxa, nxa, lp0, inv_dlp, npp = _rotmod.build_correction_tables(self.p, tab.shape[1])
+        atab, lg0, inv_dlg = _aniso.cell_tables(
+            self.eta, self.p, self.p_eta, self.gamma_m, self.gamma_max, tab.shape[1]
+        )
+        r0, L, flip = _aniso.theta_map(self.eta)
+        self._atab = atab
+        self._atab_on = 0.0 if self.eta == 1.0 else 1.0
+        self._atab_row0 = float(tab.shape[0] + ctab.shape[0] * ctab.shape[1])
+        self._atab_nth = float(atab.shape[1])
+        self._atab_inv_r0 = 1.0 / r0
+        self._atab_inv_L = 1.0 / L
+        self._atab_flip = float(flip)
+        self._atab_lg0 = lg0
+        self._atab_inv_dlg = inv_dlg
+        self._atab_ng = float(atab.shape[2])
         self._rtab = tab
         self._rtab_logx = logx
         self._rtab_logx0 = logx0
@@ -2059,7 +2078,7 @@ class JetModel:
         self._ctab_logp0 = lp0
         self._ctab_inv_dlogp = inv_dlp
         self._ctab_np = npp
-        self._rtab_p = self.p
+        self._rtab_key = key
 
     def make_image_polarized(
         self,
@@ -2080,7 +2099,8 @@ class JetModel:
         unpolarized model uses.  Their polarized synchrotron emission and absorption
         follow Dexter (2016, Eqs. A22-A24 and A41-A43); the Faraday rotativities
         rho_Q and rho_V come from the scheme selected by the model's `rotativities`
-        argument ("HS11", "JO77" or "none" -- see _rotativities.py), and the pitch-angle
+        argument ("HS11", "JO77" or "none" -- see _rotativities.py), made those of
+        the anisotropic electrons by the factors of _anisotropy.py, and the pitch-angle
         anisotropy contributes the extra factor that the circular coefficients pick up
         from a non-isotropic distribution (Tsunetoe et al. 2025).  Each cell is
         advanced with the exact constant-coefficient solution of the 4x4 transfer
@@ -3201,20 +3221,51 @@ class JetModel:
             w1_lo, w1_hi = gc**-3.0, gm**-3.0 * one
             w2_lo, w2_hi = gm ** (-(p + 2.0)) * one, gx ** (-(p + 2.0)) * one
         if self.rotativities == "JO77":
-            return self._rot_jo77_numpy(nn, cot, Kap, p1, p2, g1, g2, g3, amp2)
-        lp2 = self._log10_momentum_np(g2)
-        lp3 = self._log10_momentum_np(g3)
-        if branch == 2:
-            g1, lp1 = _rotmod.fast_cooling_lower_edge(gc)
-            w1_lo = g1**-3.0
-            seg1 = 2
+            rQ, rV = self._rot_jo77_numpy(nn, cot, Kap, p1, p2, g1, g2, g3, amp2)
         else:
-            lp1 = self._log10_momentum_np(g1)
-            seg1 = 0
-        return self._rot_hs11_numpy(
-            nn, cot, Kap, g1, g2, g3, amp2, rows1, rows2, w1_lo, w1_hi, w2_lo, w2_hi,
-            seg1, 1, lp1, lp2, lp3,
-        )
+            lp2 = self._log10_momentum_np(g2)
+            lp3 = self._log10_momentum_np(g3)
+            if branch == 2:
+                g1, lp1 = _rotmod.fast_cooling_lower_edge(gc)
+                w1_lo = g1**-3.0
+                seg1 = 2
+            else:
+                lp1 = self._log10_momentum_np(g1)
+                seg1 = 0
+            rQ, rV = self._rot_hs11_numpy(
+                nn, cot, Kap, g1, g2, g3, amp2, rows1, rows2, w1_lo, w1_hi, w2_lo, w2_hi,
+                seg1, 1, lp1, lp2, lp3,
+            )
+        fV, fQ = self._aniso_factors_numpy(cot, gc, branch)
+        return fQ * rQ, fV * rV
+
+    def _aniso_factors_numpy(self, cot, gamma_c, branch):
+        """The anisotropy factors (R_V, R_Q) of the cells' electrons; mirrors
+        _kernel_pol._aniso_factors."""
+        cot = np.asarray(cot, dtype=float)
+        if self._atab_on == 0.0:
+            return np.ones_like(cot), np.ones_like(cot)
+        c2 = cot * cot
+        c = np.sqrt(c2 / (1.0 + c2))
+        r = c if self._atab_flip != 0.0 else 1.0 - c
+        nth = self._atab_nth
+        fj = np.clip(np.log1p(r * self._atab_inv_r0) * self._atab_inv_L * (nth - 1.0), 0.0, nth - 1.000001)
+        j = fj.astype(np.intp)
+        tj = fj - j
+        ng = self._atab_ng
+        if branch == 0:
+            fi = np.full_like(cot, ng - 1.000001)
+        else:
+            lgc = np.log10(np.asarray(gamma_c, dtype=float) * np.ones_like(cot))
+            fi = np.clip((lgc - self._atab_lg0) * self._atab_inv_dlg, 0.0, ng - 1.000001)
+        i = fi.astype(np.intp)
+        ti = fi - i
+        out = []
+        for T in self._atab:
+            lo = T[j, i] + ti * (T[j, i + 1] - T[j, i])
+            hi = T[j + 1, i] + ti * (T[j + 1, i + 1] - T[j + 1, i])
+            out.append(lo + tj * (hi - lo))
+        return out[0], out[1]
 
     # ------------------------------------------------------------------
     # full-Stokes coefficients and numpy back end
@@ -3229,10 +3280,9 @@ class JetModel:
         absorption are Dexter (2016) Eqs. (A22)-(A24) and (A41)-(A43), summed over the
         two branches exactly as the Stokes I path does; the circular coefficients carry
         the extra factor 1 + g_eta/(p_i + 2) that a pitch-angle-dependent distribution
-        contributes (Tsunetoe et al. 2025).  The rotativities are the power-law forms
-        of Jones & Odell (1977) as given in Dexter's Appendix B1, evaluated on the
-        lowest-energy branch; the second branch is suppressed by
-        (gamma_1/gamma_2)^(1+p_1) and is negligible.
+        contributes (Tsunetoe et al. 2025).  The rotativities are those of
+        _rotativities_numpy in the scheme the model was built with, made those of the
+        anisotropic electrons by the factors of _anisotropy.py.
 
         This is the numpy reference for _kernel_pol._cell_emis_pol.
         """

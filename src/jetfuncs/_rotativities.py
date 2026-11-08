@@ -20,6 +20,11 @@ Two schemes are available, selected with JetModel(rotativities=...):
 
   "none"  rho_Q = rho_V = 0, i.e. emission and absorption only.
 
+Both schemes give the rotativities of isotropic electrons.  The model's electrons are
+anisotropic (pitch-angle parameters eta and p_eta), and the factors of _anisotropy.py,
+which depend on the cell's cooling break and on the angle between the photon and the
+field, turn these into theirs (_kernel_pol._aniso_factors).
+
 ONLY THE ELECTRONS THE DISTRIBUTION CONTAINS.  Kinetic theory gives each rotativity as
 an integral over the slope of the distribution function, df/dp.  Integrating by parts
 turns it into the sum, over the electrons, of the rotativity of one electron (HS11's
