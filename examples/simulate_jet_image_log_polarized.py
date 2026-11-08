@@ -167,7 +167,7 @@ IQUV_new = np.stack(
     ]
 )
 
-# per-pixel maps; pixels below the floor are left as NaN so they do not colour the plot
+# per-pixel maps; pixels below the floor are left as NaN so they do not color the plot
 floor = IQUV_new[0].max() * 1.0e-3
 m_lin, m_circ, chi = jf.polarization_fractions(IQUV_new, floor=floor)
 

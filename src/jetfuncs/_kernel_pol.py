@@ -18,7 +18,7 @@ packing) and adds
     from the closed form of Landi Degl'Innocenti & Landi Degl'Innocenti (1985)
     reproduced in Dexter (2016) Appendix D.
 
-Rays are marched from the observer outwards, in the same order and over the same
+Rays are marched from the observer outward, in the same order and over the same
 cells as the unpolarized kernel, and the emission of each cell is attenuated by the
 material in front of it.  The scalar attenuation exp(-tau) of the Stokes I path
 becomes the cumulative 4x4 operator O_cum = prod_{k in front of i} exp(-K_k ds_k), so
@@ -30,17 +30,22 @@ K_a = prefac_absorp * n_e A_norm, prefac_absorp = e^2/(4 sqrt(3) m_e c 10^9) and
 frequencies in GHz, e^2/(m_e c) = 4 sqrt(3) 10^9 prefac_absorp, and with
 nu_B sin(theta) = (2/3) nu_p and x = nu'/nu_p:
 
-    HS11:  rho_Q = 4 sqrt(3)   (K_a/nu_p) x^-1 [ X_A J_Q + boundary ]
-           rho_V = 8 sqrt(3)/3 (K_a/nu_p) cot(theta_B) x^-2 [ J_V + boundary ]
+    HS11:  rho_Q = 4 sqrt(3)   (K_a/nu_p) x^-1 X_A J_Q
+           rho_V = 8 sqrt(3)/3 (K_a/nu_p) cot(theta_B) x^-2 J_V
     JO77:  rho_Q = 32 sqrt(3)/9 (K_a/nu_p) x^-3 sum_seg int gamma^(1-q) dgamma
-           rho_V = 16 sqrt(3)/3 (K_a/nu_p) cot(theta_B) x^-2 [ int + boundary ]
+           rho_V = 16 sqrt(3)/3 (K_a/nu_p) cot(theta_B) x^-2
+                   sum_seg int gamma^-q ln(2 gamma)/gamma^2 dgamma
+
+Both are sums over the electrons the distribution contains, with no boundary terms at
+its edges; HS11's J_Q and J_V carry exact kinematics and, in fast cooling, the exact shape
+and lower edge of the cooled electrons (_rotativities.py, which says why).
 
 CONVENTIONS  (see also JetModel.make_image_polarized and jetfuncs.sky_view)
 --------------------------------------------------------------------------
 Stokes Q and U are returned in the radio convention: referred to (North, East), so
 that the EVPA is 0.5*atan2(U, Q) measured East of North, and perpendicular to the
 projected fluid-frame magnetic field for optically thin emission.  V > 0 when the
-fluid-frame magnetic field has a component pointing towards the observer
+fluid-frame magnetic field has a component pointing toward the observer
 (cos(theta_B') > 0), the sign convention of Dexter (2016) Eqs. (A14)/(A24) and of
 grtrans/ipole.
 
@@ -52,7 +57,7 @@ degrees so that the approaching jet points right, which flips both North and Eas
 and therefore leaves Q, U and V unchanged -- so the convention is well defined
 without having to know which way the jet points.
 
-The triad (x_im, y_im, n) -- with n the propagation direction towards the observer
+The triad (x_im, y_im, n) -- with n the propagation direction toward the observer
 -- is LEFT handed for this grid, so a raw pcolormesh(x, y, I) is a MIRROR of the
 sky rather than a rotation of it.  Dexter's transfer matrix assumes a right-handed
 triad, so the kernel works internally in the right-handed basis (a, b) =
@@ -89,6 +94,12 @@ from ._kernel import (  # noqa: F401  (re-exported for the polarized drivers)
     P_PHI_NORM,
     P_RG,
     P_ROT_SCHEME,
+    P_CTAB_INVDLOGP,
+    P_CTAB_INVDLOGXA,
+    P_CTAB_LOGP0,
+    P_CTAB_LOGXA0,
+    P_CTAB_NP,
+    P_CTAB_NXA,
     P_RTAB_INVDLOGX,
     P_RTAB_KMAX,
     P_RTAB_LOGX0,
@@ -104,10 +115,12 @@ from ._kernel import (  # noqa: F401  (re-exported for the polarized drivers)
     _rtheta_tab,
 )
 from ._rotativities import (
+    CORR_Q_SCALE,
     HS11_Q_PREFAC,
     HS11_V_PREFAC,
     JO77_Q_PREFAC,
     JO77_V_PREFAC,
+    N_CORR,
     N_ROT_ROWS,
     ROT_ROWS,
     XA_CONST,
@@ -149,8 +162,11 @@ ROT_HS11 = 2
     T_GaV_2,
     T_GaV_P,
     T_GaV_PP1,
+    T_KF,
+    T_KG,
+    T_KH,
     N_TAB_ROWS,
-) = range(19)
+) = range(22)
 
 _TAB_ORDER = (
     "GI_2", "GI_p", "GI_pp1", "GaI_2", "GaI_p", "GaI_pp1",
@@ -160,6 +176,11 @@ _TAB_ORDER = (
 
 # rows of the rotativity table array, in the order _rotativities.ROT_ROWS defines
 (R_Q_P, R_Q_PP1, R_Q_2, R_V1_P, R_V1_PP1, R_V1_2, R_V2_P, R_V2_PP1, R_V2_2) = range(N_ROT_ROWS)
+
+# the exact-kinematics correction tables follow those nine rows, one block of n_xa rows
+# per (segment, rotativity), in the order of _rotativities.CORR_SEGMENTS x CORR_KERNELS;
+# these are the segment indices
+C_SEG_P, C_SEG_PP1, C_SEG_2 = 0, 1, 2
 
 # small-argument coefficient of each synchrotron kernel; see JetModel._TAIL
 _H0 = math.pi / math.sqrt(3.0)
@@ -172,7 +193,10 @@ N_POL_STATE = 9
 
 
 def pack_tables_pol(model):
-    """The eighteen log-tables of the polarized coefficients, as one (18, n) array."""
+    """
+    The eighteen log-tables of the polarized coefficients and the three kernels F, G, H
+    (for the absorption of the distribution's lower edge), as one (21, n) array.
+    """
     rows = []
     for name in _TAB_ORDER:
         tab = getattr(model, "logG_" + name, None)
@@ -183,20 +207,48 @@ def pack_tables_pol(model):
                 f"JetModel.make_image_polarized, which builds them on demand)."
             )
         rows.append(tab)
+    for kernel in ("F", "G", "H"):
+        rows.append(getattr(model, "logK_" + kernel))
     return np.ascontiguousarray(np.vstack(rows))
 
 
 def pack_rot_tables(model):
-    """The nine rotativity tables, or a (9, 1) placeholder when none are needed."""
+    """
+    The nine rotativity tables followed by the exact-kinematics correction tables
+    (N_CORR blocks of n_xa rows, each with as many columns as the nine), or a
+    placeholder when none are needed.
+    """
     tab = getattr(model, "_rtab", None)
     if tab is None:
         # never read: the polarized entry points build the tables first.  Two columns
         # so that an unguarded lookup would still be in bounds.
         return np.zeros((N_ROT_ROWS, 2))
-    return np.ascontiguousarray(tab)
+    ctab = model._ctab
+    if ctab.shape[0] != N_CORR or ctab.shape[2] != tab.shape[1]:
+        raise ValueError("the rotativity correction tables do not match the rotativity tables")
+    return np.ascontiguousarray(np.vstack([tab, ctab.reshape(-1, ctab.shape[2])]))
 
 
 # ----------------------------------------------------------------------------- table lookup
+@njit(cache=True, inline="always")
+def _kernel_value_row(x, TAB, row, logx0, invdlogx, kmax):
+    """_kernel._kernel_value for one row of the packed table array."""
+    if not (x > 0.0):
+        return 0.0
+    f = (math.log10(x) - logx0) * invdlogx
+    if f > kmax + 1.0:
+        return 0.0
+    if f < 0.0:
+        a = TAB[row, 0]
+        return 10.0 ** (a + f * (TAB[row, 1] - a))
+    k = int(f)
+    if k > kmax:
+        k = int(kmax)
+    t = f - k
+    a = TAB[row, k]
+    return 10.0 ** (a + t * (TAB[row, k + 1] - a))
+
+
 @njit(cache=True, inline="always")
 def _G_eval_row(k, t, flag, TAB, row):
     """_G_eval for one row of the packed table array."""
@@ -413,34 +465,6 @@ def _cell_state_tab_pol(xi, yi, zJ, zi, P, Tup, Tlo, logr0, invdlogr, nr, invdu,
 
 # ----------------------------------------------------------------------------- rotativities
 @njit(cache=True, inline="always")
-def _H_B(x, gamma):
-    """HS11 Eq. (54) H_B, evaluated pointwise at a distribution edge."""
-    if x < 40.0:
-        kin = 1.0 - 1.0 / gamma
-        if kin < 0.0:
-            kin = 0.0
-        return 4.67e-9 * (kin**1.5) * (x**3.84)
-    L = math.log(x)
-    L2 = L * L
-    L4 = L2 * L2
-    return (
-        0.864
-        - 0.2082 * L2
-        + 0.0175 * L4
-        - 0.000626 * L4 * L2
-        + 1.0175e-5 * L4 * L4
-        - 7.686e-8 * L4 * L4 * L2
-        - 0.01 * math.exp(-((L - 4.0755) ** 2) / 0.0763)
-    )
-
-
-@njit(cache=True, inline="always")
-def _g_B(x):
-    """HS11 Eq. (54) g_B."""
-    return 1.0 - 0.0045 * (x**0.52)
-
-
-@njit(cache=True, inline="always")
 def _pow_int(a, b, q):
     """int_a^b gamma^(1-q) dgamma, with the logarithmic case at q = 2."""
     if b <= a:
@@ -472,8 +496,10 @@ def _rot_jo77(nu_nup, cot, Kap, p1, p2, g1, g2, g3, amp2):
     gamma_1^(2-p) [1 - (gamma_1/gamma_*)^(p-2)]/((p-2)/2) = 2 int_{gamma_1}^{gamma_*}
     gamma^(1-p) dgamma with gamma_* = sqrt(nu'/(nu_B sin theta)) = sqrt(1.5 nu'/nu_p),
     so the generalization to a broken power law is just a matter of limits.  rho_V
-    carries the boundary term of HS11 Eq. (56), which is where the factor (p+2) of
-    Dexter's Eq. (B2) comes from.
+    is the ultrarelativistic rotation of one electron, ln(2 gamma)/gamma^2, summed over
+    the distribution.  Dexter's Eq. (B2) also carries the boundary term of HS11 Eq. (56)
+    at gamma_min, which is where its factor (p+2) comes from; it is left out here, as in
+    the HS11 scheme (see _rotativities.py).
     """
     gstar = math.sqrt(1.5 * nu_nup)
     hi1 = g2 if g2 < gstar else gstar
@@ -487,52 +513,98 @@ def _rot_jo77(nu_nup, cot, Kap, p1, p2, g1, g2, g3, amp2):
     integ = _log_int(g1, g2, p1)
     if amp2 > 0.0:
         integ += amp2 * _log_int(g2, g3, p2)
-    s1 = g1 ** (-p1)
-    s3 = amp2 * g3 ** (-p2) if amp2 > 0.0 else g2 ** (-p1)
-    bnd = s1 * (math.log(2.0 * g1) - 1.0) / g1
-    top = g3 if amp2 > 0.0 else g2
-    bnd -= s3 * (math.log(2.0 * top) - 1.0) / top
-    rV = JO77_V_PREFAC * Kap * cot * (integ + bnd) / (nu_nup * nu_nup)
+    rV = JO77_V_PREFAC * Kap * cot * integ / (nu_nup * nu_nup)
     return rQ, rV
+
+
+@njit(cache=True, inline="always")
+def _corr(RTAB, seg, kern, lxa, lp, P):
+    """
+    One exact-kinematics correction table, C_sK(X_A, p) of _rotativities.py, at
+    log10 X_A = lxa and log10 p = lp: bilinear in (log10 X_A, log10 p), zero above the
+    grid in p, extrapolated linearly in log10 p below it (exact for the cooled shape "2",
+    whose integrand per ln p tends to a constant as p -> 0), and clamped in X_A.  kern is
+    0 for rho_Q (stored divided by X_A^CORR_Q_SCALE) and 1 for rho_V.
+    """
+    nxa = int(P[P_CTAB_NXA])
+    npp = P[P_CTAB_NP]
+    fp = (lp - P[P_CTAB_LOGP0]) * P[P_CTAB_INVDLOGP]
+    if fp >= npp - 1.0:
+        return 0.0
+    fa = (lxa - P[P_CTAB_LOGXA0]) * P[P_CTAB_INVDLOGXA]
+    if fa < 0.0:
+        fa = 0.0
+    elif fa > nxa - 1.000001:
+        fa = nxa - 1.000001
+    i = int(fa)
+    ta = fa - i
+    if fp < 0.0:
+        k = 0
+    else:
+        k = int(fp)
+    tp = fp - k
+    row = N_ROT_ROWS + (seg * 2 + kern) * nxa + i
+    lo = RTAB[row, k] + ta * (RTAB[row + 1, k] - RTAB[row, k])
+    hi = RTAB[row, k + 1] + ta * (RTAB[row + 1, k + 1] - RTAB[row, k + 1])
+    return lo + tp * (hi - lo)
+
+
+@njit(cache=True, inline="always")
+def _log10_momentum(g):
+    """log10 sqrt(g^2 - 1), formed as log10 of (g - 1)(g + 1)"""
+    return 0.5 * math.log10((g - 1.0) * (g + 1.0))
 
 
 @njit(cache=True)
 def _rot_hs11(nu_nup, cot, Kap, p1, p2, g1, g2, g3, amp2,
               rowQ1, rowV1_1, rowV2_1, rowQ2, rowV1_2, rowV2_2,
-              w1_lo, w1_hi, w2_lo, w2_hi, s1, RTAB, P):
+              w1_lo, w1_hi, w2_lo, w2_hi, seg1, seg2, lp1, lp2, lp3, RTAB, P):
     """
-    Huang & Shcherbakov (2011) rotativities: their monoenergetic fitting formulae
-    (Eq. 55) integrated over the distribution (Eq. 56).
+    Huang & Shcherbakov (2011) rotativities: their fitting formulae for one electron
+    (Eq. 55), with exact kinematics, summed over the electrons of the distribution.
 
     The integral over each power-law segment is a difference of the tabulated
     x^(q+1) W_q(x) at the segment edges, weighted by gamma^-(q+1) there -- the
     X_A^(q+1) prefactor cancels against the table's scaling.  `w*_lo/hi` carry those
     gamma^-(q+1) factors, which the caller has because they are model constants
-    everywhere except at gamma_c.  The boundary term at gamma_min is evaluated
-    pointwise with the exact kinematics; the one at gamma_max is suppressed by
-    gamma_max^-(p+2) and is dropped, as HS11 themselves do for a power law.
+    everywhere except at gamma_c.  Those tables take |p| -> gamma; the correction tables
+    (_corr) add the rest, and the exact shape of the cooled segments, from the edges'
+    log10 |p|, lp1..lp3, for the segment kinds seg1 and seg2.  An empty first segment
+    (g1 >= g2, which the fast-cooling lower edge reaches only within 0.3% of gamma_m)
+    contributes nothing.  HS11's Eq. (56) adds boundary terms at the edges of the
+    distribution; they are left out, because they are the rotativities of electrons the
+    distribution does not contain (see _rotativities.py).
     """
     logx0 = P[P_RTAB_LOGX0]
     invdlogx = P[P_RTAB_INVDLOGX]
     kmax = P[P_RTAB_KMAX]
     XA = math.sqrt(XA_CONST / nu_nup)
     lnXA = math.log(XA)
+    lxa = lnXA / math.log(10.0)
 
-    x1 = XA * g1
     x2 = XA * g2
-    JQ = (
-        _rot_V(RTAB, rowQ1, x1, logx0, invdlogx, kmax) * w1_lo
-        - _rot_V(RTAB, rowQ1, x2, logx0, invdlogx, kmax) * w1_hi
-    )
-    dV1 = (
-        _rot_V(RTAB, rowV1_1, x1, logx0, invdlogx, kmax) * w1_lo
-        - _rot_V(RTAB, rowV1_1, x2, logx0, invdlogx, kmax) * w1_hi
-    )
-    dV2 = (
-        _rot_V(RTAB, rowV2_1, x1, logx0, invdlogx, kmax) * w1_lo
-        - _rot_V(RTAB, rowV2_1, x2, logx0, invdlogx, kmax) * w1_hi
-    )
-    JV = 2.0 * dV2 - 2.0 * lnXA * dV1
+    JQ = 0.0
+    JV = 0.0
+    if g1 < g2:
+        x1 = XA * g1
+        JQ = (
+            _rot_V(RTAB, rowQ1, x1, logx0, invdlogx, kmax) * w1_lo
+            - _rot_V(RTAB, rowQ1, x2, logx0, invdlogx, kmax) * w1_hi
+        )
+        dV1 = (
+            _rot_V(RTAB, rowV1_1, x1, logx0, invdlogx, kmax) * w1_lo
+            - _rot_V(RTAB, rowV1_1, x2, logx0, invdlogx, kmax) * w1_hi
+        )
+        dV2 = (
+            _rot_V(RTAB, rowV2_1, x1, logx0, invdlogx, kmax) * w1_lo
+            - _rot_V(RTAB, rowV2_1, x2, logx0, invdlogx, kmax) * w1_hi
+        )
+        JV = 2.0 * dV2 - 2.0 * lnXA * dV1
+        cQ = _corr(RTAB, seg1, 0, lxa, lp1, P) - _corr(RTAB, seg1, 0, lxa, lp2, P)
+        cV = _corr(RTAB, seg1, 1, lxa, lp1, P) - _corr(RTAB, seg1, 1, lxa, lp2, P)
+    else:
+        cQ = 0.0
+        cV = 0.0
     if amp2 > 0.0:
         x3 = XA * g3
         JQ += amp2 * (
@@ -548,15 +620,13 @@ def _rot_hs11(nu_nup, cot, Kap, p1, p2, g1, g2, g3, amp2,
             - _rot_V(RTAB, rowV2_2, x3, logx0, invdlogx, kmax) * w2_hi
         )
         JV += amp2 * (2.0 * e2 - 2.0 * lnXA * e1)
+        cQ += amp2 * (_corr(RTAB, seg2, 0, lxa, lp2, P) - _corr(RTAB, seg2, 0, lxa, lp3, P))
+        cV += amp2 * (_corr(RTAB, seg2, 1, lxa, lp2, P) - _corr(RTAB, seg2, 1, lxa, lp3, P))
+    JQ += cQ * math.exp(CORR_Q_SCALE * lnXA)
+    JV += cV
 
-    # boundary term at gamma_min (HS11 Eq. 56), with exact kinematics
-    mom = math.sqrt(g1 * g1 - 1.0) if g1 > 1.0 else 1.0e-12
-    L1 = math.log((1.0 + mom / g1) / max(1.0 - mom / g1, 1.0e-300))
-    bq = s1 * _H_B(x1, g1) / (g1 * mom)
-    bv = s1 * (g1 * L1 - 2.0 * mom) * _g_B(x1) / (g1 * mom)
-
-    rQ = HS11_Q_PREFAC * Kap * (XA * JQ + bq) / nu_nup
-    rV = HS11_V_PREFAC * Kap * cot * (JV + bv) / (nu_nup * nu_nup)
+    rQ = HS11_Q_PREFAC * Kap * (XA * JQ) / nu_nup
+    rV = HS11_V_PREFAC * Kap * cot * JV / (nu_nup * nu_nup)
     return rQ, rV
 
 
@@ -565,6 +635,12 @@ def _rotativities(scheme, nu_nup, cot, Kap, P, RTAB, branch, gamma_c):
     """
     Dispatch to the selected rotativity scheme.  `branch` is 0 for uncooled, 1 for
     slow cooling and 2 for fast cooling, which fixes the segment indices and edges.
+
+    In fast cooling the HS11 scheme counts the cooled electrons below gamma_m as they
+    are with exact cyclo-synchrotron cooling: shape 1/(gamma^2 - 1), from the momentum
+    p_c = 1/sinh(1/gamma_c) up, i.e. from gamma_c' = coth(1/gamma_c) >= 1 rather than
+    from gamma_c, which falls below 1 in the innermost cells (_rotativities.
+    fast_cooling_lower_edge).  The JO77 scheme keeps its textbook form.
     """
     if scheme == ROT_NONE:
         return 0.0, 0.0
@@ -585,7 +661,6 @@ def _rotativities(scheme, nu_nup, cot, Kap, P, RTAB, branch, gamma_c):
         w1_hi = P[P_GX_MPP1]
         w2_lo = 0.0
         w2_hi = 0.0
-        s1 = P[P_GM_MP]
     elif branch == 1:
         # index p from gamma_m to gamma_c, then p + 1 to gamma_max
         p1 = p
@@ -601,7 +676,6 @@ def _rotativities(scheme, nu_nup, cot, Kap, P, RTAB, branch, gamma_c):
         w1_hi = gc_mpp1
         w2_lo = gc_mpp1 / gamma_c
         w2_hi = P[P_GX_MPP2]
-        s1 = P[P_GM_MP]
     else:
         # index 2 from gamma_c to gamma_m, then p + 1 to gamma_max
         p1 = 2.0
@@ -616,13 +690,27 @@ def _rotativities(scheme, nu_nup, cot, Kap, P, RTAB, branch, gamma_c):
         w1_hi = P[P_GM_M3]
         w2_lo = P[P_GM_MPP2]
         w2_hi = P[P_GX_MPP2]
-        s1 = 1.0 / (gamma_c * gamma_c)
     if scheme == ROT_JO77:
         return _rot_jo77(nu_nup, cot, Kap, p1, p2, g1, g2, g3, amp2)
+    # the HS11 scheme: segment kinds and the log10 |p| of the edges for the corrections
+    lp2 = _log10_momentum(g2)
+    lp3 = _log10_momentum(g3)
+    if branch == 2:
+        u = 1.0 / gamma_c
+        g1 = 1.0 / math.tanh(u)
+        w1_lo = 1.0 / (g1 * g1 * g1)
+        if u > 20.0:
+            lp1 = -(u - math.log(2.0)) / math.log(10.0)
+        else:
+            lp1 = -math.log10(math.sinh(u))
+        seg1 = C_SEG_2
+    else:
+        lp1 = _log10_momentum(g1)
+        seg1 = C_SEG_P
     return _rot_hs11(
         nu_nup, cot, Kap, p1, p2, g1, g2, g3, amp2,
         rowQ1, rowV1_1, rowV2_1, rowQ2, rowV1_2, rowV2_2,
-        w1_lo, w1_hi, w2_lo, w2_hi, s1, RTAB, P,
+        w1_lo, w1_hi, w2_lo, w2_hi, seg1, C_SEG_PP1, lp1, lp2, lp3, RTAB, P,
     )
 
 
@@ -637,7 +725,8 @@ def _cell_emis_pol(frequency, g, nup, gamma_c, Cj, Ca, cthB, Kap, P, TAB, RTAB):
 
     Emission and absorption follow Dexter (2016) Eqs. (A22)-(A24) and (A41)-(A43),
     summed over the two branches of the cooled double power law exactly as the Stokes
-    I path does; the anisotropy of the electron distribution enters through the factor
+    I path does, with the absorption less that of the distribution's lower edge
+    (_kernel._edge_absorption); the anisotropy of the electron distribution enters through the factor
     already folded into C_j and C_a, plus the extra factor 1 + g_eta/(p_i + 2) that a
     pitch-angle-dependent distribution contributes to the circular coefficients
     (Tsunetoe et al. 2025).  The rotativities come from _rotativities.py.
@@ -836,6 +925,22 @@ def _cell_emis_pol(frequency, g, nup, gamma_c, Cj, Ca, cthB, Kap, P, TAB, RTAB):
             + (p2 + 2.0) * fV2 * cont * pwaV2
             * _G_diff_row(x3, x2, k3, t3, f3, k2, t2, f2, TAB, T_GaV_PP1, maV2, _H0, e_H, xtail)
         )
+
+    # the absorption of the distribution's lower edge, which the tables leave out
+    # (_kernel._edge_absorption): the jump of N at g_lo, with the kernels G and H for Q
+    # and V; for V the electron's circular emissivity carries a further 1/g, and the
+    # pitch-angle factor 1 + g_eta/(p + 2) does not enter, since the jump is in energy alone
+    if branch == 2:
+        g_lo = gamma_c
+        n_lo = 1.0 / (gamma_c * gamma_c)
+    else:
+        g_lo = gamma_m
+        n_lo = P[P_GM_MP]
+    x_lo = nu_nup / (g_lo * g_lo)
+    edge = 2.0 * Ca * n_lo / (nu_nup * nu_nup)
+    aI -= edge * _kernel_value_row(x_lo, TAB, T_KF, logx0, invdlogx, kmax)
+    aQ -= edge * _kernel_value_row(x_lo, TAB, T_KG, logx0, invdlogx, kmax)
+    aV -= _V_PREFAC * cot * (edge / g_lo) * _kernel_value_row(x_lo, TAB, T_KH, logx0, invdlogx, kmax)
 
     rQ, rV = _rotativities(
         int(P[P_ROT_SCHEME]), nu_nup, cot, Kap, P, RTAB, branch, gamma_c

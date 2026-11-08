@@ -693,7 +693,7 @@ def u_driftframe(
 # full statement).  Stokes Q and U are returned in the radio convention, referred to
 # (North, East), so the EVPA is 0.5*atan2(U, Q) measured East of North and is
 # perpendicular to the projected fluid-frame magnetic field for optically thin
-# emission.  V > 0 when the fluid-frame field points towards the observer.
+# emission.  V > 0 when the fluid-frame field points toward the observer.
 #
 # The observer sits on the -z_im side of the image plane, so the un-mirrored view of
 # the sky has -x_im to the right and +y_im up, putting North along +y_im and East
@@ -922,7 +922,7 @@ class JetModel:
 
       geometry="flat"  straight lines of sight (the default)
       geometry="kerr"  null geodesics of the Kerr metric of the model's spin a, traced
-                       backwards from a distant observer at polar angle inc; light
+                       backward from a distant observer at polar angle inc; light
                        bending, the photon's local direction and energy (including
                        frame dragging) and the transport of the polarization basis
                        along each ray are all included.  Requires numba (the rays are
@@ -1164,7 +1164,7 @@ class JetModel:
 
     def _build_stagnation_surface(self):
         """
-        Stagnation surface, tabulated on n_stagnation field lines (labelled by the
+        Stagnation surface, tabulated on n_stagnation field lines (labeled by the
         polar angle theta_H at which they thread the horizon, log-spaced in theta_H).
 
         The stagnation point is where the field-parallel derivative of the corotation
@@ -1179,7 +1179,7 @@ class JetModel:
         which is evaluated directly and so cannot overflow.  (Parameterizing by theta
         instead requires r = r_H [(1-cos theta_H)/(1-cos theta)]^(1/nu), which overflows
         to inf for small theta -- badly so when 1/nu is large.  Nderiv(inf, ...) is NaN,
-        `NaN > 0` is False, and a bisection then walks towards the overflowing end and
+        `NaN > 0` is False, and a bisection then walks toward the overflowing end and
         returns r_stag = inf with no error.)
 
         The root is bracketed on a coarse logarithmic radius grid and then bisected in
@@ -1211,7 +1211,7 @@ class JetModel:
             with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
                 return Nderiv(r, th, a, Omega_H, 1.0, bf)
 
-        # bracket: scan outwards from just outside the horizon and take the innermost
+        # bracket: scan outward from just outside the horizon and take the innermost
         # sign change of N' on each field line
         r_lo_scan = rH * (1.0 + 1.0e-9)
         lo, hi = np.log10(r_lo_scan), np.log10(self._STAG_R_MAX)
@@ -1364,7 +1364,7 @@ class JetModel:
         # The integration grid ends *at* the jet boundary rather than at a fixed outer radius.
         # The boundary radius grows as z^s, so with a fixed grid it moves across grid points as
         # the parameters change, and the integral -- hence this normalization, and with it every
-        # flux the model produces -- jumps by several per cent each time a point crosses it: a
+        # flux the model produces -- jumps by several percent each time a point crosses it: a
         # +-5% sawtooth in s with a period of ~0.0024, which turns a likelihood in s into a comb.
         Nrescale = self._POYNTING_N
         logzrescale = self._POYNTING_LOGZ
@@ -1471,6 +1471,10 @@ class JetModel:
     #
     # (the previously shipped tables were 0.5-1.3% low, because they were built by
     # integrating a coarsely tabulated F/G/H rather than the kernels themselves).
+    #
+    # The kernels F, G, H themselves are stored too (logK_*): the absorption of the
+    # distribution's lower edge, which the tables of the smooth power law leave out, needs
+    # them at the edge (_kernel._edge_absorption).
     # ------------------------------------------------------------------
 
     _TAB_DEX_FINE = 0.001            # internal resolution; plateau error ~1e-6
@@ -1493,7 +1497,7 @@ class JetModel:
     _POYNTING_N = 4000
 
     # pole-on handling: |sin(i)| below this counts as exactly along the jet axis, and a
-    # ray-centring offset more than this multiple of zmax earns a warning
+    # ray-centering offset more than this multiple of zmax earns a warning
     _POLE_ON_SIN_TOL = 1.0e-12
     _POLE_ON_ZJ_WARN = 30.0
 
@@ -1577,6 +1581,11 @@ class JetModel:
                 setattr(self, "logx_" + name, logx)
                 setattr(self, "logG_" + name, np.log10(np.maximum(table, 1.0e-300)))
 
+        # the kernels themselves, for the absorption at the lowest Lorentz factor of the
+        # distribution (_edge_absorption): log10 of F, G, H on the stored grid
+        for kernel, value in kernels.items():
+            setattr(self, "logK_" + kernel, np.log10(np.maximum(value[idx], 1.0e-300)))
+
     # helper functions so the RT loop can use a simplified GIx_*/GaIx_* call style;
     # interpolation is linear in log(x)-log(G), with the small-x plateau extended to
     # the left and zero returned to the right of the tabulated range.  The stored grid
@@ -1606,7 +1615,7 @@ class JetModel:
     _TAIL_C = 4.0 * np.pi / (np.sqrt(3.0) * _gammafn(1.0 / 3.0)) / 2.0 ** (1.0 / 3.0)
 
     # The polarized families are built from two further kernels, whose small-argument
-    # behaviour differs from F's, so each kernel carries its own (coefficient, exponent
+    # behavior differs from F's, so each kernel carries its own (coefficient, exponent
     # offset) with kernel(z) -> C z^(e0 - 1):
     #
     #   F(z) = z int_z^inf K_{5/3}(y) dy  ->  Gamma(2/3) 2^(2/3) z^(1/3)     e0 = 4/3
@@ -1765,9 +1774,9 @@ class JetModel:
 
         # Each ray is sampled about z_J, the point at which it passes closest to the JET
         # AXIS -- the right place to spend resolution for an inclined view of a narrow
-        # cone, and much better resolved than centring on the black hole (verified: at
-        # i = 17 deg, axis centring is stable to 0.05% from zmax = 1e6 to 1e9, while
-        # centring on the black hole is still drifting by tens of percent at 1e9).
+        # cone, and much better resolved than centering on the black hole (verified: at
+        # i = 17 deg, axis centering is stable to 0.05% from zmax = 1e6 to 1e9, while
+        # centering on the black hole is still drifting by tens of percent at 1e9).
         #
         # It is also cot(i), so it diverges as the line of sight approaches the jet axis.
         # Exactly pole-on, every ray is parallel to the axis, there is no unique closest
@@ -1802,7 +1811,7 @@ class JetModel:
         # path lengths between adjacent z-slices, used in the RT loop
         self.dz_1D = self.rg * np.abs(np.diff(self.z_im_1D))
 
-        # cell-centre z for second-order RT quadrature
+        # cell-center z for second-order RT quadrature
         self.z_mid_1D = 0.5 * (self.z_im_1D[1:] + self.z_im_1D[:-1])
 
     # primary image-generating function
@@ -2028,20 +2037,28 @@ class JetModel:
 
     def _load_rotativity_tables(self):
         """
-        Build the nine Faraday-rotativity tables (see _rotativities.py).  They are
-        built even for the "JO77" and "none" schemes, which do not read them, so that
-        switching scheme on an existing model needs no rebuild; the cost is a few
-        milliseconds and ~150 kB.
+        Build the nine Faraday-rotativity tables and their exact-kinematics correction
+        tables (see _rotativities.py).  They are built even for the "JO77" and "none"
+        schemes, which do not read them, so that switching scheme on an existing model
+        needs no rebuild; the cost is about 0.3 s and 12 MB.
         """
         if self._rtab is not None and self._rtab_p == self.p:
             return
         tab, logx, logx0, inv_dlogx, kmax, q = _rotmod.build_tables(self.p)
+        ctab, lxa0, inv_dlxa, nxa, lp0, inv_dlp, npp = _rotmod.build_correction_tables(self.p, tab.shape[1])
         self._rtab = tab
         self._rtab_logx = logx
         self._rtab_logx0 = logx0
         self._rtab_inv_dlogx = inv_dlogx
         self._rtab_kmax = kmax
         self._rtab_q = q
+        self._ctab = ctab
+        self._ctab_logxa0 = lxa0
+        self._ctab_inv_dlogxa = inv_dlxa
+        self._ctab_nxa = nxa
+        self._ctab_logp0 = lp0
+        self._ctab_inv_dlogp = inv_dlp
+        self._ctab_np = npp
         self._rtab_p = self.p
 
     def make_image_polarized(
@@ -2073,7 +2090,7 @@ class JetModel:
         CONVENTIONS.  Q and U are in the radio convention, referred to (North, East),
         so the EVPA is 0.5*atan2(U, Q) measured East of North and is perpendicular to
         the projected fluid-frame magnetic field for optically thin emission.  V > 0
-        when the fluid-frame magnetic field has a component pointing towards the
+        when the fluid-frame magnetic field has a component pointing toward the
         observer, the sign convention of Dexter (2016) and of grtrans/ipole.  Use
         jetfuncs.evpa() and jetfuncs.polarization_fractions() rather than rederiving
         these by hand.
@@ -2859,6 +2876,11 @@ class JetModel:
                 )
 
                 alphaI[ind_uncooled] = prefac_a * term1
+                # less the absorption of the distribution's lower edge (_kernel._edge_absorption)
+                alphaI[ind_uncooled] -= (
+                    2.0 * prefac_a * ((anisotropy_term[ind_uncooled] ** (-p_eta / 2.0)) / Pp1)
+                    * (gamma_m ** (-p)) * self._kernel_numpy(x1, "F") / (nu_nup[ind_uncooled] ** 2)
+                )
 
             # slow cooling
             if np.any(ind_slow):
@@ -2921,6 +2943,10 @@ class JetModel:
                     * self._G_diff(GaIx_p2, (p2 - 2.0) / 2.0, x3, x2)
                 )
                 alphaI[ind_slow] = prefac_a * (term1 + term2)
+                alphaI[ind_slow] -= (
+                    2.0 * prefac_a * ((anisotropy_term[ind_slow] ** (-p_eta / 2.0)) / Pp1)
+                    * (gamma_m ** (-p)) * self._kernel_numpy(x1, "F") / (nu_nup[ind_slow] ** 2)
+                )
 
             # fast cooling
             if np.any(ind_fast):
@@ -2980,6 +3006,10 @@ class JetModel:
                     * self._G_diff(GaIx_p2, (p2 - 2.0) / 2.0, x3, x2)
                 )
                 alphaI[ind_fast] = prefac_a * (term1 + term2)
+                alphaI[ind_fast] -= (
+                    2.0 * prefac_a * ((anisotropy_term[ind_fast] ** (-p_eta / 2.0)) / Pp1)
+                    * (gamma_c[ind_fast] ** (-2.0)) * self._kernel_numpy(x1, "F") / (nu_nup[ind_fast] ** 2)
+                )
 
             alphaI = np.nan_to_num(alphaI, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
             alphaI = np.maximum(alphaI, 0.0)
@@ -3022,6 +3052,17 @@ class JetModel:
     # ------------------------------------------------------------------
     # Faraday rotativities (the numpy reference for _kernel_pol._rotativities)
     # ------------------------------------------------------------------
+    def _kernel_numpy(self, x, kernel):
+        """A synchrotron kernel (F, G or H) at x, from its log table; see _kernel._kernel_value."""
+        L = getattr(self, "logK_" + kernel)
+        x = np.asarray(x, dtype=float)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            f = (np.log10(np.where(x > 0.0, x, 1.0)) - self._tab_logx0) * self._tab_inv_dlogx
+        k = np.clip(np.floor(f), 0, self._tab_kmax).astype(np.intp)
+        t = f - k
+        val = 10.0 ** (L[k] + t * (L[k + 1] - L[k]))
+        return np.where((x > 0.0) & (f <= self._tab_kmax + 1.0), val, 0.0)
+
     def _rot_V_numpy(self, row, x):
         """The scaled rotativity integral x^(q+1) W_q(x); see _kernel_pol._rot_V."""
         tab = self._rtab[row]
@@ -3061,26 +3102,48 @@ class JetModel:
         integ = self._log_int_np(g1, g2, p1) + np.where(
             has2, amp2 * self._log_int_np(g2, g3, p2), 0.0
         )
-        s1 = g1 ** (-p1)
-        s3 = np.where(has2, amp2 * g3 ** (-p2), g2 ** (-p1))
-        top = np.where(has2, g3, g2)
-        bnd = s1 * (np.log(2.0 * g1) - 1.0) / g1 - s3 * (np.log(2.0 * top) - 1.0) / top
-        rV = _rotmod.JO77_V_PREFAC * Kap * cot * (integ + bnd) / (nn * nn)
+        rV = _rotmod.JO77_V_PREFAC * Kap * cot * integ / (nn * nn)
         return rQ, rV
 
+    def _corr_numpy(self, seg, kern, lxa, lp):
+        """One exact-kinematics correction table; see _kernel_pol._corr."""
+        tab = self._ctab[seg * 2 + kern]
+        nxa, npp = self._ctab_nxa, self._ctab_np
+        fa = np.clip((lxa - self._ctab_logxa0) * self._ctab_inv_dlogxa, 0.0, nxa - 1.000001)
+        i = fa.astype(np.intp)
+        ta = fa - i
+        fp = (lp - self._ctab_logp0) * self._ctab_inv_dlogp
+        top = fp >= npp - 1.0
+        fpc = np.where(top, 0.0, fp)
+        k = np.where(fpc < 0.0, 0, fpc.astype(np.intp))
+        tp = fpc - k
+        lo = tab[i, k] + ta * (tab[i + 1, k] - tab[i, k])
+        hi = tab[i, k + 1] + ta * (tab[i + 1, k + 1] - tab[i, k + 1])
+        return np.where(top, 0.0, lo + tp * (hi - lo))
+
+    @staticmethod
+    def _log10_momentum_np(g):
+        """log10 sqrt(g^2 - 1); see _kernel_pol._log10_momentum."""
+        return 0.5 * np.log10((g - 1.0) * (g + 1.0))
+
     def _rot_hs11_numpy(self, nn, cot, Kap, g1, g2, g3, amp2, rows1, rows2,
-                        w1_lo, w1_hi, w2_lo, w2_hi, s1):
-        """Huang & Shcherbakov (2011), Eq. (55) integrated over the distribution."""
+                        w1_lo, w1_hi, w2_lo, w2_hi, seg1, seg2, lp1, lp2, lp3):
+        """Huang & Shcherbakov (2011), Eq. (55) with exact kinematics, summed over the
+        distribution's electrons; see _kernel_pol._rot_hs11."""
         XA = np.sqrt(_rotmod.XA_CONST / nn)
         lnXA = np.log(XA)
+        lxa = lnXA / np.log(10.0)
         x1 = XA * g1
         x2 = XA * g2
         x3 = XA * g3
         V = self._rot_V_numpy
-        JQ = V(rows1[0], x1) * w1_lo - V(rows1[0], x2) * w1_hi
+        has1 = g1 < g2
+        JQ = np.where(has1, V(rows1[0], x1) * w1_lo - V(rows1[0], x2) * w1_hi, 0.0)
         d1 = V(rows1[1], x1) * w1_lo - V(rows1[1], x2) * w1_hi
         d2 = V(rows1[2], x1) * w1_lo - V(rows1[2], x2) * w1_hi
-        JV = 2.0 * d2 - 2.0 * lnXA * d1
+        JV = np.where(has1, 2.0 * d2 - 2.0 * lnXA * d1, 0.0)
+        cQ = np.where(has1, self._corr_numpy(seg1, 0, lxa, lp1) - self._corr_numpy(seg1, 0, lxa, lp2), 0.0)
+        cV = np.where(has1, self._corr_numpy(seg1, 1, lxa, lp1) - self._corr_numpy(seg1, 1, lxa, lp2), 0.0)
         has2 = amp2 > 0.0
         if np.any(has2):
             JQ = JQ + np.where(
@@ -3089,13 +3152,14 @@ class JetModel:
             e1 = V(rows2[1], x2) * w2_lo - V(rows2[1], x3) * w2_hi
             e2 = V(rows2[2], x2) * w2_lo - V(rows2[2], x3) * w2_hi
             JV = JV + np.where(has2, amp2 * (2.0 * e2 - 2.0 * lnXA * e1), 0.0)
-        # boundary term at gamma_min (HS11 Eq. 56), with exact kinematics
-        mom = np.where(g1 > 1.0, np.sqrt(np.maximum(g1 * g1 - 1.0, 0.0)), 1.0e-12)
-        L1 = np.log((1.0 + mom / g1) / np.maximum(1.0 - mom / g1, 1.0e-300))
-        bq = s1 * _rotmod.H_B(x1, g1) / (g1 * mom)
-        bv = s1 * (g1 * L1 - 2.0 * mom) * _rotmod.g_B(x1) / (g1 * mom)
-        rQ = _rotmod.HS11_Q_PREFAC * Kap * (XA * JQ + bq) / nn
-        rV = _rotmod.HS11_V_PREFAC * Kap * cot * (JV + bv) / (nn * nn)
+            cQ = cQ + np.where(has2, amp2 * (self._corr_numpy(seg2, 0, lxa, lp2)
+                                             - self._corr_numpy(seg2, 0, lxa, lp3)), 0.0)
+            cV = cV + np.where(has2, amp2 * (self._corr_numpy(seg2, 1, lxa, lp2)
+                                             - self._corr_numpy(seg2, 1, lxa, lp3)), 0.0)
+        JQ = JQ + cQ * np.exp(_rotmod.CORR_Q_SCALE * lnXA)
+        JV = JV + cV
+        rQ = _rotmod.HS11_Q_PREFAC * Kap * (XA * JQ) / nn
+        rV = _rotmod.HS11_V_PREFAC * Kap * cot * JV / (nn * nn)
         return rQ, rV
 
     def _rotativities_numpy(self, nn, cot, Kap, branch, gamma_c):
@@ -3119,7 +3183,6 @@ class JetModel:
             rows2 = rows1
             w1_lo, w1_hi = gm ** (-(p + 1.0)) * one, gx ** (-(p + 1.0)) * one
             w2_lo = w2_hi = np.zeros_like(nn)
-            s1 = gm ** (-p) * one
         elif branch == 1:
             p1, p2 = p, p + 1.0
             g1, g2, g3 = gm * one, gc, gx * one
@@ -3129,7 +3192,6 @@ class JetModel:
             gc1 = gc ** (-(p + 1.0))
             w1_lo, w1_hi = gm ** (-(p + 1.0)) * one, gc1
             w2_lo, w2_hi = gc1 / gc, gx ** (-(p + 2.0)) * one
-            s1 = gm ** (-p) * one
         else:
             p1, p2 = 2.0, p + 1.0
             g1, g2, g3 = gc, gm * one, gx * one
@@ -3138,11 +3200,20 @@ class JetModel:
             rows2 = (R[("Q", "pp1")], R[("V1", "pp1")], R[("V2", "pp1")])
             w1_lo, w1_hi = gc**-3.0, gm**-3.0 * one
             w2_lo, w2_hi = gm ** (-(p + 2.0)) * one, gx ** (-(p + 2.0)) * one
-            s1 = gc**-2.0
         if self.rotativities == "JO77":
             return self._rot_jo77_numpy(nn, cot, Kap, p1, p2, g1, g2, g3, amp2)
+        lp2 = self._log10_momentum_np(g2)
+        lp3 = self._log10_momentum_np(g3)
+        if branch == 2:
+            g1, lp1 = _rotmod.fast_cooling_lower_edge(gc)
+            w1_lo = g1**-3.0
+            seg1 = 2
+        else:
+            lp1 = self._log10_momentum_np(g1)
+            seg1 = 0
         return self._rot_hs11_numpy(
-            nn, cot, Kap, g1, g2, g3, amp2, rows1, rows2, w1_lo, w1_hi, w2_lo, w2_hi, s1
+            nn, cot, Kap, g1, g2, g3, amp2, rows1, rows2, w1_lo, w1_hi, w2_lo, w2_hi,
+            seg1, 1, lp1, lp2, lp3,
         )
 
     # ------------------------------------------------------------------
@@ -3321,6 +3392,17 @@ class JetModel:
             )
             rQ[m], rV[m] = self._rotativities_numpy(x, cot[m], Kap[m], 2, gc)
 
+        # the absorption of the distribution's lower edge, which the tables leave out
+        # (_kernel._edge_absorption; as in _kernel_pol._cell_emis_pol)
+        g_lo = np.where(ind_fast, gamma_c, gamma_m)
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            n_lo = np.where(ind_fast, 1.0 / (g_lo * g_lo), gamma_m ** (-p))
+            x_lo = nn / (g_lo * g_lo)
+            edge = 2.0 * Ca * n_lo / (nn * nn)
+            aI -= edge * self._kernel_numpy(x_lo, "F")
+            aQ -= edge * self._kernel_numpy(x_lo, "G")
+            aV -= _V_PREFAC * cot * (edge / g_lo) * self._kernel_numpy(x_lo, "H")
+
         bad = ~np.isfinite(nn)
         for arr in (jI, jQ, jV, aI, aQ, aV, rQ, rV):
             arr[bad] = np.nan
@@ -3423,7 +3505,7 @@ class JetModel:
         gamma_max = self.gamma_max
 
         # Front-to-back accumulation, exactly as the unpolarized transfer does it: rays
-        # are marched from the observer outwards and the emission of each cell is
+        # are marched from the observer outward and the emission of each cell is
         # attenuated by the material in front of it.  The running scalar exp(-tau) of
         # the Stokes I path becomes the cumulative 4x4 operator O_cum.
         npix = x_im_f.shape[0]
@@ -3752,11 +3834,11 @@ class JetModel:
         right-handed sky basis, in which Stokes U carries the sign opposite to the
         image-frame U that make_image_polarized returns.  EVPA is the image-frame
         electric-vector position angle of the local emission, in radians, measured
-        from +x_im towards +y_im.
+        from +x_im toward +y_im.
 
         The quantities that depend on the direction of the photon (costhetaB, nu_p, the
         emission and absorption coefficients, cos2chi, sin2chi, EVPA) are evaluated for
-        the straight line of sight towards the observer, also for geometry="kerr": along
+        the straight line of sight toward the observer, also for geometry="kerr": along
         a geodesic the photon direction at a point depends on which ray passes through
         it, so these are the flat-space values.
         """
@@ -4153,6 +4235,11 @@ class JetModel:
                 )
 
                 alphaI[ind_uncooled] = prefac_a * term1
+                # less the absorption of the distribution's lower edge (_kernel._edge_absorption)
+                alphaI[ind_uncooled] -= (
+                    2.0 * prefac_a * ((anisotropy_term[ind_uncooled] ** (-p_eta / 2.0)) / Pp1)
+                    * (gamma_m ** (-p)) * self._kernel_numpy(x1, "F") / (nu_nup[ind_uncooled] ** 2)
+                )
 
             # slow cooling
             if np.any(ind_slow):
@@ -4215,6 +4302,10 @@ class JetModel:
                     * self._G_diff(GaIx_p2, (p2 - 2.0) / 2.0, x3, x2)
                 )
                 alphaI[ind_slow] = prefac_a * (term1 + term2)
+                alphaI[ind_slow] -= (
+                    2.0 * prefac_a * ((anisotropy_term[ind_slow] ** (-p_eta / 2.0)) / Pp1)
+                    * (gamma_m ** (-p)) * self._kernel_numpy(x1, "F") / (nu_nup[ind_slow] ** 2)
+                )
 
             # fast cooling
             if np.any(ind_fast):
@@ -4274,6 +4365,10 @@ class JetModel:
                     * self._G_diff(GaIx_p2, (p2 - 2.0) / 2.0, x3, x2)
                 )
                 alphaI[ind_fast] = prefac_a * (term1 + term2)
+                alphaI[ind_fast] -= (
+                    2.0 * prefac_a * ((anisotropy_term[ind_fast] ** (-p_eta / 2.0)) / Pp1)
+                    * (gamma_c[ind_fast] ** (-2.0)) * self._kernel_numpy(x1, "F") / (nu_nup[ind_fast] ** 2)
+                )
 
             alphaI = np.nan_to_num(alphaI, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
             alphaI = np.maximum(alphaI, 0.0)
@@ -4369,7 +4464,7 @@ def polarization_fractions(IQUV, *args, degrees=False, floor=0.0):
     m_linear = sqrt(Q^2 + U^2)/I and m_circular = V/I set to NaN wherever I <= floor.
 
     Note that m_circular keeps the sign of V: it is positive where the fluid-frame
-    magnetic field points towards the observer.
+    magnetic field points toward the observer.
     """
     if args:
         if len(args) != 3:

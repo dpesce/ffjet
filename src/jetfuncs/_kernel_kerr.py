@@ -9,7 +9,7 @@ _cell_emis_pol), the transfer through a cell (_rt_step, _pol_cell), and the tran
 from stored state (rt_from_state, rt_from_state_pol), which needs no geometry at all.
 What is new:
 
-  * rays are the null geodesics of _geodesics.py, traced backwards from the observer
+  * rays are the null geodesics of _geodesics.py, traced backward from the observer
     through the pixel's screen point.  Every kernel call traces its rays again (a few
     hundred to a few thousand Runge-Kutta steps, cheap next to the jet cells) into a
     trajectory buffer held per thread; the trace is deterministic, so every call sees
@@ -470,7 +470,7 @@ def _ray_part_pol_kerr(vr, vt, vp, gamma, alphalapse, Bpr, Bpt, Bpp, gamma_c, Kj
 def rt_kernel_kerr(
     frequency, order, x_im_f, y_im_f, lamJ, z_im_1D, seg_in, seg_out, c_lo, c_hi, nint,
     P, G, bufs, use_table, xs_tab, rs_tab, ts_tab, as_tab, Tup, Tlo, logr0, invdlogr, nr,
-    invdu, nu_, T0, T1, T2, T3, T4, T5, tau_stop, I_out,
+    invdu, nu_, T0, T1, T2, T3, T4, T5, TK, tau_stop, I_out,
 ):
     """
     rt_kernel along the geodesics: state and coefficients evaluated on the fly, with
@@ -507,7 +507,7 @@ def rt_kernel_kerr(
                     g, nup, gamma_c, Cj, Ca = _ray_part_kerr(
                         vr, vt, vp, gamma, alpha_f, Bpr, Bpt, Bpp, gc, Kj, Ka, P, n0, n1, n2,
                         1.0 - om * lam)
-                    jI, alphaI = _cell_emis(frequency, g, nup, gamma_c, Cj, Ca, P, T0, T1, T2, T3, T4, T5)
+                    jI, alphaI = _cell_emis(frequency, g, nup, gamma_c, Cj, Ca, P, T0, T1, T2, T3, T4, T5, TK)
                     I_acc, atten = _rt_step(I_acc, atten, jI, alphaI, g, ds)
                     if atten <= atten_stop:
                         done = True

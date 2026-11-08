@@ -67,7 +67,7 @@ Nz = 1600
 
 ###################################
 # geometry="kerr" traces each ray #
-# backwards from the observer     #
+# backward from the observer      #
 # along a null geodesic of the    #
 # Kerr metric with the model's    #
 # spin; everything else about the #

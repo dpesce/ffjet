@@ -67,7 +67,7 @@ The stagnation surface used for the field-parallel velocity is tabulated on `n_s
 
 For parameter surveys, `jetfuncs.survey(configs, func)` evaluates `func(model)` for a list of `JetModel` configurations in parallel worker processes, dividing the machine's threads between them; see [examples/simulate_jet_survey.py](./examples/simulate_jet_survey.py).  Because the compiled kernels are already multi-threaded, the gain is modest (about 1.3-1.6x on a 10-core machine) and comes from overlapping the per-model setup and Python overhead.
 
-Synchrotron emissivity and absorption integrals are computed at model construction; pass `stokes="IQV"` to `JetModel` to build the Stokes Q and V tables up front (`make_image_polarized` builds them on demand otherwise).
+Synchrotron emissivity and absorption integrals are computed at model construction; pass `stokes="IQV"` to `JetModel` to build the Stokes Q and V tables up front (`make_image_polarized` builds them on demand otherwise).  The absorption coefficients count only the electrons the distribution contains: the power-law formulae integrate the slope of the distribution where it is smooth, and the jump at its lowest Lorentz factor is added (`_kernel._edge_absorption`).  Well below the critical frequency of the lowest-energy electrons this lowers the Stokes I absorption to (4/3)/(q + 2) of the power-law value, with q the slope of the distribution at its lowest Lorentz factor (p, or 2 in fast cooling); at more than about ten times that frequency the absorption is unchanged.
 
 ## Polarization
 
@@ -78,7 +78,7 @@ Synchrotron emissivity and absorption integrals are computed at model constructi
     m_lin, m_circ, chi = jf.polarization_fractions(IQUV, floor=IQUV[0].max() * 1e-3)
 ```
 
-Conventions: Q and U are in the astronomical convention, referred to (North, East), so the EVPA is `0.5*atan2(U, Q)` measured **east of north** and is perpendicular to the projected fluid-frame magnetic field for optically thin emission; V > 0 where the fluid-frame magnetic field points towards the observer.  Use `jf.evpa(Q, U)` and `jf.polarization_fractions(...)` rather than rederiving these.
+Conventions: Q and U are in the astronomical convention, referred to (North, East), so the EVPA is `0.5*atan2(U, Q)` measured **east of north** and is perpendicular to the projected fluid-frame magnetic field for optically thin emission; V > 0 where the fluid-frame magnetic field points toward the observer.  Use `jf.evpa(Q, U)` and `jf.polarization_fractions(...)` rather than rederiving these.
 
 Before plotting, pass the image through `jf.sky_view(x, y, IQUV)`.  jetfuncs places the observer on the −z side of the image plane, so a raw `pcolormesh(x, y, I)` is a mirror of the sky; `sky_view` re-labels the grid so that north is up and east is to the left.  In such a panel an EVPA of 0 is a vertical tick and the tick direction is `(-sin(EVPA), cos(EVPA))`.  `export_fits` accepts a `(4, Ny, Nx)` cube and writes a FITS STOKES axis.  Stokes I from the polarized transfer is not identical to `make_image`: polarized absorption couples Q, U and V back into I, which is a fraction of a percent where the jet is optically thin and up to several percent where it is thick.  See [examples/simulate_jet_image_polarized.py](./examples/simulate_jet_image_polarized.py).
 
@@ -86,15 +86,17 @@ The polarized emission and absorption coefficients follow Dexter (2016) Appendix
 
 The Faraday rotativities are selected with the `rotativities` argument of `JetModel`:
 
-- `rotativities="HS11"` (the default): Huang & Shcherbakov (2011), whose monoenergetic fitting formulae are integrated over the electron distribution.
+- `rotativities="HS11"` (the default): Huang & Shcherbakov (2011), whose monoenergetic fitting formulae are summed over the electrons of the distribution.
 - `rotativities="JO77"`: the power-law expressions of Jones & Odell (1977) / Sazonov (1969) as given in Dexter's Appendix B1, generalized here so that each segment of the broken power law is integrated over its own range of Lorentz factors.
 - `rotativities="none"`: emission and absorption only.
+
+Both schemes count only the electrons the distribution contains.  HS11's Eq. (56), for rho_Q and rho_V, and Dexter's Eq. (B2), for rho_V, add a boundary term at the distribution's lowest Lorentz factor, which is the rotativity of electrons below it that the distribution does not have (in slow cooling, two to three times the rotation of its own electrons); ffjet leaves it out.  The HS11 scheme uses exact kinematics, and counts the cooled electrons as cyclo-synchrotron cooling leaves them: in fast cooling they reach down to the momentum p_c = 1/sinh(1/gamma_c), never below gamma = 1, rather than to the ultrarelativistic break gamma_c, which falls below 1 near the black hole.  See `_rotativities.py`.
 
 A polarized image costs about 1.7x an unpolarized one with the default `"HS11"` rotativities, 1.8x with `"JO77"` and 1.4x with `"none"` (measured on a 120x120x400 grid, 0.77M jet cells).
 
 ## Kerr geodesics
 
-By default the rays are straight lines of sight (`geometry="flat"`).  With `geometry="kerr"`, each ray is instead traced backwards from a distant observer along a null geodesic of the Kerr metric with the model's spin:
+By default the rays are straight lines of sight (`geometry="flat"`).  With `geometry="kerr"`, each ray is instead traced backward from a distant observer along a null geodesic of the Kerr metric with the model's spin:
 
 ```python
     model = jf.JetModel(..., geometry="kerr")

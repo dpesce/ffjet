@@ -142,7 +142,7 @@ print("  linear   = %.3f %%" % (100.0 * m_lin_tot))
 print("  circular = %+.4f %%" % (100.0 * m_circ_tot))
 print("  EVPA     = %+.2f deg" % np.degrees(evpa_tot))
 
-# per-pixel maps; pixels below the floor are left as NaN so they do not colour the plot
+# per-pixel maps; pixels below the floor are left as NaN so they do not color the plot
 floor = IQUV[0].max() * 1.0e-3
 m_lin, m_circ, chi = jf.polarization_fractions(IQUV, floor=floor)
 

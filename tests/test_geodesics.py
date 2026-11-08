@@ -174,7 +174,7 @@ def test_flat_limit_rays_are_the_flat_models_straight_rays(x_im, y_im, r0):
       z_im - z_J, to the error bound of the affine parameter.
 
     The affine parameter from the start of the ray is not compared: its error grows with
-    the distance travelled (0.26 r_g for r0 = 1e6, 260 r_g for 1e9), but it is common to
+    the distance traveled (0.26 r_g for r0 = 1e6, 260 r_g for 1e9), but it is common to
     every point near the hole and cancels in s, which is all the cells use.
     """
     inc = 17.0
@@ -320,7 +320,7 @@ def test_walker_penrose_basis_matches_direct_parallel_transport():
     f0 = geo.carried_vector(Ka1, Ka2, *fr[:3], fr[3], fr[4], fr[5], fr[6], u, a, *fr[7:])
     x = np.array([0.0, 1.0 / w, math.acos(u), 0.0])
     # the module's photon momentum is the forward photon; going away from the observer
-    # means integrating the forward geodesic backwards, i.e. along -k
+    # means integrating the forward geodesic backward, i.e. along -k
     k = -coord(fr)
     f = coord(fr, f0)
 

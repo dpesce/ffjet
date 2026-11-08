@@ -6,35 +6,73 @@ Two schemes are available, selected with JetModel(rotativities=...):
 
   "HS11"  Huang & Shcherbakov (2011).  Their Section 4.2 gives fitting formulae for
           the rotativities of a *monoenergetic* distribution (their Eq. 55), which are
-          then integrated over any isotropic distribution (their Eq. 56).  This is the
-          accurate option: the authors' stated goal was precisely that earlier
-          power-law expressions "are inaccurate for high energies of electrons", and
-          Faraday conversion in particular was not previously computed correctly.
+          summed here over the electrons of the distribution, with exact kinematics.
+          This is the accurate option: the authors' stated goal was precisely that
+          earlier power-law expressions "are inaccurate for high energies of
+          electrons", and Faraday conversion in particular was not previously computed
+          correctly.
 
   "JO77"  The power-law expressions of Jones & Odell (1977) / Sazonov (1969), as given
           in Dexter (2016) Appendix B1, generalized here so that each segment of the
-          broken power law is integrated over its own range of Lorentz factors.
+          broken power law is integrated over its own range of Lorentz factors.  Its
+          rho_V is the textbook rotation of one ultrarelativistic electron,
+          ln(2 gamma)/gamma^2, summed over the distribution.
 
   "none"  rho_Q = rho_V = 0, i.e. emission and absorption only.
 
-MEASURED ACCURACY, emission-weighted over the cells of an M87-like model, against
-HS11 integrated numerically over the true broken power law:
+ONLY THE ELECTRONS THE DISTRIBUTION CONTAINS.  Kinetic theory gives each rotativity as
+an integral over the slope of the distribution function, df/dp.  Integrating by parts
+turns it into the sum, over the electrons, of the rotativity of one electron (HS11's
+Eq. 55), plus end terms at the edges of the distribution.  The broken power law drops
+from f(gamma_1) to zero at its lowest Lorentz factor gamma_1 (gamma_m, or gamma_c when
+the electrons cool fast), so its slope has a spike there, which cancels the end term
+exactly.  HS11's Eq. (56) keeps the end term but not the spike, and so does Dexter's
+(B2) for rho_V, whose factor (p+2) comes from it.  That end term is exactly the
+rotativity of electrons at the phase-space density f(gamma_1) filling all momenta below
+gamma_1 -- 0.41 (slow cooling) and 0.36 (fast cooling, gamma_c = 3) times as many
+electrons as the distribution holds, which it does not contain; in slow cooling it is
+two to three times the rotation of the distribution's own electrons.  Both schemes
+here leave the end terms out.  Electrons below gamma_1, if they are to be included,
+must be added to the distribution, with the same care at their own lowest edge.  The
+absorption coefficients carry the same kind of end term, in the factor p + 2 of the
+power-law tables, and ffjet takes it off as well (_kernel._edge_absorption).
 
-                                        rho_Q                rho_V
-    single segment, extended to inf     1.62 - 1.66 x        1.03 - 1.09 x
-    "JO77" (this module)                0.80 - 0.84 x        1.006 x
-    "HS11" (this module)                1.02 x               0.999 x
+THE COOLED ELECTRONS.  The cooling break gamma_c (paper Eq. 25) is how far an electron
+cools in the time t_c at the ultrarelativistic rate dgamma/dt = -C gamma^2.  The rate is
+really -C (gamma^2 - 1) = -C |p|^2 (cyclo-synchrotron), which slows as the electrons
+become mildly relativistic: in the time t_c = 1/(C gamma_c) they reach not gamma_c but the
+momentum p_c = 1/sinh(1/gamma_c), i.e. gamma_c' = coth(1/gamma_c) = gamma_c + 1/(3 gamma_c)
++ ..., which is never below 1 (in the innermost cells of the M87 model gamma_c falls to
+0.87, and the broken power law would reach below gamma = 1).  In the steady state the
+cooled electrons follow 1/(gamma^2 - 1) times what they do above, the ultrarelativistic
+gamma^-2 below gamma_m in fast cooling becoming 1/(gamma^2 - 1) from p_c up, with the same
+amplitude, so the same number of electrons (n_m gamma_m) sits at somewhat higher energies.
+The HS11 scheme sums the rotativities over this distribution (the "2" and "pp1"
+correction tables below; fast_cooling_lower_edge); the emission and absorption
+coefficients keep the ultrarelativistic shapes, since electrons this slow neither
+radiate nor absorb at the frequencies modeled.  The JO77 scheme keeps its textbook form.
 
-The residual 2% of "HS11" is the ultrarelativistic simplification below; the 20% of
-"JO77" is the intrinsic inaccuracy of the power-law form for Faraday conversion.
+MEASURED ACCURACY, against HS11's Eq. (55) summed numerically with exact kinematics over
+the electrons of each cell's distribution (as above), on the cells of the fiducial M87
+model (inner jet, 43-230 GHz), weighted by emission (j_I ds) and by the rotativity
+itself (|rho| ds):
 
-That 2% is not uniform: it is set by the lowest Lorentz factor of the distribution and
-tracks sqrt(1 - 1/gamma_1), measuring 1.9% at gamma_1 = 10, 5.8% at 3 and 9.4% at 1.5.
-Fast cooling always has gamma_1 = gamma_c < gamma_m, so that branch is the one which
-reaches the mildly relativistic end -- where the ultrarelativistic synchrotron kernels
-used for the emission coefficients are equally approximate, so nothing is lost by being
-consistent with them.  "JO77" is much less uniform over the same sweep: its rho_Q error
-ranges from 2% to 45%.
+                    rho_Q                         rho_V
+                    emission      conversion      emission      rotation
+    "HS11"          1.0005-1.0007 x               1.0000 x
+    "JO77"          1.09-1.15 x   1.08-1.14 x     1.009-1.011 x 1.02 x
+
+The residual of "HS11" is the resolution of the tables (worst cell: 3e-3 on rho_Q,
+which crosses the jump of H_X at x = 40, and 2e-4 on rho_V).  "JO77" adds the
+ultrarelativistic kinematics and the intrinsic inaccuracy of the power-law form for
+Faraday conversion; its rho_Q error ranges from 7% to 260% over four decades of
+nu'/nu_p (its rho_V stays within 1.3%).  HS11's fits are themselves accurate to about
+10% in the authors' words, and H_X jumps by a third at x = 40 as printed (their Eq. 77
+in the arXiv version).  Before the exact kinematics and the exact cooled shape were
+included (2026-11-07), the scheme had rho_V 11% low and rho_Q 7% high from the
+kinematics, and rho_V 14% high and rho_Q 2% low from the shape and lower edge of the
+fast-cooled electrons, on the M87 model's cells (rotation- and conversion-weighted,
+cells with gamma_c > 1); the two nearly cancel in rho_V.
 
 WHY THIS TABULATES.  In HS11 the Lorentz factor enters the fitting functions only
 through the product X_A*gamma, so with the ultrarelativistic kinematics that the rest
@@ -48,7 +86,9 @@ whose logarithm separates), the integral over one power-law segment gamma^-q bec
 which is the same structure as the synchrotron integrals in _core.  Three kernels
 (one for rho_Q, two for rho_V, the second carrying the ln) and the three spectral
 indices the cooling branches use (p, p+1, 2) give nine tables, built at construction
-from closed-form fits in a few milliseconds.
+from closed-form fits in a few milliseconds.  What the ultrarelativistic kinematics and
+shapes leave out is small except at low gamma, and is tabulated separately in
+(X_A, |p|) for each kind of segment (build_correction_tables, below).
 
 The tables are stored SCALED as x^(q+1) W_q(x), which is smooth and O(1) across the
 whole range -- W itself spans many decades and changes sign -- so linear interpolation
@@ -108,24 +148,6 @@ def H_X(x, gamma=None):
     return np.where(x < 40.0, lo, hi)
 
 
-def H_B(x, gamma):
-    """HS11 Eq. (54), the boundary counterpart of H_X (exact kinematics, pointwise)."""
-    x = np.asarray(x, dtype=float)
-    g = np.asarray(gamma, dtype=float)
-    L = np.log(np.maximum(x, 1.0e-300))
-    lo = 4.67e-9 * np.maximum(1.0 - 1.0 / g, 0.0) ** 1.5 * x**3.84
-    hi = (
-        0.864
-        - 0.2082 * L**2
-        + 0.0175 * L**4
-        - 0.000626 * L**6
-        + 1.0175e-5 * L**8
-        - 7.686e-8 * L**10
-        - 0.01 * np.exp(-((L - 4.0755) ** 2) / 0.0763)
-    )
-    return np.where(x < 40.0, lo, hi)
-
-
 def g_X(x):
     """HS11 Eq. (54), the multiplier of rho_V."""
     L = np.log(np.maximum(np.asarray(x, dtype=float), 1.0e-300))
@@ -135,11 +157,6 @@ def g_X(x):
         - 0.05 * np.exp(-((L - 5.76) ** 2) / 1.33)
         + 0.075 * np.exp(-((L - 4.03) ** 2) / 0.65)
     )
-
-
-def g_B(x):
-    """HS11 Eq. (54), the multiplier of the rho_V boundary term."""
-    return 1.0 - 0.0045 * np.asarray(x, dtype=float) ** 0.52
 
 
 def _kernel(name, x):
@@ -193,3 +210,141 @@ def build_tables(p):
         float(logx.size - 2),
         exponents,
     )
+
+
+# --------------------------------------------------------------------------- exact kinematics
+# The tables above take |p| -> gamma.  The tables below hold what that leaves out, for
+# each kind of power-law segment s and each rotativity K:
+#
+#     C_sK(X_A, p) = int_gamma(p)^inf [ S_s(g) w_K(X_A, g) - g^-q_s w_K,ur(X_A, g) ] dg,
+#
+# with HS11's rotativities of one electron, exactly (Eqs. 54-55: |p| = sqrt(g^2 - 1),
+# the factor sqrt(1 - 1/g) of H_X's low branch, ln[(1 + beta)/(1 - beta)] = 2 arccosh g)
+#
+#     w_Q = H_X(X_A g; g) / (g |p|),          w_Q,ur = H_X(X_A g) / g^2,
+#     w_V = 2 g_X(X_A g) arccosh(g) / (g |p|),  w_V,ur = 2 g_X(X_A g) ln(2 g) / g^2,
+#
+# and the exact shape S_s of each segment:
+#
+#     "p"    the injected electrons, S = g^-p (the shape the model gives them);
+#     "pp1"  the cooled electrons above the break, S = g^-(p+1) g^2/(g^2 - 1);
+#     "2"    the cooled electrons below gamma_m in fast cooling, S = 1/(g^2 - 1).
+#
+# The cooled shapes are the steady state of cyclo-synchrotron cooling, dg/dt ~ -(g^2 - 1)
+# = -|p|^2, of which the ultrarelativistic g^-(q) is the limit.  A segment from g_lo to
+# g_hi then contributes, on top of its ultrarelativistic table difference,
+# C_sK(X_A, p_lo) - C_sK(X_A, p_hi).  The integrand differs from zero only by O(1/g^2),
+# so C_sK vanishes above p = 10^3 to far better than the tables' accuracy.
+#
+# The tables are stored on a grid in (log10 X_A, log10 p) with as many points in p as the
+# tables above have in x, so that both pack into one array for the kernels.  rho_Q's are
+# stored divided by X_A^3.036, which makes them independent of X_A at small X_A (HS11's
+# low branch), so clamping below the grid is exact there.  Below p = 10^-6 the cooled
+# shape "2" integrates to C(p_min) + c ln(p_min/p), with c the integrand per ln p at
+# p -> 0 (cold electrons; exact to O(p^2)); the kernels extrapolate linearly in log p.
+CORR_SEGMENTS = ("p", "pp1", "2")
+CORR_KERNELS = ("Q", "V")
+N_CORR = len(CORR_SEGMENTS) * len(CORR_KERNELS)
+CORR_LOGXA = (-4.0, 2.0)
+CORR_DEX_XA = 0.05
+CORR_LOGP = (-6.0, 3.0)
+CORR_Q_SCALE = 3.036                     # rho_Q's tables are stored divided by X_A^this
+
+
+def _shape(seg, g, mom, p):
+    """the exact shape S_s(g) of a segment, and its ultrarelativistic counterpart g^-q;
+    g^2 - 1 is formed as mom^2, which keeps its precision as g -> 1"""
+    if seg == "p":
+        s = g ** (-p)
+        return s, s
+    if seg == "pp1":
+        ur = g ** (-(p + 1.0))
+        return ur * g * g / (mom * mom), ur
+    return 1.0 / (mom * mom), g ** (-2.0)
+
+
+def rotativity_of_one_electron(kern, XA, g, exact=True, mom=None):
+    """
+    HS11's rotativity of one electron of Lorentz factor g (momentum mom = sqrt(g^2 - 1),
+    in units of m_e c), w_Q or w_V above, in the normalization of the tables
+    (exact=False: the ultrarelativistic form).  The kinematic factors are formed from the
+    momentum, sqrt(1 - 1/g) = mom/sqrt(g (g + 1)) and arccosh(g) = arcsinh(mom), which keep
+    their precision as g -> 1; w_Q of the low branch and w_V stay finite there.
+    """
+    g = np.asarray(g, dtype=float)
+    x = XA * g
+    if not exact:
+        if kern == "Q":
+            return H_X(x) / (g * g)
+        return 2.0 * g_X(x) * np.log(2.0 * g) / (g * g)
+    if mom is None:
+        mom = np.sqrt(np.maximum(g * g - 1.0, 0.0))
+    mom = np.asarray(mom, dtype=float)
+    if kern == "Q":
+        # low branch: the factor sqrt(1 - 1/g) cancels the 1/|p|
+        with np.errstate(divide="ignore", invalid="ignore"):
+            hi = H_X(x) / (g * mom)
+        return np.where(x < 40.0, H_X(x) / (g * np.sqrt(g * (g + 1.0))), hi)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = np.where(mom > 1.0e-6, np.arcsinh(mom) / np.where(mom > 1.0e-6, mom, 1.0), 1.0 - mom * mom / 6.0)
+    return 2.0 * g_X(x) * ratio / g
+
+
+def build_correction_tables(p, n_p):
+    """
+    The six tables C_sK(X_A, p) for spectral index p, with n_p points in log10 p.
+
+    Returns (table, logxa0, inv_dlogxa, n_xa, logp0, inv_dlogp, n_p): table has shape
+    (N_CORR, n_xa, n_p), ordered as (s, K) over CORR_SEGMENTS x CORR_KERNELS; rho_Q's
+    are divided by X_A^CORR_Q_SCALE.
+    """
+    lxa = np.arange(CORR_LOGXA[0], CORR_LOGXA[1] + 0.5 * CORR_DEX_XA, CORR_DEX_XA)
+    lo, hi = CORR_LOGP
+    lp_out = np.linspace(lo, hi, n_p)
+    # integrate on a grid four times finer than the stored one, then decimate
+    lp = np.linspace(lo, hi, 4 * (n_p - 1) + 1)
+    mom = 10.0 ** lp
+    g = np.sqrt(1.0 + mom * mom)
+    dg_dlnp = mom * mom / g
+    XA = 10.0 ** lxa[:, None]
+    ln10 = np.log(10.0)
+    table = np.empty((N_CORR, lxa.size, n_p))
+    w = {(k, e): rotativity_of_one_electron(k, XA, g[None, :], exact=e, mom=mom[None, :])
+         for k in CORR_KERNELS for e in (True, False)}
+    i = 0
+    for seg in CORR_SEGMENTS:
+        S, S_ur = _shape(seg, g, mom, p)
+        for kern in CORR_KERNELS:
+            integrand = (S * w[(kern, True)] - S_ur * w[(kern, False)]) * dg_dlnp
+            segs = 0.5 * (integrand[:, 1:] + integrand[:, :-1]) * (ln10 * (lp[1] - lp[0]))
+            C = np.concatenate([np.cumsum(segs[:, ::-1], axis=1)[:, ::-1], np.zeros((lxa.size, 1))], axis=1)
+            C = C[:, ::4]
+            if kern == "Q":
+                C = C / XA**CORR_Q_SCALE
+            table[i] = C
+            i += 1
+    return (
+        np.ascontiguousarray(table),
+        float(lxa[0]),
+        1.0 / CORR_DEX_XA,
+        lxa.size,
+        float(lp_out[0]),
+        1.0 / float(lp_out[1] - lp_out[0]),
+        n_p,
+    )
+
+
+def fast_cooling_lower_edge(gamma_c):
+    """
+    The lowest Lorentz factor and log10 of the momentum of the cooled electrons in fast
+    cooling: with dg/dt = -C (g^2 - 1), electrons injected at high energy a time t_c ago
+    have reached p_c = 1/sinh(C t_c) = 1/sinh(1/gamma_c), where gamma_c = 1/(C t_c) is the
+    ultrarelativistic cooling break (paper Eq. 25).  So gamma_c' = coth(1/gamma_c) >= 1,
+    = gamma_c + 1/(3 gamma_c) + ... when gamma_c >> 1.  log10 p_c is computed without
+    forming sinh for small gamma_c, where p_c underflows.
+    """
+    u = 1.0 / np.asarray(gamma_c, dtype=float)
+    g_low = 1.0 / np.tanh(u)
+    with np.errstate(over="ignore"):
+        lp = np.where(u > 20.0, -(u - np.log(2.0)) / np.log(10.0), -np.log10(np.sinh(np.minimum(u, 20.0))))
+    return g_low, lp

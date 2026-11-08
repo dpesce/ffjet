@@ -9,7 +9,7 @@ infinity, and lambda = L/E, eta = Q/E^2 are their conserved angular momentum and
 constant.  The mass M and spin a of the ray geometry are arguments throughout, so that
 M = a = 0 gives the straight rays of the flat model.
 
-RAYS.  A ray is traced backwards from the observer in Mino time tau
+RAYS.  A ray is traced backward from the observer in Mino time tau
 (d tau = d lambda_affine / Sigma), in which the radial and polar motions decouple.  With
 w = 1/r and u = cos(theta),
 
@@ -104,7 +104,7 @@ def _rhs(w, u, pw, pu, lam, eta, M, a):
 @njit(cache=True)
 def trace(alpha, beta, M, a, theta_o, r0, eps, wcap, out):
     """
-    Trace the ray that reaches the observer at screen point (alpha, beta) backwards from
+    Trace the ray that reaches the observer at screen point (alpha, beta) backward from
     radius r0, storing (w, u, dw/dtau, du/dtau, affine parameter, tau) at every step in
     out[:, k] (out has shape (6, nmax)).  Returns (number of stored points, status,
     lambda, eta), with status CAPTURED (the ray ends on the horizon), ESCAPED (it has

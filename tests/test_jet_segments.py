@@ -98,4 +98,4 @@ def test_path_length_inside_the_jet_has_no_staircase():
         worst_cells = max(worst_cells, abs(whole - brute))
     cell = widths.max()
     assert worst_seg < 5.0 * step          # the brute force's own resolution
-    assert worst_cells > 0.2 * cell        # the staircase: a sizeable fraction of a cell
+    assert worst_cells > 0.2 * cell        # the staircase: a sizable fraction of a cell

@@ -67,10 +67,10 @@ def test_export_fits_rejects_nonuniform_grid(tmp_path):
 
 @pytest.mark.parametrize("cube", [False, True])
 @pytest.mark.parametrize("nx, ny", [(5, 7), (6, 7), (5, 8), (6, 8)])
-def test_export_fits_wcs_gives_every_pixel_its_own_centre(tmp_path, nx, ny, cube):
-    # The reference pixel sits at the image centre, which for an even number of pixels
-    # falls halfway between two pixel centres; the WCS must still map every pixel to its
-    # own centre.  The grid is deliberately offset from zero and different along x and y.
+def test_export_fits_wcs_gives_every_pixel_its_own_center(tmp_path, nx, ny, cube):
+    # The reference pixel sits at the image center, which for an even number of pixels
+    # falls halfway between two pixel centers; the WCS must still map every pixel to its
+    # own center.  The grid is deliberately offset from zero and different along x and y.
     from astropy.wcs import WCS
 
     x = -3.0e-6 + (np.arange(nx) + 0.5) * 1.0e-6

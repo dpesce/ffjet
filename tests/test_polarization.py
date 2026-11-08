@@ -204,7 +204,7 @@ def test_kernel_tail_constants():
 
 def test_circular_emissivity_follows_the_sign_of_the_pitch_angle_cosine(pol_model):
     """
-    V > 0 when the fluid-frame magnetic field points towards the observer, i.e. when
+    V > 0 when the fluid-frame magnetic field points toward the observer, i.e. when
     cos(theta_B') > 0 (Dexter 2016, Eqs. A14/A24).  This is the convention of
     grtrans/ipole and is what make_image_polarized documents.
     """
@@ -217,11 +217,21 @@ def test_circular_emissivity_follows_the_sign_of_the_pitch_angle_cosine(pol_mode
     assert jV[0] > 0.0 and jV[1] < 0.0
     assert jV[0] == pytest.approx(-jV[1], rel=1e-12)
     assert abs(jV[2]) < 1e-12 * jI[2]
-    assert aV[0] > 0.0 and aV[1] < 0.0
+    assert aV[0] == pytest.approx(-aV[1], rel=1e-12)
     assert rV[0] > 0.0 and rV[1] < 0.0
     # and the linear coefficients are even in cos(theta_B')
     assert jQ[0] == pytest.approx(jQ[1], rel=1e-12)
     assert jI[0] > 0.0 and aI[0] > 0.0
+    # alpha_V follows the sign of cos(theta_B') wherever each electron's absorption does,
+    # which is guaranteed for isotropic electrons.  For electrons crowded along the field,
+    # as here (eta = 0.01), below the critical frequency of the lowest Lorentz factor
+    # (x = nu'/(nu_p gamma_m^2) = 0.03 here) the pitch-angle factor that lowers the rest of
+    # alpha_V does not lower the term of the distribution's lower edge, and alpha_V can
+    # change sign (_kernel._edge_absorption).
+    iso = jf.JetModel(m=10.0, a=0.5, inc=60.0, mdot=1e-3, Nx=2, Ny=2, Nz=2, p=2.14, eta=1.0,
+                      stokes="IQV")
+    aV_iso = iso._pol_coefficients_numpy(n, nup, gc, cth, nA)[5]
+    assert aV_iso[0] > 0.0 and aV_iso[1] < 0.0
 
 
 def test_isotropic_distribution_leaves_the_circular_correction_alone():
@@ -237,6 +247,82 @@ def test_isotropic_distribution_leaves_the_circular_correction_alone():
     # with eta = 1 the anisotropy factor is 1/phi_norm = 1 and g_eta = 0
     assert iso.phi_norm == pytest.approx(1.0, rel=1e-12)
     assert np.all(np.isfinite(jV)) and jV[0] > 0.0
+
+
+@pytest.mark.parametrize("x_lo", [0.03, 1.0, 30.0])
+def test_absorption_counts_only_the_electrons_present(x_lo):
+    """
+    For isotropic electrons the absorption coefficient is the sum over the electrons of
+    each one's absorption, (1/8 pi m nu^2) (1/gamma^2) d/dgamma[gamma^2 P_nu(gamma)], which is
+    positive; the power-law tables integrate the slope of N only where it is smooth, and
+    the distribution's lower edge, where N jumps from zero, adds the rest
+    (_kernel._edge_absorption).  Against that sum by quadrature, in the tables'
+    normalization (alpha = 2 C_a nu~^-2 D, with D the sum for unit amplitude), for I, Q and
+    V, at x_lo = nu'/(nu_p gamma_m^2) where the edge matters most (0.03: alpha_I is a third
+    of what the tables alone give) and where it does not (30).
+    """
+    import warnings
+
+    from scipy.integrate import IntegrationWarning, quad
+    from scipy.special import kv
+
+    iso = jf.JetModel(m=10.0, a=0.5, inc=60.0, mdot=1e-3, Nx=2, Ny=2, Nz=2, p=2.14, eta=1.0,
+                      stokes="IQV")
+    q, glo = iso.p, iso.gamma_m
+    nn = x_lo * glo * glo
+    cth, nup, nA = 0.6, 1.0, 1.0e-4
+    out = iso._pol_coefficients_numpy(np.array([nn]), np.array([nup]), np.array([1e30]),
+                                      np.array([cth]), np.array([nA]))
+    aI, aQ, aV = out[3][0], out[4][0], out[5][0]
+    Ca = iso.prefac_absorp * nA / nup / iso.phi_norm
+    cot = cth / np.sqrt(1.0 - cth * cth)
+
+    kernels = {
+        # int_x^inf K_5/3 = 2 K_2/3(x) - int_x^inf K_1/3, which avoids K_5/3's singularity
+        "F": lambda x: x * (2.0 * kv(2.0 / 3.0, x) - quad(lambda y: kv(1.0 / 3.0, y), x, np.inf, limit=200)[0]),
+        "G": lambda x: x * kv(2.0 / 3.0, x),
+        "H": lambda x: quad(lambda y: kv(1.0 / 3.0, y), x, np.inf, limit=200)[0] + x * kv(1.0 / 3.0, x),
+    }
+
+    def D(name, v):
+        """sum over N = gamma^-q of (1/gamma^2) d/dgamma[gamma^2 gamma^-v K(nn/gamma^2)]"""
+        K = kernels[name]
+
+        def per(g):
+            x = nn / (g * g)
+            h = 1e-5 * x
+            dK = (K(x + h) - K(x - h)) / (2.0 * h)
+            return g ** (-q) * g ** (-v - 1.0) * ((2.0 - v) * K(x) - 2.0 * x * dK)
+
+        pts = [glo * 1.5, glo * 3.0, glo * 10.0, glo * 30.0]
+        # quadpack may report roundoff on the steep tail; the 1e-3 agreement below is the check
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", IntegrationWarning)
+            return quad(per, glo, glo * 3e3, limit=500, points=pts)[0]
+
+    assert aI == pytest.approx(2.0 * Ca * D("F", 0.0) / nn**2, rel=1e-3, abs=0.0)
+    assert aQ == pytest.approx(2.0 * Ca * D("G", 0.0) / nn**2, rel=1e-3, abs=0.0)
+    assert aV == pytest.approx(2.0 * (4.0 / 3.0) * Ca * cot * D("H", 1.0) / nn**2, rel=1e-3, abs=0.0)
+
+
+def test_absorption_far_below_the_lowest_critical_frequency():
+    """
+    When every electron radiates far below its critical frequency, F(x) = C x^(1/3), each
+    absorbs (1/8 pi m nu^2)(4/3) C (nu~)^(1/3) gamma^(-5/3), and the sum over gamma^-q from
+    gamma_lo is (4/3) C nu~^(1/3) gamma_lo^-(q+2/3)/(q + 2/3): (4/3)/(q + 2) of what the slope of
+    N alone gives.  Checked in the tables' normalization, numba kernel and numpy path.
+    """
+    from jetfuncs import _kernel as kc
+
+    iso = jf.JetModel(m=10.0, a=0.5, inc=60.0, mdot=1e-3, Nx=2, Ny=2, Nz=2, p=2.14, eta=1.0)
+    q, glo = iso.p, iso.gamma_m
+    nn = 1.0e-9 * glo * glo
+    Ca = 1.0
+    expect = 2.0 * Ca * (4.0 / 3.0) * iso._TAIL_C * nn ** (1.0 / 3.0) * glo ** (-(q + 2.0 / 3.0)) / (q + 2.0 / 3.0) / nn**2
+    P = kc.pack_params(iso)
+    T = kc.pack_tables(iso)
+    _, aI_nb = kc._cell_emis(1.0 * nn, 1.0, 1.0, 1.0e30, 1.0, Ca, P, *T)
+    assert aI_nb == pytest.approx(expect, rel=2e-3, abs=0.0)
 
 
 # --------------------------------------------------------------------------- conventions
@@ -473,11 +559,14 @@ def test_make_image_polarized_rejects_a_bad_heating_prescription():
 
 
 # --------------------------------------------------------------------------- rotativities
-def _hs11_reference(nA, nuHz, nuB_sin, cth, p1, p2, g1, g2, g3, N=40001):
+def _hs11_reference(nA, nuHz, nuB_sin, cth, p1, p2, g1, g2, g3, N=40001, exact=True, gX=True):
     """
-    Huang & Shcherbakov (2011) Eqs. (55) and (56) integrated directly over the broken
-    power law, with exact kinematics: the ground truth the tabulated scheme in
-    _rotativities.py is an approximation to.
+    Huang & Shcherbakov (2011) Eq. (55), the rotativities of one electron, summed
+    directly over the electrons of the broken power law.  With exact kinematics this
+    is the ground truth the tabulated scheme in _rotativities.py is an approximation
+    to; exact=False gives the ultrarelativistic kinematics (|p| -> gamma) the tables
+    are built on.  gX=False drops HS11's factor g_X, leaving the textbook rotation of
+    one electron, ln(2 gamma)/gamma^2, that the JO77 scheme sums.
     """
     from jetfuncs import _rotativities as rm
 
@@ -485,20 +574,67 @@ def _hs11_reference(nA, nuHz, nuB_sin, cth, p1, p2, g1, g2, g3, N=40001):
     XA = np.sqrt(np.sqrt(2) * (nuB_sin / nuHz) / 1e-4)
     sth = np.sqrt(max(1.0 - cth * cth, 1e-30))
     g = np.exp(np.linspace(np.log(g1), np.log(g3), N))
-    mom = np.sqrt(np.maximum(g * g - 1.0, 0.0))
     S = np.where(g < g2, g ** (-p1), g2 ** (p2 - p1) * g ** (-p2))
+    if exact:
+        mom = np.sqrt(np.maximum(g * g - 1.0, 0.0))
+        HX = rm.H_X(XA * g, g)
+        L = 2.0 * np.arccosh(g)  # = ln[(1 + beta)/(1 - beta)]
+    else:
+        mom = g
+        HX = rm.H_X(XA * g)
+        L = 2.0 * np.log(2.0 * g)
     f = nA * S / (4 * np.pi * g * mom)
-    L = np.log((1 + mom / g) / np.maximum(1 - mom / g, 1e-300))
+    G = rm.g_X(XA * g) if gX else 1.0
     cQ = 4 * np.pi * (e * e / (me * c)) / nuHz
     cV = 4 * np.pi * (e * e / (me * c)) * (nuB_sin / sth) / nuHz**2
-    rQ = np.trapz(f * cQ * XA * rm.H_X(XA * g, g) * g, np.log(g))
-    rV = np.trapz(f * cV * L * rm.g_X(XA * g) * cth * g, np.log(g))
-    # boundary term at gamma_min; the one at gamma_max is suppressed by gamma_max^-(p+2)
-    m1 = np.sqrt(max(g1 * g1 - 1.0, 0.0))
-    L1 = np.log((1 + m1 / g1) / max(1 - m1 / g1, 1e-300))
-    ff = nA * g1 ** (-p1) / (4 * np.pi * g1 * m1)
-    rQ += ff * cQ * float(rm.H_B(np.array(XA * g1), np.array(g1)))
-    rV += ff * cV * (g1 * L1 - 2 * m1) * float(rm.g_B(np.array(XA * g1))) * cth
+    rQ = np.trapz(f * cQ * XA * HX * g, np.log(g))
+    rV = np.trapz(f * cV * L * G * cth * g, np.log(g))
+    return float(rQ), float(rV)
+
+
+def _exact_reference(nA, nuHz, nuB_sin, cth, branch, gamma_c, p, gm, gx, N=40001):
+    """
+    HS11's Eq. (55) with exact kinematics, summed directly over the electrons of the
+    distribution the HS11 scheme describes: the injected electrons as gamma^-p; the
+    cooled ones in the steady state of cyclo-synchrotron cooling, dgamma/dt ~ -|p|^2,
+    i.e. gamma^-(p+1) gamma^2/(gamma^2 - 1) above the break, and in fast cooling
+    1/(gamma^2 - 1) below gamma_m, from the momentum p_c = 1/sinh(1/gamma_c) up.  The sum
+    runs in log10 |p|, which resolves the cold end, and forms the kinematic factors from
+    |p|: sqrt(1 - 1/gamma) = |p|/sqrt(gamma (gamma + 1)) and arccosh(gamma) = arcsinh |p|.
+    """
+    from jetfuncs import _rotativities as rm
+
+    e, me, c = 4.8032045e-10, 9.10938e-28, 2.99792458e10
+    XA = np.sqrt(np.sqrt(2) * (nuB_sin / nuHz) / 1e-4)
+    sth = np.sqrt(max(1.0 - cth * cth, 1e-30))
+    cQ = 4 * np.pi * (e * e / (me * c)) / nuHz
+    cV = 4 * np.pi * (e * e / (me * c)) * (nuB_sin / sth) / nuHz**2
+
+    def lmom(g):
+        return 0.5 * np.log10((g - 1.0) * (g + 1.0))
+
+    if branch == 0:
+        segments = [(lmom(gm), lmom(gx), lambda g, m: g ** (-p))]
+    elif branch == 1:
+        segments = [(lmom(gm), lmom(gamma_c), lambda g, m: g ** (-p)),
+                    (lmom(gamma_c), lmom(gx), lambda g, m: gamma_c * g ** (-(p + 1)) * g * g / (m * m))]
+    else:
+        lpc = 1.0 / gamma_c - np.log(2.0) if gamma_c < 0.05 else np.log(np.sinh(1.0 / gamma_c))
+        segments = [(-lpc / np.log(10.0), lmom(gm), lambda g, m: 1.0 / (m * m)),
+                    (lmom(gm), lmom(gx), lambda g, m: gm ** (p - 1) * g ** (-(p + 1)) * g * g / (m * m))]
+    rQ = rV = 0.0
+    for lo, hi, shape in segments:
+        if hi <= lo:
+            continue
+        lp = np.linspace(lo, hi, N)
+        mom = 10.0**lp
+        g = np.sqrt(1.0 + mom * mom)
+        x = XA * g
+        # electrons per unit log10 |p|, over 4 pi g |p| (HS11's phase-space density)
+        f = nA * shape(g, mom) * (mom * mom / g) * np.log(10.0) / (4 * np.pi * g * mom)
+        kin_q = np.where(x < 40.0, mom / np.sqrt(g * (g + 1.0)), 1.0)
+        rQ += np.trapz(f * cQ * XA * rm.H_X(x) * kin_q, lp)
+        rV += np.trapz(f * cV * 2.0 * np.arcsinh(mom) * rm.g_X(x) * cth, lp)
     return float(rQ), float(rV)
 
 
@@ -515,14 +651,19 @@ def _call_rotativities(model, branch, nu_nup, cth, nA_over_nup, gamma_c):
 _ROT_CASES = [(0, 1e9), (1, 1.0e4), (2, 3.0)]
 
 
-@pytest.mark.parametrize("branch,gamma_c", _ROT_CASES)
+@pytest.mark.parametrize("branch,gamma_c", _ROT_CASES + [(2, 0.87), (2, 0.05)])
 @pytest.mark.parametrize("nu_nup", [3.0e2, 3.0e4, 3.0e6])
 def test_hs11_matches_direct_numerical_integration(branch, gamma_c, nu_nup):
     """
-    The tabulated, factorised HS11 scheme against a brute-force integration of the
-    same fitting formulae with exact kinematics.  The difference is the
-    ultrarelativistic simplification that makes the integral separable, which the
-    module docstring quotes as ~2% on rho_Q and ~0.1% on rho_V.
+    The tabulated, factorized HS11 scheme against a brute-force sum of the same
+    fitting formulae, with exact kinematics, over the electrons of the distribution.
+    They agree to the tables' resolution (linear interpolation in log10 x, bilinear in
+    log10 X_A and log10 |p| for the corrections; rho_Q also crosses the jump of HS11's
+    H_X at x = 40).  The cases include fast cooling with gamma_c below 1 (0.87, the
+    lowest in the M87 model's jet) and far below (0.05, where the cooled electrons reach
+    p ~ 1e-8 and the correction tables extrapolate).  No boundary term enters either
+    side: a term at gamma_1 would be the rotativity of electrons the distribution does
+    not contain.
     """
     p, gm, gx = 2.23, 10.0, 1e8
     model = jf.JetModel(
@@ -531,24 +672,64 @@ def test_hs11_matches_direct_numerical_integration(branch, gamma_c, nu_nup):
     )
     cth = 0.5
     # K_a/nu_p is the scale the schemes are written in; any positive value will do
-    prefac_absorp = model.prefac_absorp
-    nA = 1.0e-4
-    nup_ghz = 1.0
-    Kap = prefac_absorp * nA / nup_ghz
+    nA, nup_ghz = 1.0e-4, 1.0
+    Kap = model.prefac_absorp * nA / nup_ghz
     rQ, rV = _call_rotativities(model, branch, nu_nup, cth, Kap, gamma_c)
+    eq, ev = _exact_reference(
+        nA, nu_nup * nup_ghz * 1e9, (2.0 / 3.0) * nup_ghz * 1e9, cth, branch, gamma_c, p, gm, gx
+    )
+    # abs=0: pytest.approx's default absolute tolerance, 1e-12, dwarfs coefficients of ~1e-27
+    assert float(rQ[0]) == pytest.approx(eq, rel=3e-3, abs=0.0)
+    assert float(rV[0]) == pytest.approx(ev, rel=1e-4, abs=0.0)
 
-    if branch == 0:
-        p1, p2, g1, g2, g3 = p, p, gm, gx, gx
-    elif branch == 1:
-        p1, p2, g1, g2, g3 = p, p + 1.0, gm, gamma_c, gx
-    else:
-        p1, p2, g1, g2, g3 = 2.0, p + 1.0, gamma_c, gm, gx
-    nuHz = nu_nup * nup_ghz * 1e9
-    nuB_sin = (2.0 / 3.0) * nup_ghz * 1e9
-    eq, ev = _hs11_reference(nA, nuHz, nuB_sin, cth, p1, p2, g1, g2, g3)
 
-    assert float(rQ[0]) == pytest.approx(eq, rel=0.05)
-    assert float(rV[0]) == pytest.approx(ev, rel=0.02)
+def test_fast_cooling_lower_edge():
+    """
+    With the cyclo-synchrotron loss rate dgamma/dt = -C (gamma^2 - 1), electrons injected
+    at high energy a time t_c ago have reached p_c, with asinh(1/p_c) = C t_c = 1/gamma_c:
+    gamma_c' = coth(1/gamma_c), never below 1 and gamma_c + 1/(3 gamma_c) + ... for
+    gamma_c >> 1, where the ultrarelativistic break is recovered.
+    """
+    from jetfuncs import _rotativities as rm
+
+    gc = np.array([1e-3, 0.0499, 0.05, 0.0501, 0.3, 0.87, 1.0, 3.0, 10.0, 100.0, 1.0e4])
+    g_low, lp = rm.fast_cooling_lower_edge(gc)
+    assert np.all(g_low >= 1.0)
+    # ln(1/p_c) = ln sinh(1/gamma_c), written so that it holds its precision for any gamma_c
+    u = 1.0 / gc
+    assert np.allclose(-lp * np.log(10.0), u + np.log(-np.expm1(-2.0 * u)) - np.log(2.0), rtol=1e-12, atol=0.0)
+    big = gc >= 100.0
+    assert np.allclose(g_low[big], gc[big] + 1.0 / (3.0 * gc[big]), rtol=1e-9, atol=0.0)
+    moderate = lp > -6.0
+    assert np.allclose(np.sqrt(1.0 + 10.0 ** (2.0 * lp[moderate])), g_low[moderate], rtol=1e-12, atol=0.0)
+
+
+def test_fast_cooled_rotation_tends_to_that_of_cold_electrons():
+    """
+    As gamma_c -> 0 the cooled electrons go cold (p_c = 1/sinh(1/gamma_c) -> 2 e^(-1/gamma_c)),
+    and each then rotates as a cold electron, 2 g_X(X_A) in the tables' units.  Below
+    gamma_m their number is int dgamma/(gamma^2 - 1) = 1/gamma_c - arccoth(gamma_m) per unit
+    amplitude, so rho_V gamma_c tends to 2 g_X(X_A) in those units -- the rotation of the
+    cold plasma the model's fixed number of electrons (n_m gamma_m) becomes, since the
+    amplitude is n_m gamma_c gamma_m.  The departure is of order gamma_c.
+    """
+    from jetfuncs import _rotativities as rm
+
+    p, gm, gx = 2.23, 10.0, 1e8
+    model = jf.JetModel(
+        m=10.0, a=0.5, inc=60.0, mdot=1e-3, Nx=2, Ny=2, Nz=2, p=p,
+        gamma_m=gm, gamma_max=gx, rotativities="HS11",
+    )
+    cth, nu_nup, Kap = 0.5, 3.0e4, 1.0
+    cot = cth / np.sqrt(1.0 - cth * cth)
+    XA = np.sqrt(rm.XA_CONST / nu_nup)
+    cold = rm.HS11_V_PREFAC * Kap * cot * 2.0 * float(rm.g_X(np.array(XA))) / nu_nup**2
+    dev = []
+    for gamma_c in (1.0e-2, 1.0e-3):
+        _, rV = _call_rotativities(model, 2, nu_nup, cth, Kap, gamma_c)
+        dev.append(abs(float(rV[0]) * gamma_c / cold - 1.0))
+    assert dev[1] < 2.0e-3
+    assert dev[1] < 0.2 * dev[0]
 
 
 @pytest.mark.parametrize("nu_nup", [1.0e3, 1.0e5])
@@ -572,26 +753,54 @@ def test_jo77_reduces_to_the_single_power_law_form(nu_nup):
     y = gm * gm / (1.5 * nu_nup)  # = (2/3)/x_1
     br = -np.expm1(a * np.log(y)) / a
     expect = (16.0 * np.sqrt(3.0) / 9.0) * Kap * gm ** (2.0 - p) * br / nu_nup**3
-    assert float(rQ[0]) == pytest.approx(expect, rel=1e-10)
+    assert float(rQ[0]) == pytest.approx(expect, rel=1e-10, abs=0.0)
+
+
+@pytest.mark.parametrize("branch,gamma_c", _ROT_CASES + [(2, 1.2)])
+def test_jo77_rotation_is_the_sum_over_the_electrons(branch, gamma_c):
+    """
+    JO77's rho_V is the textbook ultrarelativistic rotation of one electron,
+    ln(2 gamma)/gamma^2, summed over the electrons of the distribution and nothing
+    else: no boundary term at gamma_min, which would add the rotation of electrons the
+    distribution does not contain (and below gamma_1 = e/2 would even subtract).  The
+    analytic segment integrals must reproduce a brute-force sum to the quadrature's
+    accuracy.
+    """
+    p, gm, gx = 2.23, 10.0, 1e8
+    model = jf.JetModel(
+        m=10.0, a=0.5, inc=60.0, mdot=1e-3, Nx=2, Ny=2, Nz=2, p=p,
+        gamma_m=gm, gamma_max=gx, rotativities="JO77",
+    )
+    cth, nA, nup_ghz, nu_nup = 0.5, 1.0e-4, 1.0, 3.0e4
+    Kap = model.prefac_absorp * nA / nup_ghz
+    _, rV = _call_rotativities(model, branch, nu_nup, cth, Kap, gamma_c)
+    if branch == 0:
+        p1, p2, g1, g2, g3 = p, p, gm, gx, gx
+    elif branch == 1:
+        p1, p2, g1, g2, g3 = p, p + 1.0, gm, gamma_c, gx
+    else:
+        p1, p2, g1, g2, g3 = 2.0, p + 1.0, gamma_c, gm, gx
+    nuHz, nuB_sin = nu_nup * nup_ghz * 1e9, (2.0 / 3.0) * nup_ghz * 1e9
+    _, uv = _hs11_reference(nA, nuHz, nuB_sin, cth, p1, p2, g1, g2, g3, exact=False, gX=False)
+    assert float(rV[0]) == pytest.approx(uv, rel=1e-6, abs=0.0)
 
 
 def test_hs11_is_the_better_approximation_for_faraday_conversion():
     """
     Swept across all three cooling branches and five decades of nu'/nu_p: HS11 tracks
-    the exact integral of the fitting formulae everywhere, while the power-law form
-    does not.  That is what makes HS11 the default.  rho_V, by contrast, is
-    insensitive to the choice -- the two schemes differ only in Faraday conversion,
+    the exact sum of the fitting formulae over the electrons everywhere, while the
+    power-law form does not.  That is what makes HS11 the default.  rho_V, by contrast,
+    is insensitive to the choice -- the two schemes differ only in Faraday conversion,
     which is what HS11 set out to fix.
 
     Stated as a sweep rather than at a single point on purpose: the two schemes happen
     to agree at particular combinations, so a point comparison proves nothing.
 
-    The HS11 bound is split by gamma_1 on purpose.  The factorisation that makes the
-    integral separable assumes ultrarelativistic kinematics, and its error tracks
-    sqrt(1 - 1/gamma_1): measured, 1.9% at gamma_1 = 10, 2.1% at 9.9, 5.8% at 3 and
-    9.4% at 1.5.  Fast cooling always has gamma_1 = gamma_c < gamma_m, so it is the
-    branch that probes the mildly relativistic end -- where the ultrarelativistic
-    synchrotron kernels the emission coefficients use are equally approximate.
+    The HS11 scheme carries exact kinematics and the exact shape of the cooled electrons
+    (the tables' correction terms), so it matches the exact sum to the tables'
+    resolution everywhere; JO77 keeps the ultrarelativistic textbook form and the
+    ultrarelativistic cooling break, which in fast cooling (gamma_c = 3) puts its rho_V
+    a few percent off.
     """
     p, gm, gx = 2.23, 10.0, 1e8
     kw = dict(m=10.0, a=0.5, inc=60.0, mdot=1e-3, Nx=2, Ny=2, Nz=2, p=p,
@@ -601,36 +810,21 @@ def test_hs11_is_the_better_approximation_for_faraday_conversion():
     Kap = hs.prefac_absorp * 1.0e-4
     cth = 0.5
     err_q_hs, err_q_jo, err_v_hs, err_v_jo = [], [], [], []
-    hot_q, hot_v = [], []  # the ultrarelativistic subset, gamma_1 >= 10
     for branch, gamma_c in _ROT_CASES:
         for nu_nup in (3.0e2, 3.0e3, 3.0e4, 3.0e5, 3.0e6):
-            if branch == 0:
-                p1, p2, g1, g2, g3 = p, p, gm, gx, gx
-            elif branch == 1:
-                p1, p2, g1, g2, g3 = p, p + 1.0, gm, gamma_c, gx
-            else:
-                p1, p2, g1, g2, g3 = 2.0, p + 1.0, gamma_c, gm, gx
-            eq, ev = _hs11_reference(
-                1.0e-4, nu_nup * 1e9, (2.0 / 3.0) * 1e9, cth, p1, p2, g1, g2, g3
+            eq, ev = _exact_reference(
+                1.0e-4, nu_nup * 1e9, (2.0 / 3.0) * 1e9, cth, branch, gamma_c, p, gm, gx
             )
             qh, vh = _call_rotativities(hs, branch, nu_nup, cth, Kap, gamma_c)
             qj, vj = _call_rotativities(jo, branch, nu_nup, cth, Kap, gamma_c)
-            eqh = abs(float(qh[0]) / eq - 1.0)
-            evh = abs(float(vh[0]) / ev - 1.0)
-            err_q_hs.append(eqh)
+            err_q_hs.append(abs(float(qh[0]) / eq - 1.0))
             err_q_jo.append(abs(float(qj[0]) / eq - 1.0))
-            err_v_hs.append(evh)
+            err_v_hs.append(abs(float(vh[0]) / ev - 1.0))
             err_v_jo.append(abs(float(vj[0]) / ev - 1.0))
-            if g1 >= 10.0:
-                hot_q.append(eqh)
-                hot_v.append(evh)
 
-    # ultrarelativistic regime: the factorisation is good to a couple of per cent
-    assert max(hot_q) < 0.025
-    assert max(hot_v) < 0.005
-    # mildly relativistic (fast cooling, gamma_1 = gamma_c = 3): degrades, but bounded
-    assert max(err_q_hs) < 0.08
-    assert max(err_v_hs) < 0.02
+    # HS11: the tables' resolution, in every branch
+    assert max(err_q_hs) < 3e-3
+    assert max(err_v_hs) < 1e-4
     # and HS11 is uniformly the better approximation, in the worst case and typically
     assert max(err_q_jo) > 5.0 * max(err_q_hs)
     assert np.median(err_q_jo) > 2.0 * np.median(err_q_hs)
@@ -688,7 +882,7 @@ def test_sky_view_puts_the_approaching_jet_on_the_right():
     assert D.shape == IQUV.shape
     assert np.all(np.diff(X) > 0.0) and np.all(np.diff(Y) > 0.0)
     assert np.nansum(D[0] * X[None, :]) > 0.0  # brighter jet on the right
-    # a pure re-labelling: every Stokes value survives, with its sign
+    # a pure re-labeling: every Stokes value survives, with its sign
     for k in range(4):
         np.testing.assert_array_equal(np.sort(D[k].ravel()), np.sort(IQUV[k].ravel()))
     # a plain 2-D map is re-oriented the same way

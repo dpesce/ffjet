@@ -110,8 +110,15 @@ sigma_T = 6.65246e-25
     P_RTAB_LOGX0,
     P_RTAB_INVDLOGX,
     P_RTAB_KMAX,
+    # the grid of the rotativities' exact-kinematics correction tables
+    P_CTAB_LOGXA0,
+    P_CTAB_INVDLOGXA,
+    P_CTAB_NXA,
+    P_CTAB_LOGP0,
+    P_CTAB_INVDLOGP,
+    P_CTAB_NP,
     N_PARAMS,
-) = range(56)
+) = range(62)
 
 
 def pack_params(model, heating_prescription="Poynting"):
@@ -187,11 +194,17 @@ def pack_params(model, heating_prescription="Poynting"):
     P[P_RTAB_LOGX0] = getattr(model, "_rtab_logx0", 0.0)
     P[P_RTAB_INVDLOGX] = getattr(model, "_rtab_inv_dlogx", 1.0)
     P[P_RTAB_KMAX] = getattr(model, "_rtab_kmax", 0.0)
+    P[P_CTAB_LOGXA0] = getattr(model, "_ctab_logxa0", 0.0)
+    P[P_CTAB_INVDLOGXA] = getattr(model, "_ctab_inv_dlogxa", 1.0)
+    P[P_CTAB_NXA] = getattr(model, "_ctab_nxa", 0.0)
+    P[P_CTAB_LOGP0] = getattr(model, "_ctab_logp0", 0.0)
+    P[P_CTAB_INVDLOGP] = getattr(model, "_ctab_inv_dlogp", 1.0)
+    P[P_CTAB_NP] = getattr(model, "_ctab_np", 0.0)
     return P
 
 
 def pack_tables(model):
-    """The six Stokes-I log-tables, in the order the kernels expect."""
+    """The six Stokes-I log-tables and the kernel F, in the order the kernels expect."""
     return (
         model.logG_GI_2,
         model.logG_GI_p,
@@ -199,6 +212,7 @@ def pack_tables(model):
         model.logG_GaI_2,
         model.logG_GaI_p,
         model.logG_GaI_pp1,
+        model.logK_F,
     )
 
 
@@ -951,11 +965,12 @@ def _cell_state_tab(xi, yi, zJ, zi, P, Tup, Tlo, logr0, invdlogr, nr, invdu, nu_
 
 
 @njit(cache=True)
-def _cell_emis(frequency, g, nup, gamma_c, Cj, Ca, P, T0, T1, T2, T3, T4, T5):
+def _cell_emis(frequency, g, nup, gamma_c, Cj, Ca, P, T0, T1, T2, T3, T4, T5, TK):
     """
     Frequency-dependent synchrotron coefficients (j_I, alpha_I) of one cell from its
-    stored state.  T0..T5 are the log-tables GI_2, GI_p, GI_pp1, GaI_2, GaI_p, GaI_pp1.
-    Same formulas as _core.make_image (paper Eqs. C.4 and C.9).
+    stored state.  T0..T5 are the log-tables GI_2, GI_p, GI_pp1, GaI_2, GaI_p, GaI_pp1,
+    and TK the kernel F.  Same formulas as _core.make_image (paper Eqs. C.4 and C.9),
+    with alpha_I less the term of the distribution's lower edge (_edge_absorption).
     """
     p = P[P_P]
     gamma_m = P[P_GAMMA_M]
@@ -983,7 +998,7 @@ def _cell_emis(frequency, g, nup, gamma_c, Cj, Ca, P, T0, T1, T2, T3, T4, T5):
         jI = Cj * pw * dG
         pwa = pw / (nu_nup * nu_nup * sq)  # nu_nup**(-(p+4)/2)
         dGa = _G_diff(x2, x1, k2, t2, f2, k1, t1, f1, T4, 0.5 * (p - 2.0), tailC, xtail)
-        alphaI = Ca * (p + 2.0) * pwa * dGa
+        alphaI = Ca * (p + 2.0) * pwa * dGa - _edge_absorption(Ca, nu_nup, P[P_GM_MP], x1, TK, P)
     elif gamma_c > gamma_m:
         # slow: p1 = p, p2 = p+1; g1 = gamma_m, g2 = gamma_c, g3 = gamma_max
         x1 = nu_nup / (gamma_m * gamma_m)
@@ -1002,6 +1017,7 @@ def _cell_emis(frequency, g, nup, gamma_c, Cj, Ca, P, T0, T1, T2, T3, T4, T5):
         dGa1 = _G_diff(x2, x1, k2, t2, f2, k1, t1, f1, T4, 0.5 * (p - 2.0), tailC, xtail)
         dGa2 = _G_diff(x3, x2, k3, t3, f3, k2, t2, f2, T5, 0.5 * (p - 1.0), tailC, xtail)
         alphaI = Ca * ((p + 2.0) * pwa1 * dGa1 + (p + 3.0) * gamma_c * pwa2 * dGa2)
+        alphaI -= _edge_absorption(Ca, nu_nup, P[P_GM_MP], x1, TK, P)
     else:
         # fast: p1 = 2, p2 = p+1; g1 = gamma_c, g2 = gamma_m, g3 = gamma_max
         x1 = nu_nup / (gamma_c * gamma_c)
@@ -1021,7 +1037,53 @@ def _cell_emis(frequency, g, nup, gamma_c, Cj, Ca, P, T0, T1, T2, T3, T4, T5):
         dGa1 = _G_diff(x2, x1, k2, t2, f2, k1, t1, f1, T3, 0.0, tailC, xtail)
         dGa2 = _G_diff(x3, x2, k3, t3, f3, k2, t2, f2, T5, 0.5 * (p - 1.0), tailC, xtail)
         alphaI = Ca * (4.0 * pwa1 * dGa1 + (p + 3.0) * gm_pm1 * pwa2 * dGa2)
+        alphaI -= _edge_absorption(Ca, nu_nup, 1.0 / (gamma_c * gamma_c), x1, TK, P)
     return jI, alphaI
+
+
+@njit(cache=True, inline="always")
+def _kernel_value(x, TK, logx0, invdlogx, kmax):
+    """
+    A synchrotron kernel (F, G or H) at x, from its log10 table on the grid of the integral
+    tables: linear in log10 x and log10 K, extended below the grid as a power law (F and G
+    go as x^(1/3) there, H to a constant) and zero above it, where every kernel is below
+    e^-600.
+    """
+    if not (x > 0.0):
+        return 0.0
+    f = (math.log10(x) - logx0) * invdlogx
+    if f > kmax + 1.0:
+        return 0.0
+    if f < 0.0:
+        a = TK[0]
+        return 10.0 ** (a + f * (TK[1] - a))
+    k = int(f)
+    if k > kmax:
+        k = int(kmax)
+    t = f - k
+    a = TK[k]
+    return 10.0 ** (a + t * (TK[k + 1] - a))
+
+
+@njit(cache=True, inline="always")
+def _edge_absorption(Ca, nu_nup, n_lo, x_lo, TK, P):
+    """
+    The absorption of the distribution's lower edge, to be taken off alpha_I.
+
+    The absorption coefficient is -(1/8 pi m nu^2) int P_nu(g) g^2 d/dg[N/g^2] dg.  Over
+    each power-law segment the tables integrate the smooth slope, (q + 2) g^-(q+1) for
+    N = g^-q; but N jumps from 0 to N(g_lo) at the distribution's lowest Lorentz factor,
+    and that jump adds -(1/8 pi m nu^2) P_nu(g_lo) N(g_lo), which the tables leave out.
+    Without it alpha_I counts the absorption of electrons below g_lo that the distribution
+    does not contain (as HS11's boundary terms do for the rotativities; _rotativities.py).
+    In the normalization of the tables (alpha_I = C_a (q + 2) nu~^-(q+4)/2 [Ga(x_hi) -
+    Ga(x_lo)], nu~ = nu'/nu_p, x = nu~/g^2) it is 2 C_a nu~^-2 N(g_lo) F(x_lo), with
+    N(g_lo) = g_lo^-q for the segment's unit amplitude.  At x_lo >> 1 it is negligible;
+    at x_lo << 1 it is (4/3)/(p + 2) of the tabulated alpha_I.
+    """
+    return 2.0 * Ca * n_lo * _kernel_value(x_lo, TK, P[P_TAB_LOGX0], P[P_TAB_INVDLOGX], P[P_TAB_KMAX]) / (
+        nu_nup * nu_nup
+    )
 
 
 @njit(cache=True, inline="always")
@@ -1085,6 +1147,7 @@ def rt_kernel(
     T3,
     T4,
     T5,
+    TK,
     tau_stop,
     I_out,
 ):
@@ -1112,7 +1175,7 @@ def rt_kernel(
                     xi, yi, zJ, zi, P, xs_tab, rs_tab, ts_tab, as_tab
                 )
                 jI, alphaI = _cell_emis(
-                    frequency, g, nup, gamma_c, Cj, Ca, P, T0, T1, T2, T3, T4, T5
+                    frequency, g, nup, gamma_c, Cj, Ca, P, T0, T1, T2, T3, T4, T5, TK
                 )
                 I_acc, atten = _rt_step(I_acc, atten, jI, alphaI, g, ds)
                 if atten <= atten_stop:
@@ -1184,6 +1247,7 @@ def rt_from_state(
     T3,
     T4,
     T5,
+    TK,
     tau_stop,
     st_g,
     st_nup,
@@ -1204,7 +1268,7 @@ def rt_from_state(
         for o in range(offsets[q], offsets[q + 1]):
             g = st_g[o]
             jI, alphaI = _cell_emis(
-                frequency, g, st_nup[o], st_gc[o], st_Cj[o], st_Ca[o], P, T0, T1, T2, T3, T4, T5
+                frequency, g, st_nup[o], st_gc[o], st_Cj[o], st_Ca[o], P, T0, T1, T2, T3, T4, T5, TK
             )
             I_acc, atten = _rt_step(I_acc, atten, jI, alphaI, g, st_ds[o])
             if atten <= atten_stop:
@@ -1239,6 +1303,7 @@ def rt_kernel_tab(
     T3,
     T4,
     T5,
+    TK,
     tau_stop,
     I_out,
 ):
@@ -1266,7 +1331,7 @@ def rt_kernel_tab(
                     xi, yi, zJ, zi, P, Tup, Tlo, logr0, invdlogr, nr, invdu, nu_
                 )
                 jI, alphaI = _cell_emis(
-                    frequency, g, nup, gamma_c, Cj, Ca, P, T0, T1, T2, T3, T4, T5
+                    frequency, g, nup, gamma_c, Cj, Ca, P, T0, T1, T2, T3, T4, T5, TK
                 )
                 I_acc, atten = _rt_step(I_acc, atten, jI, alphaI, g, ds)
                 if atten <= atten_stop:
