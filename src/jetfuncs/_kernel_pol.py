@@ -175,8 +175,9 @@ ROT_HS11 = 2
     T_KF,
     T_KG,
     T_KH,
+    T_KK,
     N_TAB_ROWS,
-) = range(22)
+) = range(23)
 
 _TAB_ORDER = (
     "GI_2", "GI_p", "GI_pp1", "GaI_2", "GaI_p", "GaI_pp1",
@@ -204,8 +205,9 @@ N_POL_STATE = 9
 
 def pack_tables_pol(model):
     """
-    The eighteen log-tables of the polarized coefficients and the three kernels F, G, H
-    (for the absorption of the distribution's lower edge), as one (21, n) array.
+    The eighteen log-tables of the polarized coefficients and the kernels F, G, H (for the
+    absorption of the distribution's lower edge) and Kbar = int_x^inf K_{1/3} (for the end
+    terms of j_V), as one (22, n) array.
     """
     rows = []
     for name in _TAB_ORDER:
@@ -217,7 +219,7 @@ def pack_tables_pol(model):
                 f"JetModel.make_image_polarized, which builds them on demand)."
             )
         rows.append(tab)
-    for kernel in ("F", "G", "H"):
+    for kernel in ("F", "G", "H", "Kbar"):
         rows.append(getattr(model, "logK_" + kernel))
     return np.ascontiguousarray(np.vstack(rows))
 
@@ -797,7 +799,12 @@ def _cell_emis_pol(frequency, g, nup, gamma_c, Cj, Ca, cthB, Kap, P, TAB, RTAB):
     (_kernel._edge_absorption); the anisotropy of the electron distribution enters through the factor
     already folded into C_j and C_a, plus the extra factor 1 + g_eta/(p_i + 2) that a
     pitch-angle-dependent distribution contributes to the circular coefficients
-    (Tsunetoe et al. 2025).  The rotativities come from _rotativities.py, with the
+    (Tsunetoe et al. 2025).  That factor is exact for a power law without ends: per
+    electron, the anisotropy scales only the part Kbar(x) = int_x^inf K_{1/3} of the
+    kernel H, by 1 + g_eta/2, so the ends of the branches (gamma_1, the break gamma_2,
+    gamma_3) add terms in Kbar to j_V, which are added below.  alpha_V needs none: its
+    corresponding terms cancel against the anisotropic part of the absorption of the
+    distribution's lower edge.  The rotativities come from _rotativities.py, with the
     anisotropy factors of _anisotropy.py.
     """
     p = P[P_P]
@@ -857,6 +864,11 @@ def _cell_emis_pol(frequency, g, nup, gamma_c, Cj, Ca, cthB, Kap, P, TAB, RTAB):
         jV = _V_PREFAC * Cj * cot * fV * pwV * _G_diff_row(
             x2, x1, k2, t2, f2, k1, t1, f1, TAB, T_GV_P, mV, _H0, e_H, xtail
         )
+        # end terms of the anisotropy at gamma_m and gamma_max (see the docstring)
+        jV += _V_PREFAC * Cj * cot * g_eta * (
+            (gamma_m ** (-p1)) * _kernel_value_row(x1, TAB, T_KK, logx0, invdlogx, kmax)
+            - (gamma_max ** (-p1)) * _kernel_value_row(x2, TAB, T_KK, logx0, invdlogx, kmax)
+        ) / (p1 + 2.0)
         aI = Ca * (p1 + 2.0) * pwa * _G_diff_row(
             x2, x1, k2, t2, f2, k1, t1, f1, TAB, T_GaI_P, maI, tailF, e_FG, xtail
         )
@@ -911,6 +923,14 @@ def _cell_emis_pol(frequency, g, nup, gamma_c, Cj, Ca, cthB, Kap, P, TAB, RTAB):
             * _G_diff_row(x2, x1, k2, t2, f2, k1, t1, f1, TAB, T_GV_P, mV1, _H0, e_H, xtail)
             + fV2 * cont * pwV2
             * _G_diff_row(x3, x2, k3, t3, f3, k2, t2, f2, TAB, T_GV_PP1, mV2, _H0, e_H, xtail)
+        )
+        # end terms of the anisotropy at gamma_m, the break gamma_c and gamma_max
+        jV += _V_PREFAC * Cj * cot * g_eta * (
+            (gamma_m ** (-p1)) * _kernel_value_row(x1, TAB, T_KK, logx0, invdlogx, kmax) / (p1 + 2.0)
+            - (1.0 / (p1 + 2.0) - 1.0 / (p2 + 2.0)) * (gamma_c ** (-p1))
+            * _kernel_value_row(x2, TAB, T_KK, logx0, invdlogx, kmax)
+            - cont * (gamma_max ** (-p2)) * _kernel_value_row(x3, TAB, T_KK, logx0, invdlogx, kmax)
+            / (p2 + 2.0)
         )
         aI = Ca * (
             (p1 + 2.0) * pwa1
@@ -975,6 +995,14 @@ def _cell_emis_pol(frequency, g, nup, gamma_c, Cj, Ca, cthB, Kap, P, TAB, RTAB):
             * _G_diff_row(x2, x1, k2, t2, f2, k1, t1, f1, TAB, T_GV_2, mV1, _H0, e_H, xtail)
             + fV2 * cont * pwV2
             * _G_diff_row(x3, x2, k3, t3, f3, k2, t2, f2, TAB, T_GV_PP1, mV2, _H0, e_H, xtail)
+        )
+        # end terms of the anisotropy at gamma_c, the break gamma_m and gamma_max
+        jV += _V_PREFAC * Cj * cot * g_eta * (
+            (gamma_c ** (-p1)) * _kernel_value_row(x1, TAB, T_KK, logx0, invdlogx, kmax) / (p1 + 2.0)
+            - (1.0 / (p1 + 2.0) - 1.0 / (p2 + 2.0)) * (gamma_m ** (-p1))
+            * _kernel_value_row(x2, TAB, T_KK, logx0, invdlogx, kmax)
+            - cont * (gamma_max ** (-p2)) * _kernel_value_row(x3, TAB, T_KK, logx0, invdlogx, kmax)
+            / (p2 + 2.0)
         )
         aI = Ca * (
             (p1 + 2.0) * pwa1

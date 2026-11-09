@@ -59,7 +59,7 @@ from ._kernel import (
 # numba caches each compiled function by its own source file only: the kernels below keep the
 # copies of the _kernel_pol functions imported here (and of what those call) that they were
 # compiled with until this file itself changes, so a change there must come with a change
-# here.  Last: the anisotropy factors of the rotativities (_anisotropy.py).
+# here.  Last: the end terms of the anisotropy in j_V (_kernel_pol._cell_emis_pol).
 from ._kernel_pol import (
     _cell_emis_pol,
     _pol_accumulate,

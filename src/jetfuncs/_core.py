@@ -1475,7 +1475,11 @@ class JetModel:
     #
     # The kernels F, G, H themselves are stored too (logK_*): the absorption of the
     # distribution's lower edge, which the tables of the smooth power law leave out, needs
-    # them at the edge (_kernel._edge_absorption).
+    # them at the edge (_kernel._edge_absorption).  So is Kbar(x) = int_x^inf K_{1/3}(y) dy,
+    # the part of H that the electrons' pitch-angle anisotropy scales: per electron, the
+    # anisotropic circular emission has the kernel x K_{1/3}(x) + (1 + zeta/2) Kbar(x), and
+    # summing it over the broken power law gives the tables times 1 + zeta/(p_i + 2) plus
+    # terms in Kbar at the edges of the branches (_kernel_pol._cell_emis_pol).
     # ------------------------------------------------------------------
 
     _TAB_DEX_FINE = 0.001            # internal resolution; plateau error ~1e-6
@@ -1548,7 +1552,8 @@ class JetModel:
         if "Q" in stokes:
             kernels["G"] = y * kv(2.0 / 3.0, y)
         if "V" in stokes:
-            kernels["H"] = _cumulative_upper(ln10 * kv(1.0 / 3.0, y) * y) + y * kv(1.0 / 3.0, y)
+            kernels["Kbar"] = _cumulative_upper(ln10 * kv(1.0 / 3.0, y) * y)
+            kernels["H"] = kernels["Kbar"] + y * kv(1.0 / 3.0, y)
 
         # stored grid
         stride = int(round(self._TAB_DEX_STORE / self._TAB_DEX_FINE))
@@ -3073,7 +3078,7 @@ class JetModel:
     # Faraday rotativities (the numpy reference for _kernel_pol._rotativities)
     # ------------------------------------------------------------------
     def _kernel_numpy(self, x, kernel):
-        """A synchrotron kernel (F, G or H) at x, from its log table; see _kernel._kernel_value."""
+        """A synchrotron kernel (F, G, H or Kbar) at x, from its log table; see _kernel._kernel_value."""
         L = getattr(self, "logK_" + kernel)
         x = np.asarray(x, dtype=float)
         with np.errstate(divide="ignore", invalid="ignore"):
@@ -3280,7 +3285,8 @@ class JetModel:
         absorption are Dexter (2016) Eqs. (A22)-(A24) and (A41)-(A43), summed over the
         two branches exactly as the Stokes I path does; the circular coefficients carry
         the extra factor 1 + g_eta/(p_i + 2) that a pitch-angle-dependent distribution
-        contributes (Tsunetoe et al. 2025).  The rotativities are those of
+        contributes (Tsunetoe et al. 2025), and j_V the terms in Kbar = int K_{1/3} that the
+        ends of the branches add to it (_kernel_pol._cell_emis_pol).  The rotativities are those of
         _rotativities_numpy in the scheme the model was built with, made those of the
         anisotropic electrons by the factors of _anisotropy.py.
 
@@ -3334,6 +3340,11 @@ class JetModel:
                 _V_PREFAC * Cj[m] * cot[m] * fV * (pw / sq)
                 * self._G_diff(self.GVx_p, (p - 2.0) / 2.0, x2, x1, "H")
             )
+            # end terms of the anisotropy at gamma_m and gamma_max (_kernel_pol._cell_emis_pol)
+            jV[m] += _V_PREFAC * Cj[m] * cot[m] * g_eta[m] * (
+                gamma_m ** (-p) * self._kernel_numpy(x1, "Kbar")
+                - gamma_max ** (-p) * self._kernel_numpy(x2, "Kbar")
+            ) / (p + 2.0)
             aI[m] = Ca[m] * (p + 2.0) * pwa * self._G_diff(
                 self.GaIx_p, (p - 2.0) / 2.0, x2, x1, "F"
             )
@@ -3374,6 +3385,12 @@ class JetModel:
                 fV1 * (pw1 / sq) * self._G_diff(self.GVx_p, (p - 2.0) / 2.0, x2, x1, "H")
                 + fV2 * gc * (pw2 / sq)
                 * self._G_diff(self.GVx_pp1, (p2 - 2.0) / 2.0, x3, x2, "H")
+            )
+            # end terms of the anisotropy at gamma_m, the break gamma_c and gamma_max
+            jV[m] += _V_PREFAC * Cj[m] * cot[m] * g_eta[m] * (
+                gamma_m ** (-p) * self._kernel_numpy(x1, "Kbar") / (p + 2.0)
+                - (1.0 / (p + 2.0) - 1.0 / (p2 + 2.0)) * gc ** (-p) * self._kernel_numpy(x2, "Kbar")
+                - gc * gamma_max ** (-p2) * self._kernel_numpy(x3, "Kbar") / (p2 + 2.0)
             )
             aI[m] = Ca[m] * (
                 (p + 2.0) * pwa1 * self._G_diff(self.GaIx_p, (p - 2.0) / 2.0, x2, x1, "F")
@@ -3423,6 +3440,12 @@ class JetModel:
                 fV1 * (pw1 / sq) * self._G_diff(self.GVx_2, (p1 - 2.0) / 2.0, x2, x1, "H")
                 + fV2 * cont * (pw2 / sq)
                 * self._G_diff(self.GVx_pp1, (p2 - 2.0) / 2.0, x3, x2, "H")
+            )
+            # end terms of the anisotropy at gamma_c, the break gamma_m and gamma_max
+            jV[m] += _V_PREFAC * Cj[m] * cot[m] * g_eta[m] * (
+                gc ** (-p1) * self._kernel_numpy(x1, "Kbar") / (p1 + 2.0)
+                - (1.0 / (p1 + 2.0) - 1.0 / (p2 + 2.0)) * gamma_m ** (-p1) * self._kernel_numpy(x2, "Kbar")
+                - cont * gamma_max ** (-p2) * self._kernel_numpy(x3, "Kbar") / (p2 + 2.0)
             )
             aI[m] = Ca[m] * (
                 (p1 + 2.0) * pwa1 * self._G_diff(self.GaIx_2, (p1 - 2.0) / 2.0, x2, x1, "F")

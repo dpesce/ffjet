@@ -253,6 +253,82 @@ def test_isotropic_distribution_leaves_the_circular_correction_alone():
     assert np.all(np.isfinite(jV)) and jV[0] > 0.0
 
 
+@pytest.mark.parametrize("branch, x_1", [("uncooled", 0.3), ("uncooled", 3.0), ("slow", 0.3),
+                                         ("slow", 3.0), ("fast", 0.3), ("fast", 3.0)])
+def test_circular_emission_of_anisotropic_electrons_with_edges(branch, x_1):
+    """
+    Per electron, the anisotropic circular emission has the kernel
+    x K_1/3(x) + (1 + g_eta/2) Kbar(x), Kbar = int_x^inf K_1/3: the anisotropy scales only
+    the second part of H.  Summed over a power law without ends this is the tables times
+    1 + g_eta/(p_i + 2); the ends of the branches add terms in Kbar, which matter where the
+    observed frequency sits near the critical frequency of an end (x_1 = nu'/(nu_p
+    gamma_1^2) = 0.3 here: the end terms change j_V by tens of percent).  Against that sum
+    by quadrature over the electrons, in the tables' normalization, for each cooling branch
+    and for the numpy path and the compiled kernel.
+    """
+    import warnings
+
+    from scipy.integrate import IntegrationWarning, quad
+    from scipy.special import kv
+
+    from jetfuncs import _kernel as kc
+    from jetfuncs import _kernel_pol as kp
+
+    p, eta, p_eta, gamma_m, gamma_max = 2.23, 0.03, 2.0, 10.0, 1.0e3
+    model = jf.JetModel(m=10.0, a=0.5, inc=60.0, mdot=1e-3, Nx=2, Ny=2, Nz=2, p=p, eta=eta,
+                        p_eta=p_eta, gamma_m=gamma_m, gamma_max=gamma_max, stokes="IQV")
+    gamma_c = {"uncooled": 1.0e30, "slow": 50.0, "fast": 3.0}[branch]
+    if branch == "uncooled":
+        segments, g1 = [(p, gamma_m, gamma_max, 1.0)], gamma_m
+    elif branch == "slow":
+        segments, g1 = [(p, gamma_m, gamma_c, 1.0), (p + 1.0, gamma_c, gamma_max, gamma_c)], gamma_m
+    else:
+        segments = [(2.0, gamma_c, gamma_m, 1.0), (p + 1.0, gamma_m, gamma_max, gamma_m ** (p - 1.0))]
+        g1 = gamma_c
+    nn = x_1 * g1 * g1
+    cth, nup, nA = 0.5, 1.0, 1.0e-4
+    cot = cth / np.sqrt(1.0 - cth * cth)
+    zeta = p_eta * (eta - 1.0) * (1.0 - cth * cth) / (1.0 + (eta - 1.0) * cth * cth)
+
+    def kbar(z):
+        return quad(lambda y: kv(1.0 / 3.0, y), z, np.inf, limit=200)[0]
+
+    def segment(q, g_lo, g_hi):
+        """int over the electrons g_lo..g_hi of g^-q (1/g) [H + (zeta/2) Kbar], as nu~^(-q/2)
+        int z^((q-2)/2) [z K_1/3 + (1 + zeta/2) Kbar] dz from x(g_hi) to x(g_lo)"""
+        a, b = np.log(nn / g_hi**2), np.log(min(nn / g_lo**2, 200.0))
+        f = lambda u: np.exp(0.5 * q * u) * (np.exp(u) * kv(1.0 / 3.0, np.exp(u))
+                                             + (1.0 + 0.5 * zeta) * kbar(np.exp(u)))
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", IntegrationWarning)
+            return nn ** (-0.5 * q) * quad(f, a, b, limit=400, epsrel=1e-9)[0]
+
+    bracket = sum(amp * segment(q, lo, hi) for (q, lo, hi, amp) in segments)
+    aniso_fac = (1.0 + (eta - 1.0) * cth * cth) ** (-p_eta / 2.0) / model.phi_norm
+    Cj = model.prefac_emis * nA * nup * aniso_fac
+    expected = (4.0 / 3.0) * Cj * cot * bracket
+
+    out = model._pol_coefficients_numpy(np.array([nn]), np.array([nup]), np.array([gamma_c]),
+                                        np.array([cth]), np.array([nA]))
+    assert out[2][0] == pytest.approx(expected, rel=2e-3)
+
+    # without the end terms (the tables times 1 + zeta/(p_i + 2) alone) the result differs
+    # by much more than the tolerance at x_1 = 0.3, so the test sees them
+    tables_only = (4.0 / 3.0) * Cj * cot * sum(
+        amp * (1.0 + zeta / (q + 2.0)) * nn ** (-0.5 * q) * quad(
+            lambda u: np.exp(0.5 * q * u) * (np.exp(u) * kv(1.0 / 3.0, np.exp(u)) + kbar(np.exp(u))),
+            np.log(nn / hi**2), np.log(min(nn / lo**2, 200.0)), limit=400)[0]
+        for (q, lo, hi, amp) in segments)
+    if x_1 < 1.0:
+        assert abs(tables_only / expected - 1.0) > 0.05
+
+    if jf.numba_available():
+        model._ensure_polarized_tables()
+        P, TAB, RTAB = kc.pack_params(model), kp.pack_tables_pol(model), kp.pack_rot_tables(model)
+        nb = kp._cell_emis_pol(nn, 1.0, nup, gamma_c, Cj, 1.0, cth, 1.0, P, TAB, RTAB)
+        assert nb[2] == pytest.approx(out[2][0], rel=1e-6)
+
+
 @pytest.mark.parametrize("x_lo", [0.03, 1.0, 30.0])
 def test_absorption_counts_only_the_electrons_present(x_lo):
     """
